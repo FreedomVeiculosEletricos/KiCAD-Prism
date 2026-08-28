@@ -24,6 +24,113 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  catalog-architecture:
+    name: Catalog architecture and agent guidance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve catalog architecture base ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          is_usable_prior() {
+            local ref="${1:-}"
+            if [ -z "$ref" ] || [ "$ref" = "$ZERO_SHA" ]; then
+              return 1
+            fi
+            if ! git rev-parse --verify "${ref}^{commit}" >/dev/null 2>&1; then
+              return 1
+            fi
+            local resolved head
+            resolved="$(git rev-parse --verify "${ref}^{commit}")"
+            head="$(git rev-parse --verify HEAD)"
+            if [ "$resolved" = "$head" ] || [ "$resolved" = "$HEAD_SHA" ]; then
+              return 1
+            fi
+            return 0
+          }
+
+          export_base_ref() {
+            local resolved
+            resolved="$(git rev-parse --verify "${1}^{commit}")"
+            echo "CATALOG_BASE_REF=${resolved}" >> "$GITHUB_ENV"
+          }
+
+          try_head_parent() {
+            if ! git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              return 1
+            fi
+            if is_usable_prior HEAD^; then
+              export_base_ref HEAD^
+              return 0
+            fi
+            return 1
+          }
+
+          bootstrap() {
+            echo "Catalog architecture baseline bootstrap: no genuine prior commit; source-vs-baseline only"
+            echo "CATALOG_BASELINE_BOOTSTRAP=1" >> "$GITHUB_ENV"
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              if is_usable_prior "$PR_BASE_SHA"; then
+                export_base_ref "$PR_BASE_SHA"
+              elif try_head_parent; then
+                :
+              else
+                bootstrap
+              fi
+              ;;
+            push)
+              if is_usable_prior "$PUSH_BEFORE"; then
+                export_base_ref "$PUSH_BEFORE"
+              elif try_head_parent; then
+                :
+              else
+                bootstrap
+              fi
+              ;;
+            *)
+              if try_head_parent; then
+                :
+              else
+                bootstrap
+              fi
+              ;;
+          esac
+
+      - name: Check catalog architecture ratchets
+        run: |
+          set -euo pipefail
+          if [ "${CATALOG_BASELINE_BOOTSTRAP:-}" = "1" ]; then
+            echo "Catalog architecture baseline bootstrap: no prior commit; source-vs-baseline only"
+            python3 scripts/check_catalog_architecture.py
+          else
+            python3 scripts/check_catalog_architecture.py --base-ref "$CATALOG_BASE_REF"
+          fi
+
+      - name: Check agent guidance
+        run: python3 scripts/check_agent_docs.py
+
+      - name: Test architecture checker
+        run: python3 -m unittest backend.tests.test_catalog_architecture -v
+
+      - name: Compile Python sources
+        run: python3 -m compileall -q backend/app scripts/check_catalog_architecture.py
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -380,6 +487,7 @@ jobs:
     name: Quality gate
     if: ${{ always() }}
     needs:
+      - catalog-architecture
       - frontend
       - backend
       - semantic-viewer
@@ -393,6 +501,7 @@ jobs:
     steps:
       - name: Require every quality job
         env:
+          CATALOG_ARCHITECTURE_RESULT: ${{ needs.catalog-architecture.result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
           BACKEND_RESULT: ${{ needs.backend.result }}
           VIEWER_RESULT: ${{ needs.semantic-viewer.result }}
@@ -401,6 +510,7 @@ jobs:
           KICAD_LIVE_RESULT: ${{ needs.kicad-live.result }}
           AGENT_DOCS_RESULT: ${{ needs.agent-docs.result }}
         run: |
+          test "$CATALOG_ARCHITECTURE_RESULT" = "success"
           test "$FRONTEND_RESULT" = "success"
           test "$BACKEND_RESULT" = "success"
           test "$VIEWER_RESULT" = "success"
