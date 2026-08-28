@@ -27,6 +27,7 @@ from app.services.catalog_schema_migrations import (  # noqa: E402
 from app.services.component_catalog_domain import (  # noqa: E402
     PREVIEW_PIPELINE_VERSION,
     PREVIEW_STATUS_READY,
+    ComponentCatalogDomainService,
 )
 from app.services.component_catalog_service_postgres import (  # noqa: E402
     POSTGRES_SCHEMA_VERSION,
@@ -226,20 +227,25 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
     def _install_deterministic_preview_renderer(self) -> None:
         """Keep preview evidence independent of kicad-cli availability and version."""
 
-        def generate_symbol_units(_asset: object) -> tuple[str, list[tuple[int, bytes]]]:
+        def generate_symbol_units(_self: object, _asset: object) -> tuple[str, list[tuple[int, bytes]]]:
             return PREVIEW_STATUS_READY, [(1, FIXTURE_PREVIEW_SVG)]
 
-        def generate_footprint(_asset: object) -> tuple[str, bytes]:
+        def generate_footprint(_self: object, _asset: object) -> tuple[str, bytes]:
             return PREVIEW_STATUS_READY, FIXTURE_PREVIEW_SVG
 
-        def preview_identity(kind: str) -> dict[str, str]:
+        def preview_identity(_self: object, kind: str) -> dict[str, str]:
             return _fixture_preview_identity(kind)
 
-        # Bind on the instance. Class-level patch.object can miss if tests import
-        # the service through a different module object than the helper.
-        self.service._generate_symbol_preview_units = generate_symbol_units  # type: ignore[method-assign]
-        self.service._generate_footprint_preview = generate_footprint  # type: ignore[method-assign]
-        self.service._preview_generator_identity = preview_identity  # type: ignore[method-assign]
+        # patch.object with string names does not add private catalog callers.
+        # Binding the methods on the instance would.
+        for target, replacement in (
+            ("_generate_symbol_preview_units", generate_symbol_units),
+            ("_generate_footprint_preview", generate_footprint),
+            ("_preview_generator_identity", preview_identity),
+        ):
+            patcher = patch.object(ComponentCatalogDomainService, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_concurrent_creation_allows_one_manufacturer_mpn_identity(self) -> None:
         token = "identity-" + uuid.uuid4().hex[:8]
