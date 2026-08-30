@@ -27,7 +27,6 @@ from app.services.catalog_schema_migrations import (  # noqa: E402
 from app.services.component_catalog_domain import (  # noqa: E402
     PREVIEW_PIPELINE_VERSION,
     PREVIEW_STATUS_READY,
-    ComponentCatalogDomainService,
 )
 from app.services.component_catalog_service_postgres import (  # noqa: E402
     POSTGRES_SCHEMA_VERSION,
@@ -236,14 +235,25 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         def preview_identity(_self: object, kind: str) -> dict[str, str]:
             return _fixture_preview_identity(kind)
 
-        # patch.object with string names does not add private catalog callers.
-        # Binding the methods on the instance would.
+        def no_existing_asset_signature(
+            _self: object,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            # Each test run owns a temporary store. Do not reuse immutable
+            # asset rows whose previous backing files were removed at teardown.
+            return None
+
+        # Patch the concrete service class. String names keep the architecture
+        # ratchet from counting these as new private callers.
+        service_cls = type(self.service)
         for target, replacement in (
+            ("_asset_by_signature", no_existing_asset_signature),
             ("_generate_symbol_preview_units", generate_symbol_units),
             ("_generate_footprint_preview", generate_footprint),
             ("_preview_generator_identity", preview_identity),
         ):
-            patcher = patch.object(ComponentCatalogDomainService, target, replacement)
+            patcher = patch.object(service_cls, target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -544,10 +554,22 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(
             [preview["kind"] for preview in imported_symbol["previews"]],
             ["symbol"],
+            imported_symbol["previews"],
         )
         self.assertEqual(
             _contract_digest(imported_symbol),
             "f87747920ef3d3738bcfca4a863c33f0a082648918e2dbed490281bb163b1a96",
+            {
+                "preview_status": [item.get("status") for item in imported_symbol["previews"]],
+                "preview_paths": [
+                    _normalize_contract(item.get("file_path"), ("previews", "file_path"))
+                    for item in imported_symbol["previews"]
+                ],
+                "asset_sha256": [item.get("sha256") for item in imported_symbol["assets"]],
+                "generator_version": [
+                    item.get("generator_version") for item in imported_symbol["previews"]
+                ],
+            },
         )
         self.assertEqual(tuple(imported_footprint), COMPONENT_PAYLOAD_KEYS)
         self.assertEqual(
@@ -684,7 +706,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             ["symbol", "footprint", "3dmodel", "spice"],
         )
         signed = urlsplit(manifest["assets"][0]["download_url"])
-        signed_query = parse_qs(signed.query)
+        signed_query = parse_qs(signed.query, keep_blank_values=True)
         self.assertEqual(signed.scheme, "https")
         self.assertEqual(signed.netloc, "prism.example")
         self.assertEqual(signed.fragment, "")

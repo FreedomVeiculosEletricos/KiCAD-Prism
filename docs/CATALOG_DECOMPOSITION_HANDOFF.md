@@ -1,14 +1,15 @@
 # Catalog decomposition implementation handoff
 
-Updated: 2026-08-28, Asia/Kolkata
+Updated: 2026-08-31, Asia/Kolkata
 
 ## Status
 
-**Catalog PR 1 is accepted.** Characterization tests, architecture ratchets,
-agent navigation, and CI baseline selection are in
-`refactor/catalog-characterization-gates`. No production catalog behavior
-changed. Do not start PR 2 until this branch is green in GitHub Actions and
-merged into `dev`.
+**Catalog PR 1 remains pending acceptance.** The recovered characterization
+tests, architecture ratchets, agent navigation, and CI baseline selection are
+on `refactor/catalog-characterization-gates-resume`, rebased onto
+`origin/dev` at `2e841016263b3e8b9d3cc68c005a7c1e54ade6ea`. No production
+catalog behavior changed. Do not start PR 2 until this resume branch is green
+in GitHub Actions and merged into `dev`.
 
 ## Objective
 
@@ -19,8 +20,9 @@ verification, commits, pushes, and pull requests.
 ## Repository and immutable reference
 
 - Repository: `/Users/Swaroop/Personal-Projects/KiCAD-Platform/KiCAD-Prism`
-- PR 1 branch: `refactor/catalog-characterization-gates`
-- PR 1 base: `ea95799b19fd7d7d45723e2b7cdc60291982001a`
+- PR 1 resume branch: `refactor/catalog-characterization-gates-resume`
+- PR 1 base: `origin/dev` at
+  `2e841016263b3e8b9d3cc68c005a7c1e54ade6ea`
 - Reference commit before decomposition:
   `2575dce chore(agent): harden navigation and generated-artifact contracts`
 - Checkpoint PR: GitHub PR #192, merged into `dev` as
@@ -42,7 +44,7 @@ verification, commits, pushes, and pull requests.
 
 No existing production catalog implementation changed.
 
-## PR 1 accepted work
+## PR 1 retained work
 
 ### Contract characterization
 
@@ -86,15 +88,15 @@ fragment, and query keys exactly `{rev, representation, exp, sig}`.
 - enforces a monotonic private-call baseline;
 - enforces a 1,200-line limit for new production modules;
 - enforces a 500-line limit for catalog facades/orchestrators;
-- grandfathered 14 existing oversized modules at their exact current lengths;
+- grandfathered 16 existing oversized modules at their exact current lengths;
 - supports safe baseline reductions/removals;
 - compares the checked-in baseline with a trusted Git base ref.
 
-Accepted scan:
+Current resume-branch scan:
 
 ```text
-Catalog architecture OK: 0 legacy-import violations, 77 private-use keys,
-151 production modules checked, 14 grandfathered ceilings
+Catalog architecture OK: 0 legacy-import violations, 80 private-use keys,
+151 production modules checked, 16 grandfathered ceilings
 ```
 
 `backend/app/services/service_client_service.py::_connect` is in the baseline
@@ -109,7 +111,7 @@ with count 7. Architecture unit tests: 17 passed.
 - Catalog package navigation and layering rules
 
 ```text
-Agent guidance OK (242 paths, 5 model-neutral skill shims).
+Agent guidance OK (247 paths, 5 model-neutral skill shims).
 ```
 
 ### CI
@@ -126,19 +128,19 @@ Base-ref selection:
   `HEAD^`, otherwise explicit bootstrap without `--base-ref`
 - schedule/workflow_dispatch: `HEAD^` when available, otherwise bootstrap
 
-## Verification evidence at acceptance
+## Current resume verification
 
 - `git diff --check`
 - Python compilation of backend application, tests, and scripts
 - architecture unit suite: 17 tests passed
-- architecture scan: 77 private-use keys, 151 production modules, 14 ceilings
-- agent navigation: 242 checked paths, 5 model-neutral shims
+- architecture scan: 80 private-use keys, 151 production modules, 16 ceilings
+- agent navigation: 247 checked paths, 5 model-neutral shims
 - catalog PostgreSQL integration: 15 tests passed, zero skips
-- focused
-  `test_assets_release_evidence_and_diff_scope_round_trip` passed twice on a
-  reset disposable database with identical goldens
-- complete backend suite: 1001 tests passed, 4 existing conditional skips
-  (998 prior tests plus 3 new architecture tests)
+- focused contract rerun on a fresh disposable database retained identical
+  payload and generated-file goldens
+- complete backend suite: 1,082 tests passed with 4 existing conditional skips,
+  using fresh disposable PostgreSQL databases and a same-filesystem ephemeral
+  `PRISM_JOB_ARTIFACT_ROOT`
 - earlier checkpoint upgrade smoke: restored the pre-refactor dump into another
   database and matched component payload, manifest, inline bundle, metadata CSV,
   five catalog files, and seven DBL files
