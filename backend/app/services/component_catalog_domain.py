@@ -27,16 +27,12 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 from app.core.config import settings
+from app.services.catalog.runtime import (
+    CatalogRuntime, DBL_EXPORT_DIRNAME, DEFAULT_STORE_DIRNAME, KLC_VALIDATION_DIRNAME,
+    _ASSET_BROWSE_CACHE_TTL_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_STORE_DIRNAME = ".kicad-prism"
-DBL_EXPORT_DIRNAME = "kicad-dbl"
-KLC_VALIDATION_DIRNAME = "klc"
-
-# The asset browser reuses one sorted directory walk per asset type for this
-# long, so repeated dialog opens do not rescan the whole store.
-_ASSET_BROWSE_CACHE_TTL_SECONDS = 30.0
 
 PREVIEW_KIND_SYMBOL = "symbol"
 PREVIEW_KIND_FOOTPRINT = "footprint"
@@ -502,30 +498,34 @@ def _dbl_symbol_library_name(part_number: str, symbol_asset: dict[str, Any] | No
 
 class ComponentCatalogDomainService:
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
-        prism_root = Path(settings.KICAD_PROJECTS_ROOT) / DEFAULT_STORE_DIRNAME
-        self._store_root = Path(store_root or prism_root / "components").resolve()
-        self._db_path = self._database_path(database_url)
-        default_export_root = self._store_root.parent / "exports" / DBL_EXPORT_DIRNAME if store_root else prism_root / "exports" / DBL_EXPORT_DIRNAME
-        self._export_root = Path(settings.CATALOG_DBL_EXPORT_DIR or default_export_root).resolve()
-        self._validation_root = (self._store_root.parent / "validation" / KLC_VALIDATION_DIRNAME).resolve()
-        self._lock = threading.Lock()
-        self._initialized = False
-        self._kicad_cli: str | None = None
-        self._kicad_cli_version: str | None = None
-        self._category_cache: list[dict[str, Any]] | None = None
-        self._category_cache_ts: float = 0.0
-        self._CATEGORY_CACHE_TTL: float = 60.0
-        self._fts_available = False
-        self._browse_cache: dict[str, tuple[float, list[str]]] = {}
-        # One lock per asset type. Walking the footprint tree takes seconds on a
-        # large store, and a shared lock would make that block a symbol browse
-        # that could have been answered from cache. Serializing within a type is
-        # still wanted: it collapses a burst of concurrent misses into one walk.
-        self._browse_cache_locks: dict[str, threading.Lock] = {}
-        self._browse_cache_lock = threading.Lock()
-        # Bumped on every store write so a walk that started before it does not
-        # reinstate the listing it took.
-        self._browse_cache_generation = 0
+        self._catalog_runtime = CatalogRuntime(
+            store_root=store_root,
+            database_path=self._database_path(database_url),
+        )
+
+    def _runtime_for_compat(self) -> CatalogRuntime:
+        """Lazily support legacy ``__new__``-constructed test doubles."""
+        runtime = self.__dict__.get("_catalog_runtime")
+        if runtime is None:
+            runtime = CatalogRuntime()
+            self.__dict__["_catalog_runtime"] = runtime
+        return runtime
+
+    @property
+    def _store_root(self) -> Path:
+        return self._runtime_for_compat().store_root
+
+    @_store_root.setter
+    def _store_root(self, value: Path) -> None:
+        self._runtime_for_compat().store_root = Path(value)
+
+    @property
+    def _browse_cache(self) -> dict[str, tuple[float, list[str]]]:
+        return self._runtime_for_compat().browse_cache
+
+    @_browse_cache.setter
+    def _browse_cache(self, value: dict[str, tuple[float, list[str]]]) -> None:
+        self._runtime_for_compat().browse_cache = value
 
     def _database_path(self, database_url: str | None) -> Path:
         _ = database_url
@@ -537,22 +537,21 @@ class ComponentCatalogDomainService:
 
     @property
     def db_path(self) -> Path:
-        return self._db_path
+        return self._runtime_for_compat().db_path
 
     @property
     def export_root(self) -> Path:
-        return self._export_root
+        return self._runtime_for_compat().export_root
 
     @property
     def validation_root(self) -> Path:
-        return self._validation_root
+        return self._runtime_for_compat().validation_root
 
     def initialize(self) -> None:
         raise NotImplementedError("Use ComponentCatalogPostgresService")
 
     def close(self) -> None:
-        with self._lock:
-            self._initialized = False
+        self._runtime_for_compat().close()
 
     def _ensure_storage_dirs(self) -> None:
         for path in (
@@ -563,8 +562,8 @@ class ComponentCatalogDomainService:
             self._store_root / "previews" / "symbols",
             self._store_root / "previews" / "footprints",
             self._store_root / "revisions",
-            self._export_root,
-            self._validation_root,
+            self.export_root,
+            self.validation_root,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -1111,8 +1110,9 @@ class ComponentCatalogDomainService:
                 next_order += 1
 
     def _resolve_kicad_cli(self) -> str | None:
-        if self._kicad_cli and Path(self._kicad_cli).exists():
-            return self._kicad_cli
+        runtime = self._catalog_runtime
+        if runtime.kicad_cli and Path(runtime.kicad_cli).exists():
+            return runtime.kicad_cli
         candidates = (
             shutil.which("kicad-cli"),
             "/usr/bin/kicad-cli",
@@ -1122,8 +1122,8 @@ class ComponentCatalogDomainService:
         )
         for candidate in candidates:
             if candidate and Path(candidate).exists():
-                self._kicad_cli = str(candidate)
-                return self._kicad_cli
+                runtime.kicad_cli = str(candidate)
+                return runtime.kicad_cli
         return None
 
     def _run_kicad_cli(self, args: list[str]) -> tuple[bool, str]:
@@ -1150,8 +1150,8 @@ class ComponentCatalogDomainService:
         cli = self._resolve_kicad_cli()
         if not cli:
             version = "unavailable"
-        elif self._kicad_cli_version is not None:
-            version = self._kicad_cli_version
+        elif self._catalog_runtime.kicad_cli_version is not None:
+            version = self._catalog_runtime.kicad_cli_version
         else:
             try:
                 result = subprocess.run(
@@ -1160,7 +1160,7 @@ class ComponentCatalogDomainService:
                 version = (result.stdout or result.stderr or "unknown").strip() or "unknown"
             except (OSError, subprocess.TimeoutExpired):
                 version = "unknown"
-            self._kicad_cli_version = version
+            self._catalog_runtime.kicad_cli_version = version
         canonical = json.dumps(
             {
                 "generator_name": "kicad-cli",
@@ -4244,8 +4244,9 @@ class ComponentCatalogDomainService:
     def list_categories(self) -> list[dict[str, Any]]:
         self.initialize()
         now = time.monotonic()
-        if self._category_cache is not None and (now - self._category_cache_ts) < self._CATEGORY_CACHE_TTL:
-            return self._category_cache
+        runtime = self._catalog_runtime
+        if runtime.category_cache is not None and (now - runtime.category_cache_ts) < runtime.category_cache_ttl:
+            return runtime.category_cache
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -4258,8 +4259,8 @@ class ComponentCatalogDomainService:
                 """
             ).fetchall()
         result = [{"name": str(row["name"] or ""), "count": int(row["count"])} for row in rows]
-        self._category_cache = result
-        self._category_cache_ts = now
+        runtime.category_cache = result
+        runtime.category_cache_ts = now
         return result
 
     def get_component(
@@ -5839,8 +5840,7 @@ class ComponentCatalogDomainService:
         return {"updated": updated, "not_found": not_found, "errors": errors}
 
     def _browse_cache_lock_for(self, asset_type: str) -> threading.Lock:
-        with self._browse_cache_lock:
-            return self._browse_cache_locks.setdefault(asset_type, threading.Lock())
+        return self._runtime_for_compat().browse_cache_lock_for(asset_type)
 
     def _invalidate_browse_cache(self) -> None:
         """Drop the stored-file listings after the store on disk changes.
@@ -5851,9 +5851,7 @@ class ComponentCatalogDomainService:
         listings are rebuilt lazily on the next browse, and a write does not
         reliably tell us which tree it touched.
         """
-        with self._browse_cache_lock:
-            self._browse_cache.clear()
-            self._browse_cache_generation += 1
+        self._runtime_for_compat().invalidate_browse_cache()
 
     def browse_library_assets(
         self,
@@ -5874,9 +5872,9 @@ class ComponentCatalogDomainService:
         root = self._asset_root(asset_type)
         now = time.monotonic()
         with self._browse_cache_lock_for(asset_type):
-            with self._browse_cache_lock:
+            with self._catalog_runtime.browse_cache_lock:
                 cached = self._browse_cache.get(asset_type)
-                generation = self._browse_cache_generation
+                generation = self._catalog_runtime.browse_cache_generation
             if cached is None or now - cached[0] > _ASSET_BROWSE_CACHE_TTL_SECONDS:
                 if asset_type == "symbol":
                     paths = root.rglob("*.kicad_sym")
@@ -5887,12 +5885,12 @@ class ComponentCatalogDomainService:
                 else:
                     paths = root.rglob("*")
                 files = sorted(path.relative_to(root).as_posix() for path in paths if path.is_file())
-                with self._browse_cache_lock:
+                with self._catalog_runtime.browse_cache_lock:
                     # A write that landed while this walk was running already
                     # cleared the cache. Storing the result now would reinstate a
                     # listing taken before that write and hide it for a full TTL,
                     # so leave the cache empty and let the next browse rebuild it.
-                    if self._browse_cache_generation == generation:
+                    if self._catalog_runtime.browse_cache_generation == generation:
                         self._browse_cache[asset_type] = (now, files)
                 all_files = files
             else:
@@ -7266,7 +7264,7 @@ class ComponentCatalogDomainService:
             raise ValueError("KLC validation only supports symbol and footprint assets")
         run_id = str(uuid.uuid4())
         created_at = _utc_now_iso()
-        report_dir = self._validation_root / run_id
+        report_dir = self.validation_root / run_id
         report_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = report_dir / "stdout.txt"
         stderr_path = report_dir / "stderr.txt"
@@ -7459,7 +7457,7 @@ class ComponentCatalogDomainService:
                 return None
             path = Path(str(row[column])).resolve()
         try:
-            path.relative_to(self._validation_root)
+            path.relative_to(self.validation_root)
         except ValueError:
             return None
         return path if path.is_file() else None
@@ -8124,7 +8122,7 @@ class ComponentCatalogDomainService:
         import sqlite3 as sqlite_export
 
         self.initialize()
-        export_root = self._export_root
+        export_root = self.export_root
         if export_root.exists():
             shutil.rmtree(export_root)
         (export_root / "SchLib").mkdir(parents=True, exist_ok=True)

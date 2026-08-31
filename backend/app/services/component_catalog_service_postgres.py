@@ -5,10 +5,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.core.config import settings
+from app.services.catalog.postgres_runtime import (
+    CatalogPostgresConnection,
+    PostgresCatalogRuntime,
+    _postgres_dsn,
+    _split_sql_script,
+)
 from app.services.catalog_schema_migrations import apply_catalog_migrations
 from app.services.component_catalog_domain import ComponentCatalogDomainService
-from app.services.postgres_database import database
 
 logger = logging.getLogger(__name__)
 
@@ -26,74 +30,6 @@ POSTGRES_INTEGRITY_GUARDS_VERSION = "catalog-integrity-guards-v4"
 POSTGRES_HEAD_PROJECTION_VERSION = "catalog-component-heads-v5"
 POSTGRES_REMOTE_HEAD_PROJECTION_VERSION = "catalog-remote-heads-v4"
 
-def _postgres_dsn(value: str) -> str:
-    """Accept both native and SQLAlchemy-style psycopg URLs."""
-    return value.strip().replace("postgresql+psycopg://", "postgresql://", 1)
-
-
-def _split_sql_script(script: str) -> list[str]:
-    """Split the catalog's simple DDL script while respecting quoted strings."""
-    statements: list[str] = []
-    current: list[str] = []
-    quote = ""
-    index = 0
-    while index < len(script):
-        char = script[index]
-        if quote:
-            current.append(char)
-            if char == quote:
-                if index + 1 < len(script) and script[index + 1] == quote:
-                    current.append(script[index + 1])
-                    index += 1
-                else:
-                    quote = ""
-        elif char in {"'", '"'}:
-            quote = char
-            current.append(char)
-        elif char == ";":
-            statement = "".join(current).strip()
-            if statement:
-                statements.append(statement)
-            current = []
-        else:
-            current.append(char)
-        index += 1
-    statement = "".join(current).strip()
-    if statement:
-        statements.append(statement)
-    return statements
-
-
-class _CatalogConnection:
-    """Native psycopg connection with the domain's DDL-script convenience API."""
-
-    def __init__(self, connection: Any) -> None:
-        self._connection = connection
-
-    def execute(self, sql: str, params: Any = None) -> Any:
-        return self._connection.execute(sql, params, prepare=False)
-
-    def executescript(self, script: str) -> None:
-        # Psycopg accepts parameter-free multi-statement DDL through the simple
-        # protocol. The catalog script is idempotent, so send it in one round
-        # trip rather than splitting it into dozens of remote calls.
-        if script.strip():
-            self._connection.execute(script, prepare=False)
-
-    def commit(self) -> None:
-        self._connection.commit()
-
-    def rollback(self) -> None:
-        self._connection.rollback()
-
-    def iter_rows(self, sql: str, params: Any = None, *, batch_size: int = 500) -> Iterator[Any]:
-        """Iterate a large read through a PostgreSQL server-side cursor."""
-        with self._connection.cursor(name="prism_catalog_export") as cursor:
-            cursor.itersize = batch_size
-            cursor.execute(sql, params)
-            while rows := cursor.fetchmany(batch_size):
-                yield from rows
-
 
 class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     """PostgreSQL-backed catalog with the existing stable domain/API contract.
@@ -103,7 +39,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     """
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
-        self._postgres_url = _postgres_dsn(database_url or settings.PRISM_DATABASE_URL)
+        self._postgres_runtime = PostgresCatalogRuntime(database_url=database_url)
         super().__init__(store_root=store_root, database_url="postgres")
 
     def _database_path(self, database_url: str | None) -> Path:
@@ -113,28 +49,14 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
         return Path("/dev/null")
 
     @contextmanager
-    def _connect(self) -> Iterator[_CatalogConnection]:
-        if not self._postgres_url:
-            raise ValueError("PRISM_DATABASE_URL is required for PostgreSQL catalog storage")
-        configured_url = _postgres_dsn(settings.PRISM_DATABASE_URL)
-        if configured_url and self._postgres_url == configured_url:
-            connection_context = database.connection()
-        else:
-            import psycopg
-            from psycopg.rows import dict_row
-
-            connection_context = psycopg.connect(
-                self._postgres_url,
-                row_factory=dict_row,
-                autocommit=False,
-            )
-        with connection_context as connection:
-            connection.execute("SET search_path TO catalog, public")
-            yield _CatalogConnection(connection)
+    def _connect(self) -> Iterator[CatalogPostgresConnection]:
+        with self._postgres_runtime.connect() as connection:
+            yield connection
 
     def initialize(self) -> None:
-        with self._lock:
-            if self._initialized:
+        runtime = self._catalog_runtime
+        with runtime.initialization_lock:
+            if runtime.initialized:
                 return
             self._ensure_storage_dirs()
             with self._connect() as conn:
@@ -215,10 +137,10 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
                 conn.commit()
             self._ensure_postgres_search_indexes()
             self._ensure_postgres_integrity_guards()
-            self._fts_available = False
-            self._initialized = True
+            runtime.fts_available = False
+            runtime.initialized = True
 
-    def _ensure_component_heads_projection(self, conn: _CatalogConnection) -> None:
+    def _ensure_component_heads_projection(self, conn: CatalogPostgresConnection) -> None:
         """Install the current-head read model and its transactional refresh hooks."""
         marker = conn.execute(
             "SELECT value FROM catalog_meta WHERE key = %s",
@@ -453,7 +375,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
             ("postgres_head_projection_version", POSTGRES_HEAD_PROJECTION_VERSION),
         )
 
-    def _ensure_remote_component_heads_projection(self, conn: _CatalogConnection) -> None:
+    def _ensure_remote_component_heads_projection(self, conn: CatalogPostgresConnection) -> None:
         """Install the released-only read model used by the KiCad provider."""
 
         marker = conn.execute(
@@ -1144,8 +1066,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
         ).fetchone()
 
     def close(self) -> None:
-        with self._lock:
-            self._initialized = False
+        self._catalog_runtime.close()
 
 
 __all__ = [
