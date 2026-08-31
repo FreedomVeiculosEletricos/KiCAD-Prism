@@ -5,8 +5,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
 from app.services.catalog.component_history import CatalogComponentHistoryReads
+from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
+from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import CatalogRevisionKernel
 from app.services.catalog.postgres_runtime import (
     CatalogPostgresConnection,
@@ -46,6 +47,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
 
     _catalog_locks: CatalogLockOperations = PostgresCatalogLocks()
     _revision_kernel: CatalogRevisionKernel = CatalogRevisionKernel(_catalog_locks)
+    _revision_comparison: CatalogRevisionComparison = CatalogRevisionComparison(_revision_kernel)
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
@@ -53,6 +55,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
         super().__init__(store_root=store_root, database_url="postgres")
         self._catalog_locks = PostgresCatalogLocks()
         self._revision_kernel = CatalogRevisionKernel(self._catalog_locks)
+        self._revision_comparison = CatalogRevisionComparison(self._revision_kernel)
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
 
     def _database_path(self, database_url: str | None) -> Path:
