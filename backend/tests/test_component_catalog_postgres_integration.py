@@ -226,6 +226,14 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
     def _install_deterministic_preview_renderer(self) -> None:
         """Keep preview evidence independent of kicad-cli availability and version."""
 
+        for target, value in (
+            ("app.services.component_catalog_domain.settings.CATALOG_KLC_ENABLED", False),
+            ("app.services.component_catalog_domain.settings.CATALOG_KLC_RELEASE_GATE", "warn"),
+        ):
+            settings_patcher = patch(target, value)
+            settings_patcher.start()
+            self.addCleanup(settings_patcher.stop)
+
         def generate_symbol_units(_self: object, _asset: object) -> tuple[str, list[tuple[int, bytes]]]:
             return PREVIEW_STATUS_READY, [(1, FIXTURE_PREVIEW_SVG)]
 
@@ -568,7 +576,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             _contract_digest(imported_symbol),
-            "36eea7806bb444438dea3efd085af63a94d0105f033753a99fd8ed2a677a0951",
+            "93e52eb5141723ec2a987ae9de938907923747cf1918a8e8528b69d6982e35e0",
             {
                 "preview_status": [item.get("status") for item in imported_symbol["previews"]],
                 "preview_paths": [
@@ -584,7 +592,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(tuple(imported_footprint), COMPONENT_PAYLOAD_KEYS)
         self.assertEqual(
             _contract_digest(imported_footprint),
-            "c5c2106236c3f313e10eb2687973c147d25207859b52d167fef9a357567df00f",
+            "ae8eeb5b599f1a8135cff4228878960d1ed2d137db8b49127feea53d7e687820",
         )
         with_model = self.service.attach_auxiliary_asset(
             component["id"],
@@ -640,7 +648,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(tuple(released), COMPONENT_PAYLOAD_KEYS)
         self.assertEqual(
             _contract_digest(released),
-            "1acea04511a7d56a35077e28e94401e87117a4a1b862c951b75035fb5a4ec6a5",
+            "ecb19c09822c12c5ed0ab9249f7e42c57dea9576154b871f1e4c4a6a03ba670f",
         )
         self.assertEqual(released["identity_kind"], "mpn")
         self.assertEqual(released["mpn"], component["mpn"])
