@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 from app.services.catalog.component_history import CatalogComponentHistoryReads
+from app.services.catalog.component_read_models import CatalogComponentReadModels
 from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import CatalogRevisionKernel
@@ -49,6 +50,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     _revision_kernel: CatalogRevisionKernel = CatalogRevisionKernel(_catalog_locks)
     _revision_comparison: CatalogRevisionComparison = CatalogRevisionComparison(_revision_kernel)
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
+    _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._postgres_runtime = PostgresCatalogRuntime(database_url=database_url)
@@ -57,6 +59,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
         self._revision_kernel = CatalogRevisionKernel(self._catalog_locks)
         self._revision_comparison = CatalogRevisionComparison(self._revision_kernel)
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
+        self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
 
     def _database_path(self, database_url: str | None) -> Path:
         # Retained only for the legacy service's diagnostic property. PostgreSQL does
