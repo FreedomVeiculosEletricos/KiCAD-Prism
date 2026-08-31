@@ -235,6 +235,15 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         def preview_identity(_self: object, kind: str) -> dict[str, str]:
             return _fixture_preview_identity(kind)
 
+        def preserve_symbol_upload(
+            _self: object,
+            _upload_name: str,
+            payload: bytes,
+        ) -> bytes:
+            # The contract fixture must not depend on whether this runtime has
+            # kicad-cli. The canonical single-symbol extraction remains real.
+            return payload
+
         def no_existing_asset_signature(
             _self: object,
             *_args: object,
@@ -249,6 +258,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         service_cls = type(self.service)
         for target, replacement in (
             ("_asset_by_signature", no_existing_asset_signature),
+            ("_normalize_symbol_upload", preserve_symbol_upload),
             ("_generate_symbol_preview_units", generate_symbol_units),
             ("_generate_footprint_preview", generate_footprint),
             ("_preview_generator_identity", preview_identity),
@@ -558,7 +568,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             _contract_digest(imported_symbol),
-            "f87747920ef3d3738bcfca4a863c33f0a082648918e2dbed490281bb163b1a96",
+            "36eea7806bb444438dea3efd085af63a94d0105f033753a99fd8ed2a677a0951",
             {
                 "preview_status": [item.get("status") for item in imported_symbol["previews"]],
                 "preview_paths": [
@@ -574,7 +584,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(tuple(imported_footprint), COMPONENT_PAYLOAD_KEYS)
         self.assertEqual(
             _contract_digest(imported_footprint),
-            "b4cf02c20db047eddfca50c222256738bc4637237d69ca8638f5069f4854aae3",
+            "c5c2106236c3f313e10eb2687973c147d25207859b52d167fef9a357567df00f",
         )
         with_model = self.service.attach_auxiliary_asset(
             component["id"],
@@ -630,7 +640,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(tuple(released), COMPONENT_PAYLOAD_KEYS)
         self.assertEqual(
             _contract_digest(released),
-            "c858b4c019e64b9b346674489c07215d0b025f44cadff56492f4a410b9710603",
+            "1acea04511a7d56a35077e28e94401e87117a4a1b862c951b75035fb5a4ec6a5",
         )
         self.assertEqual(released["identity_kind"], "mpn")
         self.assertEqual(released["mpn"], component["mpn"])
@@ -853,7 +863,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
                 "PcbLib/Prism_Test.pretty/R_Test.kicad_mod": "8d4ef2234c867094a30e793fdbff4975a78a98742ac72825b5fef2c2c5355461",
                 "Prism_Linux.kicad_dbl": "86cacbfb2c4f192082191bf6cfd4a386cb89672ffb4747ebea6cd538c379064d",
                 "Prism_Windows.kicad_dbl": "5f8b5b8128abd1fd8021eac341c104b152f407a179a5df6c2e6c6c8efd20ad14",
-                "SchLib/Prism_PG-R-assets-<token>_Prism_Test_R_Test.kicad_sym": "ea678c419de7359ca63f28755adb5d824f7df5d327ecb881f0d82e7c620fe991",
+                "SchLib/Prism_PG-R-assets-<token>_Prism_Test_R_Test.kicad_sym": "f005b31dc8b9553ea528ad253896bab79c9c69ea1e1dac0a683bbcc4dc8d9fbe",
                 "fp-lib-table": "149d573ae28f732acb912b6707b02f0851c7c250d3f698b6e7a92269e2cc3c86",
                 "sym-lib-table": "a97a151e180b2945dbd6a81a3cbc00d4a7edcb17488f371d5fe24f43a1805fbf",
             },
