@@ -36,6 +36,7 @@ from app.services.catalog.component_read_models import (
     SUPPLY_VENDOR_SOURCE_NAMES,
     supply_source_payload as _supply_source_payload,
 )
+from app.services.catalog.component_queries import CatalogComponentQueries
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
 from app.services.catalog.normalization import (
     json_loads as _json_loads,
@@ -442,6 +443,7 @@ class ComponentCatalogDomainService:
     _revision_comparison: CatalogRevisionComparison = CatalogRevisionComparison(_revision_kernel)
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
+    _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
@@ -453,6 +455,7 @@ class ComponentCatalogDomainService:
         self._revision_comparison = CatalogRevisionComparison(self._revision_kernel)
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
+        self._component_queries = CatalogComponentQueries(self._component_read_models)
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -1064,9 +1067,6 @@ class ComponentCatalogDomainService:
 
     def _load_preview_evidence_for_revision(self, conn: Any, revision_id: str) -> list[dict[str, Any]]:
         return self._revision_kernel.load_preview_evidence_for_revision(conn, revision_id)
-
-    def _load_previews_for_revisions(self, conn: Any, revision_ids: list[str]) -> list[dict[str, Any]]:
-        return self._component_read_models.load_previews_for_revisions(conn, revision_ids)
 
     def _latest_validation_runs_for_assets(
         self,
@@ -2079,23 +2079,6 @@ class ComponentCatalogDomainService:
                 removed.append(session_id)
         return {"removed": len(removed), "session_ids": removed}
 
-    def _component_summary_payload(
-        self,
-        component_row: dict[str, Any],
-        revision_row: dict[str, Any],
-        assets: list[dict[str, Any]],
-        *,
-        released_view: bool = False,
-        validation_summary: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return self._component_read_models.component_summary_payload(
-            component_row,
-            revision_row,
-            assets,
-            released_view=released_view,
-            validation_summary=validation_summary,
-        )
-
     def list_components(
         self,
         *,
@@ -2114,315 +2097,23 @@ class ComponentCatalogDomainService:
         sort_dir: str = "asc",
     ) -> dict[str, Any]:
         self.initialize()
-        offset = (page - 1) * page_size
-        revision_ref = "rr" if released_only else "cr"
-        revision_join_column = "released_revision_id" if released_only else "current_revision_id"
-        filters: list[str] = []
-        params: list[Any] = []
-
-        if not include_inactive:
-            filters.append("c.is_active = 1")
-        if source:
-            filters.append("c.source = %s")
-            params.append(source)
-        if category is not None:
-            filters.append(f"{revision_ref}.category = %s")
-            params.append(category)
-        requested_workflow_stages = _dedupe(
-            [
-                normalized
-                for raw_stage in str(workflow_stage or "").split(",")
-                if (normalized := _normalize_workflow_stage(raw_stage.strip()))
-            ]
+        plan = self._component_queries.prepare_list_components(
+            query=query,
+            source=source,
+            availability_state=availability_state,
+            workflow_stage=workflow_stage,
+            validation_status=validation_status,
+            category=category,
+            include_inactive=include_inactive,
+            page=page,
+            page_size=page_size,
+            released_only=released_only,
+            lightweight=lightweight,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
-        if requested_workflow_stages:
-            unsupported_stages = [
-                stage for stage in requested_workflow_stages if stage not in WORKFLOW_STAGES
-            ]
-            if unsupported_stages:
-                raise ValueError("Unsupported workflow stage")
-            placeholders = ",".join("%s" for _ in requested_workflow_stages)
-            filters.append(f"{revision_ref}.release_status IN ({placeholders})")
-            params.extend(requested_workflow_stages)
-        if availability_state:
-            symbol_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_symbol "
-                f"WHERE ra_symbol.revision_id = {revision_ref}.id AND ra_symbol.asset_type = 'symbol')"
-            )
-            footprint_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_footprint "
-                f"WHERE ra_footprint.revision_id = {revision_ref}.id AND ra_footprint.asset_type = 'footprint')"
-            )
-            if availability_state == STATE_PLACE_READY:
-                filters.append(f"{symbol_exists} AND {footprint_exists}")
-            elif availability_state == STATE_METADATA_ONLY:
-                filters.append(f"NOT {symbol_exists} AND NOT {footprint_exists}")
-            elif availability_state == STATE_FILES_PARTIAL:
-                filters.append(f"(({symbol_exists}) <> ({footprint_exists}))")
-            else:
-                raise ValueError("Unsupported availability state")
-        if validation_status:
-            supported_validation_statuses = {
-                VALIDATION_STATUS_PASSED,
-                VALIDATION_STATUS_WARNING,
-                VALIDATION_STATUS_FAILED,
-                VALIDATION_STATUS_SKIPPED,
-                VALIDATION_STATUS_NOT_RUN,
-            }
-            if validation_status not in supported_validation_statuses:
-                raise ValueError("Unsupported validation status")
-
-            relevant_assets_exist = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_validation_any "
-                f"JOIN assets asset_validation_any ON asset_validation_any.id = ra_validation_any.asset_id "
-                f"WHERE ra_validation_any.revision_id = {revision_ref}.id "
-                f"AND asset_validation_any.asset_type IN ('symbol', 'footprint'))"
-            )
-
-            def latest_status_exists(status: str, suffix: str) -> str:
-                # Scope runs to the revision (direct or inherited evidence). Matching
-                # by asset_id alone incorrectly picks status from unrelated revisions.
-                return (
-                    f"EXISTS (SELECT 1 FROM revision_assets ra_validation_{suffix} "
-                    f"JOIN assets asset_validation_{suffix} ON asset_validation_{suffix}.id = ra_validation_{suffix}.asset_id "
-                    f"WHERE ra_validation_{suffix}.revision_id = {revision_ref}.id "
-                    f"AND asset_validation_{suffix}.asset_type IN ('symbol', 'footprint') "
-                    f"AND COALESCE(("
-                    f"SELECT avr_validation_{suffix}.status "
-                    f"FROM asset_validation_runs avr_validation_{suffix} "
-                    f"WHERE avr_validation_{suffix}.revision_id = {revision_ref}.id "
-                    f"AND avr_validation_{suffix}.asset_id = asset_validation_{suffix}.id "
-                    f"ORDER BY avr_validation_{suffix}.finished_at DESC, avr_validation_{suffix}.created_at DESC "
-                    f"LIMIT 1"
-                    f"), COALESCE(("
-                    f"SELECT inherited_run_{suffix}.status "
-                    f"FROM revision_validation_evidence_links inherited_link_{suffix} "
-                    f"JOIN asset_validation_runs inherited_run_{suffix} "
-                    f"  ON inherited_run_{suffix}.id = inherited_link_{suffix}.source_run_id "
-                    f"WHERE inherited_link_{suffix}.revision_id = {revision_ref}.id "
-                    f"AND inherited_link_{suffix}.asset_id = asset_validation_{suffix}.id "
-                    f"LIMIT 1"
-                    f"), '{VALIDATION_STATUS_NOT_RUN}')) = '{status}')"
-                )
-
-            failed_exists = latest_status_exists(VALIDATION_STATUS_FAILED, "failed")
-            warning_exists = latest_status_exists(VALIDATION_STATUS_WARNING, "warning")
-            skipped_exists = latest_status_exists(VALIDATION_STATUS_SKIPPED, "skipped")
-            not_run_exists = latest_status_exists(VALIDATION_STATUS_NOT_RUN, "not_run")
-
-            if validation_status == VALIDATION_STATUS_FAILED:
-                filters.append(failed_exists)
-            elif validation_status == VALIDATION_STATUS_WARNING:
-                filters.append(f"NOT {failed_exists} AND {warning_exists}")
-            elif validation_status == VALIDATION_STATUS_SKIPPED:
-                filters.append(f"NOT {failed_exists} AND NOT {warning_exists} AND {skipped_exists}")
-            elif validation_status == VALIDATION_STATUS_NOT_RUN:
-                filters.append(
-                    f"(NOT {relevant_assets_exist} OR "
-                    f"(NOT {failed_exists} AND NOT {warning_exists} AND NOT {skipped_exists} AND {not_run_exists}))"
-                )
-            elif validation_status == VALIDATION_STATUS_PASSED:
-                filters.append(
-                    f"{relevant_assets_exist} AND NOT {failed_exists} AND NOT {warning_exists} "
-                    f"AND NOT {skipped_exists} AND NOT {not_run_exists}"
-                )
-        if released_only:
-            filters.append("c.released_revision_id <> ''")
-            filters.append("rr.release_status = 'released'")
-        query_text = query.strip()
-        # Postgres catalog search uses search_document (+ optional pg_trgm). The
-        # legacy SQLite FTS branch is intentionally disabled to avoid rowid MATCH.
-        if query_text:
-            filters.append(
-                f"(LOWER({revision_ref}.search_document) LIKE LOWER(%s) "
-                f"OR LOWER({revision_ref}.created_by) LIKE LOWER(%s))"
-            )
-            params.extend([f"%{query_text}%", f"%{query_text}%"])
-        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
-        sort_columns = {
-            "name": f"{revision_ref}.name",
-            "mpn": f"{revision_ref}.mpn",
-            "manufacturer": f"{revision_ref}.manufacturer",
-            "category": f"{revision_ref}.category",
-            "package_name": f"{revision_ref}.package_name",
-            "workflow_stage": f"{revision_ref}.release_status",
-            "release_status": f"{revision_ref}.release_status",
-            "updated_at": f"{revision_ref}.updated_at",
-        }
-        sort_direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
-        sort_column = sort_columns.get(sort_by)
-        if sort_by == "availability_state":
-            symbol_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_symbol_sort "
-                f"WHERE ra_symbol_sort.revision_id = {revision_ref}.id AND ra_symbol_sort.asset_type = 'symbol')"
-            )
-            footprint_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_footprint_sort "
-                f"WHERE ra_footprint_sort.revision_id = {revision_ref}.id AND ra_footprint_sort.asset_type = 'footprint')"
-            )
-            sort_column = f"CASE WHEN {symbol_exists} AND {footprint_exists} THEN 0 WHEN ({symbol_exists}) <> ({footprint_exists}) THEN 1 ELSE 2 END"
-
-        if sort_column:
-            order_sql = f"ORDER BY {sort_column} {sort_direction}, {revision_ref}.updated_at DESC"
-            order_params = []
-        elif query_text:
-            order_sql = (
-                f"ORDER BY CASE "
-                f"WHEN LOWER({revision_ref}.mpn) = LOWER(%s) THEN 0 "
-                f"WHEN LOWER({revision_ref}.mpn) LIKE LOWER(%s) THEN 1 "
-                f"WHEN LOWER({revision_ref}.name) LIKE LOWER(%s) THEN 2 "
-                f"ELSE 3 END, {revision_ref}.updated_at DESC"
-            )
-            order_params: list[Any] = [query_text, f"{query_text}%", f"{query_text}%"]
-        else:
-            order_sql = f"ORDER BY {revision_ref}.updated_at DESC"
-            order_params = []
-
         with self._connect() as conn:
-            total = int(
-                conn.execute(
-                    f"""
-                    SELECT COUNT(1) AS total
-                    FROM components c
-                    JOIN component_revisions {revision_ref} ON {revision_ref}.id = c.{revision_join_column}
-                    {where_sql}
-                    """,
-                    tuple(params),
-                ).fetchone()["total"]
-            )
-            rows = conn.execute(
-                f"""
-                SELECT c.*, {revision_ref}.id AS revision_id
-                FROM components c
-                JOIN component_revisions {revision_ref} ON {revision_ref}.id = c.{revision_join_column}
-                {where_sql}
-                {order_sql}
-                LIMIT %s OFFSET %s
-                """,
-                tuple(params + order_params + [page_size, offset]),
-            ).fetchall()
-            row_pairs: list[tuple[dict[str, Any], str]] = []
-            for row in rows:
-                component_row = dict(row)
-                revision_id = str(component_row.pop("revision_id"))
-                row_pairs.append((component_row, revision_id))
-
-            revision_ids = [revision_id for _, revision_id in row_pairs]
-            revisions_by_id: dict[str, dict[str, Any]] = {}
-            if revision_ids:
-                placeholders = ",".join("%s" for _ in revision_ids)
-                revision_rows = conn.execute(
-                    f"SELECT * FROM component_revisions WHERE id IN ({placeholders})",
-                    tuple(revision_ids),
-                ).fetchall()
-                revisions_by_id = {str(revision["id"]): dict(revision) for revision in revision_rows}
-
-            parsed_rows = []
-            for component_row, revision_id in row_pairs:
-                revision = revisions_by_id.get(revision_id)
-                if revision:
-                    parsed_rows.append((component_row, revision))
-
-            revision_ids = [str(rev["id"]) for _, rev in parsed_rows]
-            assets_by_revision: dict[str, list[dict[str, Any]]] = {}
-            all_asset_ids: list[str] = []
-            if revision_ids:
-                placeholders = ",".join("%s" for _ in revision_ids)
-                all_assets_rows = [
-                    dict(r) for r in conn.execute(
-                        f"""
-                        SELECT a.*, ra.required, ra.revision_id
-                        FROM revision_assets ra
-                        JOIN assets a ON a.id = ra.asset_id
-                        WHERE ra.revision_id IN ({placeholders})
-                        ORDER BY CASE a.asset_type
-                            WHEN 'symbol' THEN 1 WHEN 'footprint' THEN 2
-                            WHEN '3dmodel' THEN 3 WHEN 'spice' THEN 4 ELSE 99
-                        END, a.target_library, a.target_name
-                        """,
-                        tuple(revision_ids),
-                    ).fetchall()
-                ]
-                for asset_row in all_assets_rows:
-                    rev_id = str(asset_row.pop("revision_id"))
-                    assets_by_revision.setdefault(rev_id, []).append(asset_row)
-                    all_asset_ids.append(str(asset_row["id"]))
-
-            previews_by_revision: dict[str, list[dict[str, Any]]] = {}
-            validation_by_revision: dict[str, dict[str, dict[str, Any]]] = {}
-            if not lightweight:
-                for preview_row in self._load_previews_for_revisions(conn, revision_ids):
-                    preview_revision_id = str(preview_row.pop("revision_id"))
-                    previews_by_revision.setdefault(preview_revision_id, []).append(preview_row)
-            if revision_ids:
-                placeholders = ",".join("%s" for _ in revision_ids)
-                validation_rows = conn.execute(
-                    f"""
-                    SELECT *
-                    FROM asset_validation_runs
-                    WHERE revision_id IN ({placeholders})
-                    ORDER BY revision_id, asset_id, finished_at DESC, created_at DESC
-                    """,
-                    tuple(revision_ids),
-                ).fetchall()
-                for validation_row in validation_rows:
-                    revision_id = str(validation_row["revision_id"])
-                    asset_id = str(validation_row["asset_id"])
-                    revision_runs = validation_by_revision.setdefault(revision_id, {})
-                    if asset_id not in revision_runs:
-                        revision_runs[asset_id] = dict(validation_row)
-                inherited_rows = conn.execute(
-                    f"""
-                    SELECT run.*, run.revision_id AS inherited_from_revision_id,
-                           link.revision_id AS inherited_for_revision_id, link.asset_id AS linked_asset_id
-                    FROM revision_validation_evidence_links link
-                    JOIN asset_validation_runs run ON run.id = link.source_run_id
-                    WHERE link.revision_id IN ({placeholders})
-                    """,
-                    tuple(revision_ids),
-                ).fetchall()
-                for inherited_row in inherited_rows:
-                    revision_id = str(inherited_row["inherited_for_revision_id"])
-                    asset_id = str(inherited_row["linked_asset_id"])
-                    revision_runs = validation_by_revision.setdefault(revision_id, {})
-                    if asset_id not in revision_runs:
-                        revision_runs[asset_id] = dict(inherited_row)
-
-            items = []
-            for component_row, revision_row in parsed_rows:
-                rev_assets = assets_by_revision.get(str(revision_row["id"]), [])
-                if lightweight:
-                    validation = self._component_validation_summary(
-                        conn,
-                        str(revision_row["id"]),
-                        rev_assets,
-                        preloaded_runs=validation_by_revision.get(str(revision_row["id"]), {}),
-                    )
-                    items.append(
-                        self._component_summary_payload(
-                            component_row,
-                            revision_row,
-                            rev_assets,
-                            released_view=released_only,
-                            validation_summary=validation,
-                        )
-                    )
-                    continue
-                rev_previews = previews_by_revision.get(str(revision_row["id"]), [])
-                items.append(
-                    self._component_payload(
-                        conn,
-                        component_row,
-                        revision_row,
-                        released_view=released_only,
-                        preloaded_assets=rev_assets,
-                        preloaded_previews=rev_previews,
-                        preloaded_validation_runs=validation_by_revision.get(str(revision_row["id"]), {}),
-                    )
-                )
-
-        pages = max(1, (total + page_size - 1) // page_size)
-        return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
+            return self._component_queries.execute_list_components(conn, plan)
 
     def list_components_flat(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self.list_components(page=1, page_size=10000, **kwargs)["items"]
@@ -2734,17 +2425,7 @@ class ComponentCatalogDomainService:
         if runtime.category_cache is not None and (now - runtime.category_cache_ts) < runtime.category_cache_ttl:
             return runtime.category_cache
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT rr.category AS name, COUNT(1) AS count
-                FROM components c
-                JOIN component_revisions rr ON rr.id = c.released_revision_id
-                WHERE c.is_active = 1 AND c.released_revision_id <> '' AND rr.release_status = 'released'
-                GROUP BY rr.category
-                ORDER BY rr.category
-                """
-            ).fetchall()
-        result = [{"name": str(row["name"] or ""), "count": int(row["count"])} for row in rows]
+            result = self._component_queries.list_categories(conn)
         runtime.category_cache = result
         runtime.category_cache_ts = now
         return result
