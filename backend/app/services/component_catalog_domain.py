@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 from app.core.config import settings
+from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
 from app.services.catalog.runtime import (
     CatalogRuntime, DBL_EXPORT_DIRNAME, DEFAULT_STORE_DIRNAME, KLC_VALIDATION_DIRNAME,
     _ASSET_BROWSE_CACHE_TTL_SECONDS,
@@ -497,11 +498,14 @@ def _dbl_symbol_library_name(part_number: str, symbol_asset: dict[str, Any] | No
 
 
 class ComponentCatalogDomainService:
+    _catalog_locks: CatalogLockOperations = NoopCatalogLocks()
+
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
             store_root=store_root,
             database_path=self._database_path(database_url),
         )
+        self._catalog_locks: CatalogLockOperations = NoopCatalogLocks()
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -941,6 +945,7 @@ class ComponentCatalogDomainService:
         return normalized
 
     def _unique_slug(self, conn: Any, base: str) -> str:
+        self._catalog_locks.lock_slug_allocation(conn, base)
         slug = _slugify(base or "component")
         candidate = slug
         counter = 2
@@ -950,12 +955,10 @@ class ComponentCatalogDomainService:
         return candidate
 
     def _lock_component_identity(self, conn: Any, manufacturer: str, mpn: str) -> None:
-        # Persistence adapters provide their transaction-level identity lock.
-        _ = (conn, manufacturer, mpn)
+        self._catalog_locks.lock_component_identity(conn, manufacturer, mpn)
 
     def _lock_component_for_mutation(self, conn: Any, component_id: str) -> None:
-        # Persistence adapters provide their row-level component lock.
-        _ = (conn, component_id)
+        self._catalog_locks.lock_component_for_mutation(conn, component_id)
 
     def _assert_component_identity_available(
         self,
@@ -1037,6 +1040,7 @@ class ComponentCatalogDomainService:
         actor: str = "",
         details: dict[str, Any] | None = None,
     ) -> None:
+        self._catalog_locks.lock_audit_append(conn, component_id)
         previous = conn.execute(
             "SELECT sequence, event_hash FROM catalog_audit_events WHERE component_id = %s ORDER BY sequence DESC LIMIT 1",
             (component_id,),
@@ -1197,6 +1201,7 @@ class ComponentCatalogDomainService:
         change_summary: str = "",
         expected_revision_id: str = "",
     ) -> dict[str, Any]:
+        self._catalog_locks.lock_revision_clone(conn, component_id)
         component, current = self._active_revision_row(conn, component_id, released=False)
         if not component or not current:
             raise ValueError("Component not found")

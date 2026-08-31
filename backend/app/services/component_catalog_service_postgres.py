@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 
+from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
 from app.services.catalog.postgres_runtime import (
     CatalogPostgresConnection,
     PostgresCatalogRuntime,
@@ -41,9 +42,12 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     owns identities, revisions, workflow, usage, review, and audit state.
     """
 
+    _catalog_locks: CatalogLockOperations = PostgresCatalogLocks()
+
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._postgres_runtime = PostgresCatalogRuntime(database_url=database_url)
         super().__init__(store_root=store_root, database_url="postgres")
+        self._catalog_locks = PostgresCatalogLocks()
 
     def _database_path(self, database_url: str | None) -> Path:
         # Retained only for the legacy service's diagnostic property. PostgreSQL does
@@ -156,32 +160,6 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
 
     def _ensure_postgres_integrity_guards(self) -> None:
         ensure_postgres_integrity_guards(self._postgres_runtime)
-
-    def _clone_revision(self, conn: Any, component_id: str, **kwargs: Any) -> dict[str, Any]:
-        # Serialize version allocation and head updates per component. The unique
-        # (component_id, version) constraint remains the final invariant.
-        conn.execute("SELECT id FROM components WHERE id = %s FOR UPDATE", (component_id,)).fetchone()
-        return super()._clone_revision(conn, component_id, **kwargs)
-
-    def _lock_component_for_mutation(self, conn: Any, component_id: str) -> None:
-        conn.execute("SELECT id FROM components WHERE id = %s FOR UPDATE", (component_id,)).fetchone()
-
-    def _append_audit_event(self, conn: Any, *, component_id: str, **kwargs: Any) -> None:
-        # Prevent audit forks when independent workflow/import requests arrive at once.
-        conn.execute("SELECT id FROM components WHERE id = %s FOR UPDATE", (component_id,)).fetchone()
-        super()._append_audit_event(conn, component_id=component_id, **kwargs)
-
-    def _unique_slug(self, conn: Any, base: str) -> str:
-        # Stable transaction-scoped advisory lock eliminates concurrent slug races.
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"catalog-slug:{base}",)).fetchone()
-        return super()._unique_slug(conn, base)
-
-    def _lock_component_identity(self, conn: Any, manufacturer: str, mpn: str) -> None:
-        normalized = f"{manufacturer.strip().casefold()}\n{mpn.strip().casefold()}"
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtext(%s))",
-            (f"catalog-component-identity:{normalized}",),
-        ).fetchone()
 
     def close(self) -> None:
         self._catalog_runtime.close()
