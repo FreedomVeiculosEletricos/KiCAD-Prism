@@ -1593,16 +1593,11 @@ class ComponentCatalogDomainService:
     def reject_project_import_proposal(self, proposal_id: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            result = conn.execute(
-                """
-                UPDATE project_component_import_proposals
-                SET status = 'rejected', updated_at = %s
-                WHERE id = %s AND status = 'candidate'
-                """,
-                (_utc_now_iso(), proposal_id),
+            self._project_import_sessions.reject_proposal(
+                conn,
+                proposal_id,
+                now=_utc_now_iso(),
             )
-            if result.rowcount == 0:
-                raise ValueError("Project import proposal was not found or has already been resolved")
             conn.commit()
         return self.get_project_import_proposal(proposal_id) or {}
 
@@ -1664,32 +1659,14 @@ class ComponentCatalogDomainService:
         """Remove regenerable staged copies after every proposal is resolved."""
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT session.id
-                FROM project_component_import_sessions session
-                WHERE session.updated_at < %s
-                  AND NOT EXISTS (
-                    SELECT 1 FROM project_component_import_proposals proposal
-                    WHERE proposal.session_id = session.id
-                      AND proposal.status IN ('candidate', 'accepting')
-                  )
-                """,
-                (older_than,),
-            ).fetchall()
-        removed: list[str] = []
-        imports_root = (self._store_root / "imports").resolve()
-        for row in rows:
-            session_id = str(row["id"])
-            path = (imports_root / session_id).resolve()
-            try:
-                path.relative_to(imports_root)
-            except ValueError:
-                continue
-            if path.is_dir():
-                shutil.rmtree(path)
-                removed.append(session_id)
-        return {"removed": len(removed), "session_ids": removed}
+            session_ids = self._project_import_sessions.list_resolved_session_ids(
+                conn,
+                older_than=older_than,
+            )
+        return self._project_import_sessions.remove_staging_directories(
+            store_root=self._store_root,
+            session_ids=session_ids,
+        )
 
     def list_components(
         self,

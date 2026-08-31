@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
+from pathlib import Path
 from typing import Any
 
 from app.services.catalog.normalization import json_loads
@@ -174,6 +176,53 @@ class CatalogProjectImportSessions:
             )
             updated += cursor.rowcount
         return updated
+
+    def reject_proposal(self, conn: Any, proposal_id: str, *, now: str) -> None:
+        result = conn.execute(
+            """
+            UPDATE project_component_import_proposals
+            SET status = 'rejected', updated_at = %s
+            WHERE id = %s AND status = 'candidate'
+            """,
+            (now, proposal_id),
+        )
+        if result.rowcount == 0:
+            raise ValueError("Project import proposal was not found or has already been resolved")
+
+    def list_resolved_session_ids(self, conn: Any, *, older_than: str) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT session.id
+            FROM project_component_import_sessions session
+            WHERE session.updated_at < %s
+              AND NOT EXISTS (
+                SELECT 1 FROM project_component_import_proposals proposal
+                WHERE proposal.session_id = session.id
+                  AND proposal.status IN ('candidate', 'accepting')
+              )
+            """,
+            (older_than,),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    @staticmethod
+    def remove_staging_directories(
+        *,
+        store_root: Path,
+        session_ids: list[str],
+    ) -> dict[str, Any]:
+        removed: list[str] = []
+        imports_root = (Path(store_root) / "imports").resolve()
+        for session_id in session_ids:
+            path = (imports_root / session_id).resolve()
+            try:
+                path.relative_to(imports_root)
+            except ValueError:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+                removed.append(session_id)
+        return {"removed": len(removed), "session_ids": removed}
 
     @staticmethod
     def _proposal_payload(row: Any) -> dict[str, Any]:
