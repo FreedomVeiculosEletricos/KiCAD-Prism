@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
+from app.services.catalog.revision_kernel import CatalogRevisionKernel
 from app.services.catalog.postgres_runtime import (
     CatalogPostgresConnection,
     PostgresCatalogRuntime,
@@ -43,11 +44,13 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     """
 
     _catalog_locks: CatalogLockOperations = PostgresCatalogLocks()
+    _revision_kernel: CatalogRevisionKernel = CatalogRevisionKernel(_catalog_locks)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._postgres_runtime = PostgresCatalogRuntime(database_url=database_url)
         super().__init__(store_root=store_root, database_url="postgres")
         self._catalog_locks = PostgresCatalogLocks()
+        self._revision_kernel = CatalogRevisionKernel(self._catalog_locks)
 
     def _database_path(self, database_url: str | None) -> Path:
         # Retained only for the legacy service's diagnostic property. PostgreSQL does
