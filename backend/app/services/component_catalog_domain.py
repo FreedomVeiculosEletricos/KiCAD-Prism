@@ -29,6 +29,15 @@ from xml.etree import ElementTree
 from app.core.config import settings
 from app.services.catalog.component_history import CatalogComponentHistoryReads
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
+from app.services.catalog.normalization import (
+    json_loads as _json_loads,
+    preview_base_kind as _preview_base_kind,
+    preview_kind as _preview_kind,
+    preview_unit as _preview_unit,
+    preview_unit_label as _preview_unit_label,
+    sha256_bytes as _sha256_bytes,
+    sha256_file as _sha256_file,
+)
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
@@ -208,26 +217,6 @@ BUILTIN_METADATA_FIELDS: tuple[dict[str, Any], ...] = (
 _TOP_LEVEL_PROPERTY_RE = re.compile(r'^([ \t]+)\(property "([^"]+)" ')
 
 
-def _preview_base_kind(kind: str) -> str:
-    return kind.split(":unit", 1)[0]
-
-
-def _preview_unit(kind: str) -> int:
-    match = re.search(r":unit(\d+)$", kind)
-    return max(1, int(match.group(1))) if match else 1
-
-
-def _preview_kind(kind: str, unit: int) -> str:
-    return kind if unit <= 1 else f"{kind}:unit{unit}"
-
-
-def _preview_unit_label(kind: str) -> str:
-    unit = _preview_unit(kind)
-    if unit <= 26:
-        return f"Unit {chr(64 + unit)}"
-    return f"Unit {unit}"
-
-
 @dataclass
 class CatalogPreview:
     preview_id: str
@@ -270,18 +259,6 @@ def _remote_library_nickname(library_name: str) -> str:
 
 def _escape_symbol_property_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _sha256_file(file_path: Path) -> str:
-    digest = hashlib.sha256()
-    with file_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _symbol_property_block(name: str, value: str, *, indent: str = "    ", hidden: bool = True) -> str:
@@ -462,17 +439,6 @@ def _normalize_workflow_stage(stage: str) -> str:
 def _normalize_identity_value(value: Any) -> str:
     """Canonical catalog identity normalization: trim and lowercase only."""
     return str(value or "").strip().lower()
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if value in (None, ""):
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(str(value))
-    except json.JSONDecodeError:
-        return default
 
 
 def _quote_identifier(identifier: str) -> str:

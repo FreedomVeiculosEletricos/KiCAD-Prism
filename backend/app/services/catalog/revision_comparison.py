@@ -2,38 +2,15 @@
 
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
 
+from app.services.catalog.normalization import (
+    json_loads,
+    preview_base_kind,
+    preview_unit,
+    preview_unit_label,
+)
 from app.services.catalog.revision_kernel import CatalogRevisionKernel
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if value in (None, ""):
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(str(value))
-    except json.JSONDecodeError:
-        return default
-
-
-def _preview_base_kind(kind: str) -> str:
-    return kind.split(":unit", 1)[0]
-
-
-def _preview_unit(kind: str) -> int:
-    match = re.search(r":unit(\d+)$", kind)
-    return max(1, int(match.group(1))) if match else 1
-
-
-def _preview_unit_label(kind: str) -> str:
-    unit = _preview_unit(kind)
-    if unit <= 26:
-        return f"Unit {chr(64 + unit)}"
-    return f"Unit {unit}"
 
 
 class CatalogRevisionComparison:
@@ -71,11 +48,11 @@ class CatalogRevisionComparison:
         # Unit A as `symbol`, while regenerated records use `symbol:unit1`.
         # Returning both made the UI show two Unit A tabs.
         previews = {
-            (str(row["asset_id"]), _preview_base_kind(str(row["kind"])), _preview_unit(str(row["kind"]))): dict(row)
+            (str(row["asset_id"]), preview_base_kind(str(row["kind"])), preview_unit(str(row["kind"]))): dict(row)
             for row in evidence_rows
         }
         previews.update({
-            (str(row["asset_id"]), _preview_base_kind(str(row["kind"])), _preview_unit(str(row["kind"]))): dict(row)
+            (str(row["asset_id"]), preview_base_kind(str(row["kind"])), preview_unit(str(row["kind"]))): dict(row)
             for row in output_rows
         })
         return sorted(previews.values(), key=lambda row: (str(row["kind"]), str(row["asset_id"]), str(row["created_at"]), str(row["id"])))
@@ -101,8 +78,8 @@ class CatalogRevisionComparison:
         )
         before_metadata = {field: str(before.get(field) or "") for field in fixed_fields}
         after_metadata = {field: str(after.get(field) or "") for field in fixed_fields}
-        before_extra = _json_loads(before.get("extra_fields"), {})
-        after_extra = _json_loads(after.get("extra_fields"), {})
+        before_extra = json_loads(before.get("extra_fields"), {})
+        after_extra = json_loads(after.get("extra_fields"), {})
         for field in sorted(set(before_extra) | set(after_extra)):
             before_metadata[f"field:{field}"] = str(before_extra.get(field) or "")
             after_metadata[f"field:{field}"] = str(after_extra.get(field) or "")
@@ -131,7 +108,7 @@ class CatalogRevisionComparison:
                 key = f"{asset['asset_type']}:{asset['target_library']}:{asset['target_name']}"
                 asset_previews = sorted(
                     previews_by_asset.get(str(asset["id"]), []),
-                    key=lambda item: (_preview_unit(str(item["kind"])), str(item["id"])),
+                    key=lambda item: (preview_unit(str(item["kind"])), str(item["id"])),
                 )
                 preview = asset_previews[0] if asset_previews else None
                 preview_payloads = [
@@ -140,8 +117,8 @@ class CatalogRevisionComparison:
                         "previewStatus": str(item["status"]),
                         "previewSha256": str(item["sha256"]),
                         "previewGeneratorFingerprint": str(item["generator_fingerprint"]),
-                        "unit": _preview_unit(str(item["kind"])),
-                        "unitLabel": _preview_unit_label(str(item["kind"])),
+                        "unit": preview_unit(str(item["kind"])),
+                        "unitLabel": preview_unit_label(str(item["kind"])),
                     }
                     for item in asset_previews
                 ]
@@ -196,7 +173,7 @@ class CatalogRevisionComparison:
                     "isDefault": bool(row["is_default"]),
                     "displayOrder": int(row["display_order"]),
                     "sourceInternalPartNumber": str(row["source_internal_part_number"] or ""),
-                    "provenance": _json_loads(row.get("provenance_json"), {}),
+                    "provenance": json_loads(row.get("provenance_json"), {}),
                 }
                 for row in rows
             }

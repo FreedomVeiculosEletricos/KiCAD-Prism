@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import hashlib
 import json
 import uuid
 from typing import Any
 
 from app.services.catalog.locking import CatalogLockOperations
+from app.services.catalog.normalization import canonical_json, json_loads, sha256_text
 
 
 REVISION_MANIFEST_A0 = "prism.revision_manifest_a0"
@@ -33,25 +33,6 @@ def normalize_workflow_stage(stage: str) -> str:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if value in (None, ""):
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(str(value))
-    except json.JSONDecodeError:
-        return default
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def _sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class CatalogRevisionKernel:
@@ -106,8 +87,8 @@ class CatalogRevisionKernel:
         sequence = int(previous["sequence"] or 0) + 1 if previous else 1
         created_at = _utc_now_iso()
         event_id = str(uuid.uuid4())
-        details_json = _canonical_json(details or {})
-        canonical = _canonical_json(
+        details_json = canonical_json(details or {})
+        canonical = canonical_json(
             {
                 "id": event_id,
                 "component_id": component_id,
@@ -119,7 +100,7 @@ class CatalogRevisionKernel:
                 "created_at": created_at,
             }
         )
-        event_hash = _sha256_text(canonical)
+        event_hash = sha256_text(canonical)
         conn.execute(
             """
             INSERT INTO catalog_audit_events (
@@ -206,7 +187,7 @@ class CatalogRevisionKernel:
                         "is_default": bool(item["is_default"]),
                         "display_order": int(item["display_order"]),
                         "source_internal_part_number": str(item["source_internal_part_number"] or ""),
-                        "provenance": _json_loads(item["provenance_json"], {}),
+                        "provenance": json_loads(item["provenance_json"], {}),
                     }
                     for item in conn.execute(
                         "SELECT * FROM revision_representations WHERE revision_id = %s "
@@ -218,8 +199,8 @@ class CatalogRevisionKernel:
             }
         elif manifest_schema != REVISION_MANIFEST_A0:
             raise ValueError(f"Unsupported revision manifest schema: {manifest_schema}")
-        canonical = _canonical_json(payload)
-        return _sha256_text(canonical)
+        canonical = canonical_json(payload)
+        return sha256_text(canonical)
 
     def clone_revision(
         self,

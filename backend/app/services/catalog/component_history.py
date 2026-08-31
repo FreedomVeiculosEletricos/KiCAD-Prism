@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
@@ -11,25 +9,12 @@ from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
     normalize_workflow_stage,
 )
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if value in (None, ""):
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(str(value))
-    except json.JSONDecodeError:
-        return default
-
-
-def _sha256_file(file_path: Path) -> str:
-    digest = hashlib.sha256()
-    with file_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from app.services.catalog.normalization import (
+    canonical_json,
+    json_loads,
+    sha256_file,
+    sha256_text,
+)
 
 
 class CatalogComponentHistoryReads:
@@ -74,7 +59,7 @@ class CatalogComponentHistoryReads:
             (component_id,),
         ).fetchall()
         return [
-            {**dict(row), "details": _json_loads(row["details_json"], {})}
+            {**dict(row), "details": json_loads(row["details_json"], {})}
             for row in rows
         ]
 
@@ -119,8 +104,8 @@ class CatalogComponentHistoryReads:
                     "first_invalid_event_id": str(row["id"]),
                     "head_hash": previous_hash,
                 }
-            details = _json_loads(row["details_json"], {})
-            canonical = json.dumps(
+            details = json_loads(row["details_json"], {})
+            canonical = canonical_json(
                 {
                     "id": str(row["id"]),
                     "component_id": str(row["component_id"]),
@@ -130,11 +115,9 @@ class CatalogComponentHistoryReads:
                     "details": details,
                     "previous_hash": str(row["previous_hash"]),
                     "created_at": str(row["created_at"]),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+                }
             )
-            expected_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            expected_hash = sha256_text(canonical)
             if str(row["previous_hash"]) != previous_hash or str(row["event_hash"]) != expected_hash:
                 return {
                     "valid": False,
@@ -195,7 +178,7 @@ class CatalogComponentHistoryReads:
         ).fetchall()
         for asset in assets:
             path = Path(str(asset["canonical_path"]))
-            if not path.is_file() or _sha256_file(path) != str(asset["sha256"]):
+            if not path.is_file() or sha256_file(path) != str(asset["sha256"]):
                 return {
                     "valid": False,
                     "coverage": coverage,
@@ -241,8 +224,8 @@ class CatalogComponentHistoryReads:
         return [
             {
                 **dict(row),
-                "references": _json_loads(row["references_json"], []),
-                "details": _json_loads(row["details_json"], []),
+                "references": json_loads(row["references_json"], []),
+                "details": json_loads(row["details_json"], []),
                 "is_current": bool(row["is_current"]),
             }
             for row in rows
@@ -258,8 +241,8 @@ class CatalogComponentHistoryReads:
         return [
             {
                 **dict(row),
-                "validation": _json_loads(row["validation_json"], {}),
-                "policy": _json_loads(row["policy_json"], {}),
+                "validation": json_loads(row["validation_json"], {}),
+                "policy": json_loads(row["policy_json"], {}),
             }
             for row in rows
         ]
@@ -274,8 +257,8 @@ class CatalogComponentHistoryReads:
         return [
             {
                 **dict(row),
-                "validation": _json_loads(row["validation_json"], {}),
-                "policy": _json_loads(row["policy_json"], {}),
+                "validation": json_loads(row["validation_json"], {}),
+                "policy": json_loads(row["policy_json"], {}),
             }
             for row in rows
         ]
