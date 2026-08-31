@@ -50,6 +50,7 @@ from app.services.catalog.normalization import (
 from app.services.catalog.project_import_sessions import CatalogProjectImportSessions
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
 from app.services.catalog.project_import_assets import CatalogProjectImportAssets
+from app.services.catalog.project_import_acceptance import CatalogProjectImportAcceptance
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
@@ -450,6 +451,7 @@ class ComponentCatalogDomainService:
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
+    _project_import_acceptance: CatalogProjectImportAcceptance = CatalogProjectImportAcceptance()
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
@@ -465,6 +467,7 @@ class ComponentCatalogDomainService:
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
+        self._project_import_acceptance = CatalogProjectImportAcceptance()
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -1409,27 +1412,10 @@ class ComponentCatalogDomainService:
             raise ValueError("Import proposal not found")
         if proposal["status"] != "candidate":
             raise ValueError("Project import proposal has already been resolved")
-        source_metadata = dict(proposal["metadata"])
-        fields = dict(source_metadata.get("fields") or {})
-        normalized_input: dict[str, Any] = {
-            "value": source_metadata.get("value"),
-            "description": source_metadata.get("description"),
-            "datasheet": source_metadata.get("datasheet"),
-            "manufacturer": source_metadata.get("manufacturer"),
-            "manufacturer_part_number": source_metadata.get("manufacturer_part_number"),
-            "package_name": source_metadata.get("footprint"),
-            "vendor": fields.get("Vendor", ""),
-            "vendor_part_number": fields.get("Vendor Part Number", ""),
-            "mass_g": fields.get("Mass (g)", ""),
-            "rqjc_c_w": fields.get("RQjC (C/W)", ""),
-            "rqjc_top_c_w": fields.get("RQjC_top (C/W)", ""),
-            "temp_max_c": fields.get("Temp_max (C)", ""),
-            "temp_min_c": fields.get("Temp_min (C)", ""),
-            "power_dissipation_w": fields.get("Power Dissipation (W)", ""),
-            "rate": fields.get("Rate", ""),
-            "extra_fields": fields,
-            **(metadata_overrides or {}),
-        }
+        normalized_input = self._project_import_acceptance.build_normalized_input(
+            proposal,
+            metadata_overrides,
+        )
         metadata = self._normalize_metadata(normalized_input)
         candidates_by_type = self._project_import_assets.group_import_assets(proposal)
         # An asset type may instead be satisfied by an existing catalog asset. That is
@@ -1454,37 +1440,22 @@ class ComponentCatalogDomainService:
 
         now = _utc_now_iso()
         with self._connect() as conn:
-            claimed = conn.execute(
-                """
-                UPDATE project_component_import_proposals
-                SET status = 'accepting', updated_at = %s
-                WHERE id = %s AND status = 'candidate'
-                """,
-                (now, proposal_id),
+            self._project_import_acceptance.claim_proposal(
+                conn,
+                proposal_id,
+                now=now,
             )
-            if claimed.rowcount == 0:
-                raise ValueError("Project import proposal has already been resolved")
             self._lock_component_identity(conn, metadata["manufacturer"], metadata["mpn"])
-            existing = conn.execute(
-                """
-                SELECT c.id
-                FROM components c
-                JOIN component_revisions revision ON revision.id = c.current_revision_id
-                WHERE c.is_active = 1 AND lower(revision.manufacturer) = lower(%s) AND lower(revision.mpn) = lower(%s)
-                ORDER BY c.created_at
-                LIMIT 1
-                """,
-                (metadata["manufacturer"], metadata["mpn"]),
-            ).fetchone()
-            component_id = str(existing["id"]) if existing else str(uuid.uuid4())
-            provenance = list(proposal["provenance"])
-            provenance_source = str(provenance[0].get("source") or "project") if provenance else "project"
-            import_source = "folder_snapshot" if provenance_source == "folder_snapshot" else "project"
-            external_id = (
-                str(provenance[0].get("snapshotId") or provenance[0].get("projectId") or "")
-                if provenance
-                else ""
+            existing = self._project_import_acceptance.find_existing_component(
+                conn,
+                metadata["manufacturer"],
+                metadata["mpn"],
             )
+            component_id = str(existing["id"]) if existing else str(uuid.uuid4())
+            import_payload = self._project_import_acceptance.build_import_payload(proposal)
+            provenance = import_payload["provenance"]
+            import_source = import_payload["import_source"]
+            external_id = import_payload["external_id"]
             current_revision = (
                 self._revision_row(conn, str(self._component_row(conn, component_id)["current_revision_id"]))
                 if existing
@@ -1576,13 +1547,11 @@ class ComponentCatalogDomainService:
                 observed_at=now,
                 source="project_import",
             )
-            conn.execute(
-                """
-                UPDATE project_component_import_proposals
-                SET status = 'accepted', accepted_component_id = %s, updated_at = %s
-                WHERE id = %s AND status = 'accepting'
-                """,
-                (component_id, now, proposal_id),
+            self._project_import_acceptance.mark_proposal_accepted(
+                conn,
+                proposal_id,
+                component_id,
+                now=now,
             )
             conn.commit()
         return {
