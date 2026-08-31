@@ -47,6 +47,7 @@ from app.services.catalog.normalization import (
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_file,
 )
+from app.services.catalog.project_import_sessions import CatalogProjectImportSessions
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
@@ -444,6 +445,7 @@ class ComponentCatalogDomainService:
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
+    _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
@@ -456,6 +458,7 @@ class ComponentCatalogDomainService:
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
         self._component_queries = CatalogComponentQueries(self._component_read_models)
+        self._project_import_sessions = CatalogProjectImportSessions()
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -1254,26 +1257,17 @@ class ComponentCatalogDomainService:
         now = _utc_now_iso()
         session_id = str(uuid.uuid4())
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO project_component_import_sessions (
-                    id, scope, project_id, project_ids_json, project_revisions_json,
-                    source_revision, selection_json, status,
-                    created_by, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s)
-                """,
-                (
-                    session_id,
-                    scope,
-                    project_id,
-                    json.dumps(sorted(set(project_ids or ([project_id] if project_id else []))), separators=(",", ":")),
-                    json.dumps(project_revisions or {}, sort_keys=True, separators=(",", ":")),
-                    source_revision,
-                    json.dumps(selection or {}, sort_keys=True, separators=(",", ":")),
-                    actor,
-                    now,
-                    now,
-                ),
+            self._project_import_sessions.create_session(
+                conn,
+                session_id=session_id,
+                scope=scope,
+                project_id=project_id,
+                project_ids=project_ids or ([project_id] if project_id else []),
+                project_revisions=project_revisions or {},
+                source_revision=source_revision,
+                selection=selection or {},
+                actor=actor,
+                now=now,
             )
             conn.commit()
         return self.get_project_import_session(session_id) or {}
@@ -1281,151 +1275,63 @@ class ComponentCatalogDomainService:
     def get_project_import_session(self, session_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM project_component_import_sessions WHERE id = %s",
-                (session_id,),
-            ).fetchone()
-            if not row:
-                return None
-            payload = dict(row)
-            payload["selection"] = _json_loads(payload.pop("selection_json"), {})
-            payload["project_ids"] = _json_loads(payload.pop("project_ids_json"), [])
-            payload["project_revisions"] = _json_loads(payload.pop("project_revisions_json"), {})
-            count = conn.execute(
-                "SELECT COUNT(1) AS count FROM project_component_import_proposals WHERE session_id = %s",
-                (session_id,),
-            ).fetchone()
-            payload["proposal_count"] = int(count["count"] if count else 0)
-            return payload
+            return self._project_import_sessions.get_session(conn, session_id)
 
     def list_project_import_sessions(self, *, created_by: str = "", include_all: bool = False) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if include_all:
-                rows = conn.execute(
-                    "SELECT id FROM project_component_import_sessions ORDER BY created_at DESC LIMIT 100"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT id FROM project_component_import_sessions
-                    WHERE created_by = %s ORDER BY created_at DESC LIMIT 100
-                    """,
-                    (created_by,),
-                ).fetchall()
-        return [session for row in rows if (session := self.get_project_import_session(str(row["id"]))) is not None]
+            session_ids = self._project_import_sessions.list_session_ids(
+                conn,
+                created_by=created_by,
+                include_all=include_all,
+            )
+        return [session for session_id in session_ids if (session := self.get_project_import_session(session_id)) is not None]
 
     def update_project_import_session(self, session_id: str, *, status: str, error_message: str = "") -> None:
         if status not in {"queued", "uploading", "scanning", "staged", "failed"}:
             raise ValueError("Unsupported project import session status")
         self.initialize()
         with self._connect() as conn:
-            result = conn.execute(
-                "UPDATE project_component_import_sessions SET status = %s, error_message = %s, updated_at = %s WHERE id = %s",
-                (status, error_message, _utc_now_iso(), session_id),
+            self._project_import_sessions.update_session(
+                conn,
+                session_id,
+                status=status,
+                error_message=error_message,
+                now=_utc_now_iso(),
             )
-            if result.rowcount == 0:
-                raise ValueError("Project import session not found")
             conn.commit()
 
     def stage_project_import_proposals(self, session_id: str, proposals: list[dict[str, Any]]) -> None:
         self.initialize()
         now = _utc_now_iso()
         with self._connect() as conn:
-            if not conn.execute(
-                "SELECT 1 FROM project_component_import_sessions WHERE id = %s",
-                (session_id,),
-            ).fetchone():
-                raise ValueError("Project import session not found")
-            conn.execute("DELETE FROM project_component_import_proposals WHERE session_id = %s", (session_id,))
-            for proposal in proposals:
-                conn.execute(
-                    """
-                    INSERT INTO project_component_import_proposals (
-                        id, session_id, dedupe_key, component_uid, reference, metadata_json, assets_json,
-                        provenance_json, findings_json, status, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'candidate', %s, %s)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        session_id,
-                        str(proposal["dedupe_key"]),
-                        str(proposal.get("component_uid") or ""),
-                        str(proposal.get("reference") or ""),
-                        json.dumps(proposal.get("metadata") or {}, sort_keys=True, separators=(",", ":")),
-                        json.dumps(proposal.get("assets") or [], sort_keys=True, separators=(",", ":")),
-                        json.dumps(proposal.get("provenance") or [], sort_keys=True, separators=(",", ":")),
-                        json.dumps(proposal.get("findings") or [], sort_keys=True, separators=(",", ":")),
-                        now,
-                        now,
-                    ),
-                )
-            conn.execute(
-                "UPDATE project_component_import_sessions SET status = 'staged', updated_at = %s WHERE id = %s",
-                (now, session_id),
-            )
+            self._project_import_sessions.stage_proposals(conn, session_id, proposals, now=now)
             conn.commit()
 
     def list_project_import_proposals(self, session_id: str) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM project_component_import_proposals WHERE session_id = %s ORDER BY reference, id",
-                (session_id,),
-            ).fetchall()
-            proposals: list[dict[str, Any]] = []
-            for row in rows:
-                proposal = dict(row)
-                proposal["metadata"] = _json_loads(proposal.pop("metadata_json"), {})
-                proposal["assets"] = _json_loads(proposal.pop("assets_json"), [])
-                proposal["provenance"] = _json_loads(proposal.pop("provenance_json"), [])
-                proposal["findings"] = _json_loads(proposal.pop("findings_json"), [])
-                proposal["draft"] = _json_loads(proposal.pop("draft_json", "{}"), {})
-                proposals.append(proposal)
-            return proposals
+            return self._project_import_sessions.list_proposals(conn, session_id)
 
     def get_project_import_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM project_component_import_proposals WHERE id = %s",
-                (proposal_id,),
-            ).fetchone()
-            if not row:
-                return None
-            proposal = dict(row)
-            proposal["metadata"] = _json_loads(proposal.pop("metadata_json"), {})
-            proposal["assets"] = _json_loads(proposal.pop("assets_json"), [])
-            proposal["provenance"] = _json_loads(proposal.pop("provenance_json"), [])
-            proposal["findings"] = _json_loads(proposal.pop("findings_json"), [])
-            proposal["draft"] = _json_loads(proposal.pop("draft_json", "{}"), {})
-            return proposal
+            return self._project_import_sessions.get_proposal(conn, proposal_id)
 
     def save_project_import_drafts(
         self, session_id: str, drafts: dict[str, dict[str, Any]]
     ) -> int:
-        """Persist unaccepted grid edits so remediation survives a reload.
-
-        A large import is rarely resolved in one sitting. Keeping the edits on the
-        proposal, rather than in browser state, also lets a second reviewer pick up
-        where the first stopped.
-        """
         self.initialize()
         if not drafts:
             return 0
         now = _utc_now_iso()
         with self._connect() as conn:
-            updated = 0
-            for proposal_id, draft in drafts.items():
-                cursor = conn.execute(
-                    """
-                    UPDATE project_component_import_proposals
-                    SET draft_json = %s, updated_at = %s
-                    WHERE id = %s AND session_id = %s AND status = 'candidate'
-                    """,
-                    (json.dumps(draft or {}, separators=(",", ":")), now, proposal_id, session_id),
-                )
-                updated += cursor.rowcount
+            updated = self._project_import_sessions.save_drafts(
+                conn,
+                session_id,
+                drafts,
+                now=now,
+            )
             conn.commit()
         return updated
 
