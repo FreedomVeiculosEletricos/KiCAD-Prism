@@ -229,6 +229,10 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         for target, value in (
             ("app.services.component_catalog_domain.settings.CATALOG_KLC_ENABLED", False),
             ("app.services.component_catalog_domain.settings.CATALOG_KLC_RELEASE_GATE", "warn"),
+            (
+                "app.services.component_catalog_domain.settings.SESSION_SECRET",
+                "catalog-contract-test-secret",
+            ),
         ):
             settings_patcher = patch(target, value)
             settings_patcher.start()
