@@ -85,6 +85,7 @@ from app.services.catalog.project_import_sessions import CatalogProjectImportSes
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
 from app.services.catalog.project_import_assets import CatalogProjectImportAssets
 from app.services.catalog.project_import_acceptance import CatalogProjectImportAcceptance
+from app.services.catalog.preview_renderer import CatalogPreviewRenderer
 from app.services.catalog.preview_store import CatalogPreviewStore
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import (
@@ -376,6 +377,7 @@ class ComponentCatalogDomainService:
     _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
     _asset_files: CatalogAssetFiles = CatalogAssetFiles()
     _asset_registry: CatalogAssetRegistry = CatalogAssetRegistry()
+    _preview_renderer: CatalogPreviewRenderer = CatalogPreviewRenderer()
     _preview_store: CatalogPreviewStore = CatalogPreviewStore()
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
@@ -404,6 +406,7 @@ class ComponentCatalogDomainService:
         self._asset_browser = CatalogAssetBrowser()
         self._asset_files = CatalogAssetFiles()
         self._asset_registry = CatalogAssetRegistry()
+        self._preview_renderer = CatalogPreviewRenderer()
         self._preview_store = CatalogPreviewStore()
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
@@ -2817,19 +2820,7 @@ class ComponentCatalogDomainService:
 
     def _generate_symbol_preview(self, asset: dict[str, Any]) -> tuple[str, bytes | str]:
         """Compatibility single-unit renderer used by existing test/custom adapters."""
-        with tempfile.TemporaryDirectory(prefix="prism_symsvg_") as tmp_dir:
-            success, error = self._run_kicad_cli(
-                ["sym", "export", "svg", str(asset["canonical_path"]), "--output", tmp_dir, "--symbol", str(asset["target_name"])]
-            )
-            if not success:
-                return PREVIEW_STATUS_FAILED, error
-            expected = Path(tmp_dir) / f"{asset['target_name']}_unit1.svg"
-            if not expected.is_file():
-                candidates = sorted(Path(tmp_dir).glob("*.svg"))
-                if not candidates:
-                    return PREVIEW_STATUS_FAILED, "symbol preview export did not produce an SVG"
-                expected = candidates[0]
-            return PREVIEW_STATUS_READY, expected.read_bytes()
+        return self._preview_renderer.generate_symbol_preview(asset, self._run_kicad_cli)
 
     def _generate_symbol_preview_units(
         self,
@@ -2842,45 +2833,10 @@ class ComponentCatalogDomainService:
                 return status, str(result)
             return PREVIEW_STATUS_READY, [(1, result)]
 
-        with tempfile.TemporaryDirectory(prefix="prism_symsvg_units_") as tmp_dir:
-            success, error = self._run_kicad_cli(
-                ["sym", "export", "svg", str(asset["canonical_path"]), "--output", tmp_dir, "--symbol", str(asset["target_name"])]
-            )
-            if not success:
-                return PREVIEW_STATUS_FAILED, error
-            candidates = sorted(Path(tmp_dir).glob("*.svg"))
-            if not candidates:
-                return PREVIEW_STATUS_FAILED, "symbol preview export did not produce an SVG"
-            units: dict[int, bytes] = {}
-            for index, candidate in enumerate(candidates, start=1):
-                match = re.search(r"_unit(\d+)(?:[^0-9].*)?\.svg$", candidate.name, flags=re.IGNORECASE)
-                unit = int(match.group(1)) if match else index
-                units.setdefault(unit, candidate.read_bytes())
-            return PREVIEW_STATUS_READY, sorted(units.items())
+        return self._preview_renderer.generate_symbol_preview_units(asset, self._run_kicad_cli)
 
     def _generate_footprint_preview(self, asset: dict[str, Any]) -> tuple[str, bytes | str]:
-        with tempfile.TemporaryDirectory(prefix="prism_fpsvg_") as tmp_dir:
-            footprint_source = Path(str(asset["canonical_path"]))
-            target_name = str(asset["target_name"])
-            isolated_library = Path(tmp_dir) / "isolated.pretty"
-            isolated_library.mkdir(parents=True, exist_ok=True)
-            isolated_footprint = isolated_library / f"{_sanitize_name(target_name, footprint_source.stem)}.kicad_mod"
-            shutil.copy2(footprint_source, isolated_footprint)
-            success, error = self._run_kicad_cli(
-                [
-                    "fp", "export", "svg", "--output", tmp_dir,
-                    "--footprint", isolated_footprint.stem, str(isolated_library),
-                ]
-            )
-            if not success:
-                return PREVIEW_STATUS_FAILED, error
-            expected = Path(tmp_dir) / f"{target_name}.svg"
-            if not expected.is_file():
-                candidates = sorted(Path(tmp_dir).glob("*.svg"))
-                if not candidates:
-                    return PREVIEW_STATUS_FAILED, "footprint preview export did not produce an SVG"
-                expected = candidates[0]
-            return PREVIEW_STATUS_READY, expected.read_bytes()
+        return self._preview_renderer.generate_footprint_preview(asset, self._run_kicad_cli)
 
     def _store_preview_version(
         self,
