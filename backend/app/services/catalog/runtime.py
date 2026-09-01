@@ -126,6 +126,21 @@ class CatalogRuntime:
         with self.initialization_lock:
             self.initialized = False
 
+    def ensure_storage_dirs(self) -> None:
+        """Create the canonical store, preview, revision, export, and validation trees."""
+        for path in (
+            self.store_root / "symbols",
+            self.store_root / "footprints",
+            self.store_root / "3dmodels",
+            self.store_root / "spice",
+            self.store_root / "previews" / "symbols",
+            self.store_root / "previews" / "footprints",
+            self.store_root / "revisions",
+            self.export_root,
+            self.validation_root,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
     def browse_cache_lock_for(self, asset_type: str) -> threading.Lock:
         with self.browse_cache_lock:
             return self.browse_cache_locks.setdefault(asset_type, threading.Lock())

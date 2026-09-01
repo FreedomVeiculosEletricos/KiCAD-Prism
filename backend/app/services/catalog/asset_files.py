@@ -6,8 +6,21 @@ import mimetypes
 from pathlib import Path
 import re
 
+from app.services.catalog.metadata_normalization import dedupe
 from app.services.catalog.normalization import sanitize_name, sha256_bytes
 from app.services.catalog.runtime import CatalogRuntime
+
+
+def discover_symbol_names_in_text(text: str) -> list[str]:
+    """Top-level symbol names in a ``.kicad_sym`` payload, unit blocks excluded."""
+    matches = re.findall(r'\(symbol\s+"([^"]+)"', text)
+    filtered = [name for name in matches if not re.search(r"_\d+_\d+$", name)]
+    return dedupe(filtered or matches)
+
+
+def discover_footprint_name_in_text(text: str) -> str:
+    match = re.search(r'\(footprint\s+"([^"]+)"', text)
+    return match.group(1) if match else ""
 
 
 def content_type_for_asset(asset_type: str, file_path: Path) -> str:
@@ -172,4 +185,9 @@ class CatalogAssetFiles:
         return CatalogAssetFiles.asset_root(runtime, asset_type) / safe_library / safe_name
 
 
-__all__ = ["CatalogAssetFiles", "content_type_for_asset"]
+__all__ = [
+    "CatalogAssetFiles",
+    "content_type_for_asset",
+    "discover_footprint_name_in_text",
+    "discover_symbol_names_in_text",
+]

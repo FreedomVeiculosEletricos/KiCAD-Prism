@@ -20,6 +20,10 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.services.catalog.asset_imports import CatalogAssetImports  # noqa: E402
+from app.services.catalog.asset_registry import CatalogAssetRegistry  # noqa: E402
+from app.services.catalog.preview_pipeline import CatalogPreviewPipeline  # noqa: E402
+from app.services.catalog.preview_renderer import CatalogPreviewRenderer  # noqa: E402
 from app.services.catalog_schema_migrations import (  # noqa: E402
     MIGRATIONS,
     pending_catalog_migrations,
@@ -185,6 +189,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.component_ids: list[str] = []
+        self.metadata_field_ids: list[str] = []
         self.service = ComponentCatalogPostgresService(
             store_root=Path(self.tempdir.name) / "components",
             database_url=POSTGRES_URL,
@@ -194,7 +199,12 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         # The database is explicitly isolated from the application database.
         # Deactivation keeps the test database's own audit chain valid while the
-        # test database remains disposable as a unit.
+        # test database remains disposable as a unit. Custom metadata fields
+        # are archived for the same reason: the DBL export contract hashes the
+        # active field list, so a leaked field would fail the next run against
+        # this database.
+        for field_id in reversed(self.metadata_field_ids):
+            self.service.set_metadata_field_archived(field_id, True, actor="integration-test@local")
         for component_id in reversed(self.component_ids):
             self.assertTrue(
                 self.service.deactivate_component(
@@ -238,17 +248,17 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             settings_patcher.start()
             self.addCleanup(settings_patcher.stop)
 
-        def generate_symbol_units(_self: object, _asset: object) -> tuple[str, list[tuple[int, bytes]]]:
+        def generate_symbol_units(_asset: object, _run: object) -> tuple[str, list[tuple[int, bytes]]]:
             return PREVIEW_STATUS_READY, [(1, FIXTURE_PREVIEW_SVG)]
 
-        def generate_footprint(_self: object, _asset: object) -> tuple[str, bytes]:
+        def generate_footprint(_asset: object, _run: object) -> tuple[str, bytes]:
             return PREVIEW_STATUS_READY, FIXTURE_PREVIEW_SVG
 
-        def preview_identity(_self: object, kind: str) -> dict[str, str]:
+        def preview_identity(_runtime: object, kind: str) -> dict[str, str]:
             return _fixture_preview_identity(kind)
 
         def preserve_symbol_upload(
-            _self: object,
+            _runtime: object,
             _upload_name: str,
             payload: bytes,
         ) -> bytes:
@@ -256,26 +266,22 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             # kicad-cli. The canonical single-symbol extraction remains real.
             return payload
 
-        def no_existing_asset_signature(
-            _self: object,
-            *_args: object,
-            **_kwargs: object,
-        ) -> None:
+        def no_existing_asset_signature(*_args: object, **_kwargs: object) -> None:
             # Each test run owns a temporary store. Do not reuse immutable
             # asset rows whose previous backing files were removed at teardown.
             return None
 
-        # Patch the concrete service class. String names keep the architecture
-        # ratchet from counting these as new private callers.
-        service_cls = type(self.service)
-        for target, replacement in (
-            ("_asset_by_signature", no_existing_asset_signature),
-            ("_normalize_symbol_upload", preserve_symbol_upload),
-            ("_generate_symbol_preview_units", generate_symbol_units),
-            ("_generate_footprint_preview", generate_footprint),
-            ("_preview_generator_identity", preview_identity),
+        # Patch the package seams the service composes. They are static
+        # methods, so the replacement is wrapped to stay callable through both
+        # the class and an instance.
+        for owner, target, replacement in (
+            (CatalogAssetRegistry, "asset_by_signature", no_existing_asset_signature),
+            (CatalogAssetImports, "normalize_symbol_upload", preserve_symbol_upload),
+            (CatalogPreviewRenderer, "generate_symbol_preview_units", generate_symbol_units),
+            (CatalogPreviewRenderer, "generate_footprint_preview", generate_footprint),
+            (CatalogPreviewPipeline, "generator_identity", preview_identity),
         ):
-            patcher = patch.object(service_cls, target, replacement)
+            patcher = patch.object(owner, target, staticmethod(replacement))
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -455,6 +461,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             },
             actor="admin@example.com",
         )
+        self.metadata_field_ids.append(str(field["id"]))
         batch = self.service.stage_metadata_batch(
             [
                 {
