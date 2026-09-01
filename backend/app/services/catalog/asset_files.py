@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import mimetypes
 from pathlib import Path
 import re
 
 from app.services.catalog.normalization import sanitize_name, sha256_bytes
 from app.services.catalog.runtime import CatalogRuntime
+
+
+def content_type_for_asset(asset_type: str, file_path: Path) -> str:
+    if asset_type == "symbol":
+        return "application/x-kicad-symbol"
+    if asset_type == "footprint":
+        return "application/x-kicad-footprint"
+    if asset_type == "3dmodel":
+        return "model/step"
+    if asset_type == "spice":
+        if file_path.suffix.lower() in {".lib", ".mod", ".mdl"}:
+            return "application/x-spice"
+        return "application/octet-stream"
+    guessed, _ = mimetypes.guess_type(file_path.name)
+    return guessed or "application/octet-stream"
 
 
 class CatalogAssetFiles:
@@ -156,4 +172,4 @@ class CatalogAssetFiles:
         return CatalogAssetFiles.asset_root(runtime, asset_type) / safe_library / safe_name
 
 
-__all__ = ["CatalogAssetFiles"]
+__all__ = ["CatalogAssetFiles", "content_type_for_asset"]

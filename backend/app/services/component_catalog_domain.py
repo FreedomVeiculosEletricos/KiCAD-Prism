@@ -6,7 +6,6 @@ import hmac
 import io
 import json
 import logging
-import mimetypes
 import os
 import re
 import shutil
@@ -34,7 +33,11 @@ from app.services.catalog.component_read_models import (
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
 from app.services.catalog.asset_browser import CatalogAssetBrowser
-from app.services.catalog.asset_files import CatalogAssetFiles
+from app.services.catalog.asset_files import (
+    CatalogAssetFiles,
+    content_type_for_asset as _content_type_for_asset,
+)
+from app.services.catalog.asset_registry import CatalogAssetRegistry
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
 from app.services.catalog.metadata_batch_application import CatalogMetadataBatchApplication
 from app.services.catalog.metadata_batches import CatalogMetadataBatches
@@ -333,21 +336,6 @@ def _discover_footprint_name_in_text(text: str) -> str:
     return match.group(1) if match else ""
 
 
-def _content_type_for_asset(asset_type: str, file_path: Path) -> str:
-    if asset_type == "symbol":
-        return "application/x-kicad-symbol"
-    if asset_type == "footprint":
-        return "application/x-kicad-footprint"
-    if asset_type == "3dmodel":
-        return "model/step"
-    if asset_type == "spice":
-        if file_path.suffix.lower() in {".lib", ".mod", ".mdl"}:
-            return "application/x-spice"
-        return "application/octet-stream"
-    guessed, _ = mimetypes.guess_type(file_path.name)
-    return guessed or "application/octet-stream"
-
-
 def _release_allows_remote(release_status: str) -> bool:
     return release_status == "released"
 
@@ -386,6 +374,7 @@ class ComponentCatalogDomainService:
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
     _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
     _asset_files: CatalogAssetFiles = CatalogAssetFiles()
+    _asset_registry: CatalogAssetRegistry = CatalogAssetRegistry()
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -412,6 +401,7 @@ class ComponentCatalogDomainService:
         self._component_queries = CatalogComponentQueries(self._component_read_models)
         self._asset_browser = CatalogAssetBrowser()
         self._asset_files = CatalogAssetFiles()
+        self._asset_registry = CatalogAssetRegistry()
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
@@ -2786,11 +2776,9 @@ class ComponentCatalogDomainService:
         )
 
     def _asset_by_key(self, conn: Any, asset_type: str, canonical_path: str, target_name: str) -> dict[str, Any] | None:
-        row = conn.execute(
-            "SELECT * FROM assets WHERE asset_type = %s AND canonical_path = %s AND target_name = %s",
-            (asset_type, canonical_path, target_name),
-        ).fetchone()
-        return dict(row) if row else None
+        return self._asset_registry.asset_by_key(
+            conn, asset_type, canonical_path, target_name
+        )
 
     def _asset_by_signature(
         self,
@@ -2800,15 +2788,9 @@ class ComponentCatalogDomainService:
         target_library: str,
         target_name: str,
     ) -> dict[str, Any] | None:
-        row = conn.execute(
-            """
-            SELECT * FROM assets
-            WHERE asset_type = %s AND sha256 = %s AND target_library = %s AND target_name = %s
-            LIMIT 1
-            """,
-            (asset_type, sha256, target_library, target_name),
-        ).fetchone()
-        return dict(row) if row else None
+        return self._asset_registry.asset_by_signature(
+            conn, asset_type, sha256, target_library, target_name
+        )
 
     def _register_asset(
         self,
@@ -2820,91 +2802,15 @@ class ComponentCatalogDomainService:
         target_name: str,
         source_group: str = "",
     ) -> dict[str, Any]:
-        canonical_path = canonical_path.resolve()
-        payload = canonical_path.read_bytes()
-        sha256 = hashlib.sha256(payload).hexdigest()
-        existing = self._asset_by_key(conn, asset_type, str(canonical_path), target_name)
-        if existing:
-            if str(existing.get("sha256") or "") == sha256:
-                return existing
-            # A path already referenced by an immutable asset was edited in place.
-            # Preserve its historical database identity and ingest the observed bytes
-            # at a content-addressed path for the new revision.
-            try:
-                relative = canonical_path.relative_to(self._store_root)
-            except ValueError:
-                relative = Path(canonical_path.name)
-            immutable_path = self._store_root / "revisions" / sha256 / relative
-            immutable_path.parent.mkdir(parents=True, exist_ok=True)
-            if immutable_path.exists():
-                if immutable_path.read_bytes() != payload:
-                    raise ValueError(f"Immutable asset hash collision at {immutable_path}")
-            else:
-                immutable_path.write_bytes(payload)
-            canonical_path = immutable_path.resolve()
-            existing = self._asset_by_key(conn, asset_type, str(canonical_path), target_name)
-            if existing:
-                if str(existing.get("sha256") or "") != sha256:
-                    raise ValueError("Immutable asset identity does not match its content hash")
-                return existing
-        same_content = self._asset_by_signature(conn, asset_type, sha256, target_library, target_name)
-        if same_content:
-            existing_path = Path(str(same_content["canonical_path"]))
-            if not existing_path.is_file() or _sha256_file(existing_path) != sha256:
-                # Re-uploading identical content repairs a missing/corrupt backing file
-                # without changing immutable asset identity or revision manifests.
-                conn.execute(
-                    """
-                    UPDATE assets
-                    SET name = %s, canonical_path = %s, size_bytes = %s, content_type = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        canonical_path.name,
-                        str(canonical_path),
-                        canonical_path.stat().st_size,
-                        _content_type_for_asset(asset_type, canonical_path),
-                        _utc_now_iso(),
-                        same_content["id"],
-                    ),
-                )
-                same_content = dict(same_content)
-                same_content.update(
-                    {
-                        "name": canonical_path.name,
-                        "canonical_path": str(canonical_path),
-                        "size_bytes": canonical_path.stat().st_size,
-                        "content_type": _content_type_for_asset(asset_type, canonical_path),
-                    }
-                )
-            return same_content
-        now = _utc_now_iso()
-        asset_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO assets (
-                id, asset_type, name, canonical_path, target_library, target_name, source_group,
-                sha256, size_bytes, content_type, created_at, updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                asset_id,
-                asset_type,
-                canonical_path.name,
-                str(canonical_path),
-                target_library,
-                target_name,
-                source_group,
-                sha256,
-                canonical_path.stat().st_size,
-                _content_type_for_asset(asset_type, canonical_path),
-                now,
-                now,
-            ),
+        return self._asset_registry.register_asset(
+            self._runtime_for_compat(),
+            conn,
+            asset_type=asset_type,
+            canonical_path=canonical_path,
+            target_library=target_library,
+            target_name=target_name,
+            source_group=source_group,
         )
-        row = conn.execute("SELECT * FROM assets WHERE id = %s", (asset_id,)).fetchone()
-        return dict(row)
 
     def _generate_symbol_preview(self, asset: dict[str, Any]) -> tuple[str, bytes | str]:
         """Compatibility single-unit renderer used by existing test/custom adapters."""
