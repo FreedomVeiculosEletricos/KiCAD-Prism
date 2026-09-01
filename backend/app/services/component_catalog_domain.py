@@ -34,6 +34,7 @@ from app.services.catalog.component_read_models import (
     supply_source_payload as _supply_source_payload,
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
+from app.services.catalog.asset_browser import CatalogAssetBrowser
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
 from app.services.catalog.metadata_batch_application import CatalogMetadataBatchApplication
 from app.services.catalog.metadata_batches import CatalogMetadataBatches
@@ -395,6 +396,7 @@ class ComponentCatalogDomainService:
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
+    _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -419,6 +421,7 @@ class ComponentCatalogDomainService:
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
         self._component_queries = CatalogComponentQueries(self._component_read_models)
+        self._asset_browser = CatalogAssetBrowser()
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
@@ -2693,34 +2696,14 @@ class ComponentCatalogDomainService:
         """
         self.initialize()
         root = self._asset_root(asset_type)
-        now = time.monotonic()
-        with self._browse_cache_lock_for(asset_type):
-            with self._catalog_runtime.browse_cache_lock:
-                cached = self._browse_cache.get(asset_type)
-                generation = self._catalog_runtime.browse_cache_generation
-            if cached is None or now - cached[0] > _ASSET_BROWSE_CACHE_TTL_SECONDS:
-                if asset_type == "symbol":
-                    paths = root.rglob("*.kicad_sym")
-                elif asset_type == "footprint":
-                    paths = root.rglob("*.kicad_mod")
-                elif asset_type == "3dmodel":
-                    paths = [*root.rglob("*.step"), *root.rglob("*.stp")]
-                else:
-                    paths = root.rglob("*")
-                files = sorted(path.relative_to(root).as_posix() for path in paths if path.is_file())
-                with self._catalog_runtime.browse_cache_lock:
-                    # A write that landed while this walk was running already
-                    # cleared the cache. Storing the result now would reinstate a
-                    # listing taken before that write and hide it for a full TTL,
-                    # so leave the cache empty and let the next browse rebuild it.
-                    if self._catalog_runtime.browse_cache_generation == generation:
-                        self._browse_cache[asset_type] = (now, files)
-                all_files = files
-            else:
-                all_files = cached[1]
-        needle = q.strip().lower()
-        matches = [path for path in all_files if needle in path.lower()] if needle else list(all_files)
-        return {"files": matches[: max(1, limit)], "total": len(matches)}
+        return self._asset_browser.browse(
+            runtime=self._catalog_runtime,
+            root=root,
+            asset_type=asset_type,
+            q=q,
+            limit=limit,
+            now=time.monotonic(),
+        )
 
     def _attach_asset_revision(
         self,
