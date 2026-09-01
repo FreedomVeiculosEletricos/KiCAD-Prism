@@ -34,6 +34,7 @@ from app.services.catalog.component_read_models import (
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
 from app.services.catalog.asset_browser import CatalogAssetBrowser
+from app.services.catalog.asset_files import CatalogAssetFiles
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
 from app.services.catalog.metadata_batch_application import CatalogMetadataBatchApplication
 from app.services.catalog.metadata_batches import CatalogMetadataBatches
@@ -73,6 +74,7 @@ from app.services.catalog.normalization import (
     preview_unit_label as _preview_unit_label,
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_file,
+    sanitize_name as _sanitize_name,
     slugify as _slugify,
     utc_now_iso as _utc_now_iso,
 )
@@ -177,12 +179,6 @@ class CatalogPreview:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _sanitize_name(value: str, default: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in (value or "").strip())
-    cleaned = cleaned.strip("._-")
-    return cleaned or default
 
 
 def _remote_library_nickname(library_name: str) -> str:
@@ -389,6 +385,7 @@ class ComponentCatalogDomainService:
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
     _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
+    _asset_files: CatalogAssetFiles = CatalogAssetFiles()
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -414,6 +411,7 @@ class ComponentCatalogDomainService:
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
         self._component_queries = CatalogComponentQueries(self._component_read_models)
         self._asset_browser = CatalogAssetBrowser()
+        self._asset_files = CatalogAssetFiles()
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
@@ -567,15 +565,7 @@ class ComponentCatalogDomainService:
         }
 
     def _asset_root(self, asset_type: str) -> Path:
-        mapping = {
-            "symbol": self._store_root / "symbols",
-            "footprint": self._store_root / "footprints",
-            "3dmodel": self._store_root / "3dmodels",
-            "spice": self._store_root / "spice",
-        }
-        if asset_type not in mapping:
-            raise ValueError("Unsupported asset type")
-        return mapping[asset_type]
+        return self._asset_files.asset_root(self._runtime_for_compat(), asset_type)
 
     def _unique_slug(self, conn: Any, base: str) -> str:
         self._catalog_locks.lock_slug_allocation(conn, base)
@@ -2767,121 +2757,33 @@ class ComponentCatalogDomainService:
         return revision
 
     def _extract_top_level_symbol_blocks(self, text: str) -> list[tuple[str, str]]:
-        blocks: list[tuple[str, str]] = []
-        depth = 0
-        start: int | None = None
-        name = ""
-        in_string = False
-        escape = False
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                i += 1
-                continue
-            if ch == '"':
-                in_string = True
-                i += 1
-                continue
-            if ch == "(":
-                if depth == 1 and text.startswith("(symbol", i):
-                    start = i
-                    j = i + len("(symbol")
-                    while j < len(text) and text[j].isspace():
-                        j += 1
-                    if j < len(text) and text[j] == '"':
-                        j += 1
-                        k = j
-                        escaped = False
-                        chars: list[str] = []
-                        while k < len(text):
-                            current = text[k]
-                            if escaped:
-                                chars.append(current)
-                                escaped = False
-                            elif current == "\\":
-                                escaped = True
-                            elif current == '"':
-                                break
-                            else:
-                                chars.append(current)
-                            k += 1
-                        name = "".join(chars)
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if start is not None and depth == 1:
-                    blocks.append((name, text[start : i + 1]))
-                    start = None
-                    name = ""
-            i += 1
-        return blocks
+        return self._asset_files.extract_top_level_symbol_blocks(text)
 
     def _symbol_header(self, text: str) -> tuple[str, str]:
-        version_match = re.search(r"\(version\s+([^)]+)\)", text)
-        version = version_match.group(1) if version_match else "20211014"
-        generator_match = re.search(r"\(generator\s+([^)]+)\)", text)
-        generator = generator_match.group(1) if generator_match else '"KiCAD Prism"'
-        return version, generator
+        return self._asset_files.symbol_header(text)
 
     def _single_symbol_payload(self, text: str, selected_symbol: str) -> bytes:
-        blocks = self._extract_top_level_symbol_blocks(text)
-        blocks_dict = dict(blocks)
-        base_block = blocks_dict.get(selected_symbol)
-        if not base_block:
-            raise ValueError("Selected symbol was not found in the library")
-
-        escaped_name = re.escape(selected_symbol)
-        unit_pattern = re.compile(rf"^{escaped_name}_\d+_\d+$")
-        unit_blocks = [b for n, b in blocks if unit_pattern.match(n)]
-        all_blocks_text = "\n  ".join([base_block] + unit_blocks)
-        version, generator = self._symbol_header(text)
-        return f"(kicad_symbol_lib (version {version}) (generator {generator})\n  {all_blocks_text}\n)\n".encode("utf-8")
+        return self._asset_files.single_symbol_payload(text, selected_symbol)
 
     def _write_canonical_file(self, destination: Path, payload: bytes) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            existing = destination.read_bytes()
-            if existing == payload:
-                return destination
-            digest = hashlib.sha256(payload).hexdigest()
-            try:
-                relative = destination.resolve().relative_to(self._store_root)
-            except ValueError:
-                relative = Path(destination.name)
-            immutable_destination = self._store_root / "revisions" / digest / relative
-            immutable_destination.parent.mkdir(parents=True, exist_ok=True)
-            if immutable_destination.exists():
-                if immutable_destination.read_bytes() != payload:
-                    raise ValueError(f"Immutable asset hash collision at {immutable_destination}")
-                return immutable_destination
-            immutable_destination.write_bytes(payload)
-            self._invalidate_browse_cache()
-            return immutable_destination
-        destination.write_bytes(payload)
-        self._invalidate_browse_cache()
-        return destination
+        return self._asset_files.write_canonical_file(
+            self._runtime_for_compat(), destination, payload
+        )
 
     def _symbol_destination(self, target_library: str, target_name: str) -> Path:
-        safe_library = _sanitize_name(target_library, "Prism_Symbols")
-        safe_name = _sanitize_name(target_name, "symbol")
-        return self._store_root / "symbols" / safe_library / f"{safe_name}.kicad_sym"
+        return self._asset_files.symbol_destination(
+            self._runtime_for_compat(), target_library, target_name
+        )
 
     def _footprint_destination(self, target_library: str, target_name: str) -> Path:
-        safe_library = _sanitize_name(target_library, "Prism_Footprints")
-        safe_name = _sanitize_name(target_name, "footprint")
-        return self._store_root / "footprints" / f"{safe_library}.pretty" / f"{safe_name}.kicad_mod"
+        return self._asset_files.footprint_destination(
+            self._runtime_for_compat(), target_library, target_name
+        )
 
     def _aux_destination(self, asset_type: str, target_library: str, upload_name: str) -> Path:
-        safe_library = _sanitize_name(target_library, "Prism_Assets")
-        safe_name = _sanitize_name(Path(upload_name).name, f"{asset_type}.bin")
-        return self._asset_root(asset_type) / safe_library / safe_name
+        return self._asset_files.aux_destination(
+            self._runtime_for_compat(), asset_type, target_library, upload_name
+        )
 
     def _asset_by_key(self, conn: Any, asset_type: str, canonical_path: str, target_name: str) -> dict[str, Any] | None:
         row = conn.execute(

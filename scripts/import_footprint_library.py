@@ -97,12 +97,12 @@ def _load_catalog_runtime() -> None:
     try:
         from app.services.component_catalog_domain import (  # noqa: PLC0415
             _discover_footprint_name_in_text as loaded_discover_footprint_name,
-            _sanitize_name as loaded_sanitize_name,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
         )
         from app.services.catalog.normalization import (  # noqa: PLC0415
+            sanitize_name as loaded_sanitize_name,
             slugify as loaded_slugify,
             utc_now_iso as loaded_utc_now_iso,
         )

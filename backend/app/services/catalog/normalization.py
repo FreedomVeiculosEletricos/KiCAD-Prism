@@ -17,6 +17,12 @@ def slugify(value: str, default: str = "component") -> str:
     )
 
 
+def sanitize_name(value: str, default: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or default
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -74,6 +80,7 @@ def preview_unit_label(kind: str) -> str:
 
 __all__ = [
     "slugify",
+    "sanitize_name",
     "utc_now_iso",
     "json_loads",
     "canonical_json",

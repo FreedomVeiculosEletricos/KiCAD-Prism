@@ -41,10 +41,12 @@ def _load_catalog_runtime(database_url: str = "") -> None:
         from app.services.component_catalog_domain import (  # noqa: PLC0415
             _discover_footprint_name_in_text as loaded_discover_footprint_name,
             _discover_symbol_names_in_text as loaded_discover_symbol_names,
-            _sanitize_name as loaded_sanitize_name,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
+        )
+        from app.services.catalog.normalization import (  # noqa: PLC0415
+            sanitize_name as loaded_sanitize_name,
         )
         from app.core.config import settings  # noqa: PLC0415
     except ModuleNotFoundError as exc:
