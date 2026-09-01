@@ -10,9 +10,12 @@ from app.services.catalog.asset_links import CatalogAssetLinks
 from app.services.catalog.component_history import CatalogComponentHistoryReads
 from app.services.catalog.component_read_models import CatalogComponentReadModels
 from app.services.catalog.component_queries import CatalogComponentQueries
+from app.services.catalog.health import CatalogHealth
+from app.services.catalog.klc_validation import CatalogKlcValidation
 from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
 from app.services.catalog.preview_pipeline import CatalogPreviewPipeline
 from app.services.catalog.project_import_assets import CatalogProjectImportAssets
+from app.services.catalog.release_workflow import CatalogReleaseWorkflow
 from app.services.catalog.representations import CatalogRepresentations
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_finalization import CatalogRevisionFinalizer
@@ -75,6 +78,11 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     _representations: CatalogRepresentations = CatalogRepresentations(
         _revision_kernel, _revision_finalizer
     )
+    _klc_validation: CatalogKlcValidation = CatalogKlcValidation(_revision_kernel, _component_read_models)
+    _release_workflow: CatalogReleaseWorkflow = CatalogReleaseWorkflow(
+        _catalog_locks, _revision_kernel, _component_read_models, _revision_finalizer, _klc_validation
+    )
+    _catalog_health: CatalogHealth = CatalogHealth(_component_queries, _klc_validation)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._postgres_runtime = PostgresCatalogRuntime(database_url=database_url)
