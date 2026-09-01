@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import uuid
 from typing import Any
 
 from app.services.catalog.locking import CatalogLockOperations
-from app.services.catalog.normalization import canonical_json, json_loads, sha256_text
+from app.services.catalog.normalization import (
+    canonical_json,
+    json_loads,
+    sha256_text,
+    utc_now_iso as _utc_now_iso,
+)
 
 
 REVISION_MANIFEST_A0 = "prism.revision_manifest_a0"
@@ -29,10 +33,6 @@ LEGACY_WORKFLOW_STAGE_MAP = {
 def normalize_workflow_stage(stage: str) -> str:
     normalized = (stage or "").strip().lower()
     return LEGACY_WORKFLOW_STAGE_MAP.get(normalized, normalized)
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class CatalogRevisionKernel:

@@ -43,6 +43,8 @@ for candidate in (REPO_ROOT / "backend", REPO_ROOT):
         sys.path.insert(0, str(candidate))
         break
 
+from app.services.catalog.metadata_normalization import metadata_keywords, metadata_search_document  # noqa: E402
+
 ComponentCatalogService: Any = None
 _discover_footprint_name_in_text: Any = None
 _sanitize_name: Any = None
@@ -96,11 +98,13 @@ def _load_catalog_runtime() -> None:
         from app.services.component_catalog_domain import (  # noqa: PLC0415
             _discover_footprint_name_in_text as loaded_discover_footprint_name,
             _sanitize_name as loaded_sanitize_name,
-            _slugify as loaded_slugify,
-            _utc_now_iso as loaded_utc_now_iso,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
+        )
+        from app.services.catalog.normalization import (  # noqa: PLC0415
+            slugify as loaded_slugify,
+            utc_now_iso as loaded_utc_now_iso,
         )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
@@ -523,9 +527,9 @@ def _insert_component(
             metadata["rate"],
             metadata["sap_code"],
             metadata["summary"],
-            json.dumps(service._keywords(metadata), separators=(",", ":")),  # type: ignore[attr-defined]
+            json.dumps(metadata_keywords(metadata), separators=(",", ":")),
             json.dumps(metadata["extra_fields"], sort_keys=True, separators=(",", ":")),
-            service._search_document(metadata),  # type: ignore[attr-defined]
+            metadata_search_document(metadata),
             now,
             now,
         ),

@@ -22,6 +22,9 @@ for candidate in (REPO_ROOT / "backend", REPO_ROOT):
         sys.path.insert(0, str(candidate))
         break
 
+from app.services.catalog.metadata_normalization import metadata_keywords, metadata_search_document, normalize_metadata  # noqa: E402
+from app.services.catalog.metadata_schema import CatalogMetadataSchema  # noqa: E402
+
 ComponentCatalogService: Any = None
 _discover_footprint_name_in_text: Any = None
 _sanitize_name: Any = None
@@ -33,21 +36,20 @@ MAX_REPORTED_ERRORS = 100
 
 def _load_catalog_runtime() -> None:
     global ComponentCatalogService
-    global _discover_footprint_name_in_text
-    global _sanitize_name
-    global _utc_now_iso
-
-    global _slugify
+    global _discover_footprint_name_in_text, _sanitize_name
+    global _utc_now_iso, _slugify
 
     try:
         from app.services.component_catalog_domain import (  # noqa: PLC0415
             _discover_footprint_name_in_text as loaded_discover_footprint_name,
             _sanitize_name as loaded_sanitize_name,
-            _slugify as loaded_slugify,
-            _utc_now_iso as loaded_utc_now_iso,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
+        )
+        from app.services.catalog.normalization import (  # noqa: PLC0415
+            slugify as loaded_slugify,
+            utc_now_iso as loaded_utc_now_iso,
         )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
@@ -573,9 +575,9 @@ def _insert_import_component(
             metadata["rate"],
             metadata["sap_code"],
             metadata["summary"],
-            json.dumps(service._keywords(metadata), separators=(",", ":")),  # type: ignore[attr-defined]
+            json.dumps(metadata_keywords(metadata), separators=(",", ":")),
             json.dumps(metadata["extra_fields"], sort_keys=True, separators=(",", ":")),
-            service._search_document(metadata),  # type: ignore[attr-defined]
+            metadata_search_document(metadata),
             now,
             now,
         ),
@@ -651,14 +653,11 @@ def _collect_import_plans(
                 continue
 
             stats.rows_selected += 1
-            metadata = service._normalize_metadata(  # type: ignore[attr-defined]
+            metadata = normalize_metadata(
                 _metadata_from_row_cached(
                     row, table, import_name, column_map, source_namespace
                 )
             )
-            # _normalize_metadata intentionally returns only catalog revision
-            # fields. Keep import origin alongside that normalized payload so
-            # every identity kind receives the component-level provenance tag.
             metadata["import_source_namespace"] = source_namespace
             if metadata["extra_fields"].get(MPN_SOURCE_FIELD_LABEL) == MPN_SOURCE_DATABASE:
                 stats.mpn_recovered += 1
@@ -1039,7 +1038,7 @@ def _import_groups(
         for key in group.metadata.get("extra_fields", {})
     }
     if discovered_keys:
-        service._ensure_extra_field_definitions(  # type: ignore[attr-defined]
+        CatalogMetadataSchema().ensure_extra_field_definitions(
             target_conn,
             sorted(discovered_keys),
             actor=DATABASE_LIBRARY_IMPORT_ACTOR,

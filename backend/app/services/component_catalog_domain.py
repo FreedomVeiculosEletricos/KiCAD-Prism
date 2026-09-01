@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import base64
-import csv
-from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
 import io
@@ -22,8 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
-from urllib.parse import urlparse
+from typing import Any, Callable, Iterator
 from xml.etree import ElementTree
 
 from app.core.config import settings
@@ -38,6 +35,36 @@ from app.services.catalog.component_read_models import (
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
+from app.services.catalog.metadata_batch_application import CatalogMetadataBatchApplication
+from app.services.catalog.metadata_batches import CatalogMetadataBatches
+from app.services.catalog.metadata_batch_staging import CatalogMetadataBatchStaging
+from app.services.catalog.metadata_csv import (
+    CSV_ASSET_COLUMNS,
+    CSV_REQUIRED_COLUMNS,
+    CSV_SPREADSHEET_TEXT_GUARD,
+    CatalogMetadataCsv,
+)
+from app.services.catalog.inventory_csv import CatalogInventoryCsv
+from app.services.catalog.metadata_fields import CatalogMetadataFields
+from app.services.catalog.metadata_grid import CatalogMetadataGrid
+from app.services.catalog.metadata_schema import (
+    BUILTIN_METADATA_FIELDS,
+    CatalogMetadataSchema,
+    METADATA_FIELD_TYPES,
+    METADATA_SCHEMA_VERSION,
+    SYMBOL_METADATA_LABEL_TO_KEY,
+)
+from app.services.catalog.metadata_normalization import (
+    IDENTITY_KIND_MPN,
+    IDENTITY_KIND_PROVISIONAL_IPN,
+    MPN_SOURCE_MANUFACTURER,
+    MPN_SOURCE_PROVISIONAL_IPN,
+    dedupe,
+    metadata_keywords,
+    metadata_search_document,
+    normalize_identity_value,
+    normalize_metadata,
+)
 from app.services.catalog.normalization import (
     json_loads as _json_loads,
     preview_base_kind as _preview_base_kind,
@@ -46,6 +73,8 @@ from app.services.catalog.normalization import (
     preview_unit_label as _preview_unit_label,
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_file,
+    slugify as _slugify,
+    utc_now_iso as _utc_now_iso,
 )
 from app.services.catalog.project_import_sessions import CatalogProjectImportSessions
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
@@ -74,11 +103,6 @@ PREVIEW_KIND_FOOTPRINT = "footprint"
 PREVIEW_STATUS_READY = "ready"
 PREVIEW_STATUS_FAILED = "failed"
 PREVIEW_PIPELINE_VERSION = "prism-preview-a2-multi-unit"
-
-IDENTITY_KIND_MPN = "mpn"
-IDENTITY_KIND_PROVISIONAL_IPN = "provisional_ipn"
-MPN_SOURCE_MANUFACTURER = "manufacturer"
-MPN_SOURCE_PROVISIONAL_IPN = "provisional_ipn"
 
 SOURCE_MANUAL = "manual"
 SOURCE_EXTERNAL = "external"
@@ -118,43 +142,6 @@ SYMBOL_METADATA_FIELD_ORDER: tuple[str, ...] = (
     "SAP Code",
 )
 
-SYMBOL_METADATA_LABEL_TO_KEY = {
-    "Value": "value",
-    "Description": "description",
-    "Datasheet": "datasheet_url",
-    "Manufacturer": "manufacturer",
-    "Manufacturer Part Number": "mpn",
-    "Vendor": "vendor",
-    "Vendor Part Number": "vendor_part_number",
-    "Mass (g)": "mass_g",
-    "RQjC (C/W)": "rqjc_c_w",
-    "RQjC_top (C/W)": "rqjc_top_c_w",
-    "Temp_max (C)": "temp_max_c",
-    "Temp_min (C)": "temp_min_c",
-    "Power Dissipation (W)": "power_dissipation_w",
-    "Rate": "rate",
-    "SAP Code": "sap_code",
-}
-
-CSV_REQUIRED_COLUMNS = (
-    "value",
-    "datasheet",
-    "description",
-    "manufacturer",
-    "manufacturer_part_number",
-)
-
-CSV_ASSET_COLUMNS = (
-    "symbol_file_path",
-    "symbol_target_library",
-    "symbol_target_name",
-    "footprint_file_path",
-    "footprint_target_library",
-    "footprint_target_name",
-    "model_3d_file_path",
-    "spice_file_path",
-)
-
 DBL_COMMON_COLUMNS: tuple[str, ...] = (
     "Part Number",
     "Part Number Nocolon",
@@ -168,29 +155,6 @@ DBL_COMMON_COLUMNS: tuple[str, ...] = (
     "Datasheet",
     "LibSymbol",
     "LibFootprint",
-)
-
-METADATA_SCHEMA_VERSION = "prism.component_metadata_a1"
-METADATA_FIELD_TYPES = {"text", "number", "url", "boolean", "enum"}
-CSV_SPREADSHEET_TEXT_GUARD = "\u200b"
-BUILTIN_METADATA_FIELDS: tuple[dict[str, Any], ...] = (
-    {"key": "value", "label": "Value", "group": "core", "type": "text", "required": True},
-    {"key": "category", "label": "Category", "group": "core", "type": "text"},
-    {"key": "description", "label": "Description", "group": "core", "type": "text", "required": True},
-    {"key": "datasheet_url", "label": "Datasheet", "group": "core", "type": "url", "required": True},
-    {"key": "manufacturer", "label": "Manufacturer", "group": "core", "type": "text", "required": True},
-    {"key": "mpn", "label": "Manufacturer Part Number", "group": "core", "type": "text", "required": True},
-    {"key": "vendor", "label": "Vendor", "group": "core", "type": "text"},
-    {"key": "vendor_part_number", "label": "Vendor Part Number", "group": "core", "type": "text"},
-    {"key": "package_name", "label": "Package / Footprint", "group": "core", "type": "text"},
-    {"key": "mass_g", "label": "Mass", "group": "engineering", "type": "number", "unit": "g"},
-    {"key": "rqjc_c_w", "label": "RQjC", "group": "engineering", "type": "number", "unit": "C/W"},
-    {"key": "rqjc_top_c_w", "label": "RQjC top", "group": "engineering", "type": "number", "unit": "C/W"},
-    {"key": "temp_max_c", "label": "Maximum temperature", "group": "engineering", "type": "number", "unit": "C"},
-    {"key": "temp_min_c", "label": "Minimum temperature", "group": "engineering", "type": "number", "unit": "C"},
-    {"key": "power_dissipation_w", "label": "Power dissipation", "group": "engineering", "type": "number", "unit": "W"},
-    {"key": "rate", "label": "Rate", "group": "engineering", "type": "number"},
-    {"key": "sap_code", "label": "SAP Code", "group": "core", "type": "text"},
 )
 
 _TOP_LEVEL_PROPERTY_RE = re.compile(r'^([ \t]+)\(property "([^"]+)" ')
@@ -213,15 +177,6 @@ class CatalogPreview:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _utc_now_iso() -> str:
-    return _utc_now().isoformat()
-
-
-def _slugify(value: str, default: str = "component") -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", (value or "").strip().lower()).strip("._-")
-    return cleaned or default
 
 
 def _sanitize_name(value: str, default: str) -> str:
@@ -371,20 +326,10 @@ def _rewrite_footprint_payload(
     return text.encode("utf-8")
 
 
-def _dedupe(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            ordered.append(value)
-    return ordered
-
-
 def _discover_symbol_names_in_text(text: str) -> list[str]:
     matches = re.findall(r'\(symbol\s+"([^"]+)"', text)
     filtered = [name for name in matches if not re.search(r"_\d+_\d+$", name)]
-    return _dedupe(filtered or matches)
+    return dedupe(filtered or matches)
 
 
 def _discover_footprint_name_in_text(text: str) -> str:
@@ -413,11 +358,6 @@ def _release_allows_remote(release_status: str) -> bool:
 
 def _normalize_workflow_stage(stage: str) -> str:
     return normalize_workflow_stage(stage)
-
-
-def _normalize_identity_value(value: Any) -> str:
-    """Canonical catalog identity normalization: trim and lowercase only."""
-    return str(value or "").strip().lower()
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -452,6 +392,14 @@ class ComponentCatalogDomainService:
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
     _project_import_acceptance: CatalogProjectImportAcceptance = CatalogProjectImportAcceptance()
+    _metadata_schema: CatalogMetadataSchema = CatalogMetadataSchema()
+    _metadata_fields: CatalogMetadataFields = CatalogMetadataFields(_metadata_schema)
+    _metadata_grid: CatalogMetadataGrid = CatalogMetadataGrid()
+    _metadata_csv: CatalogMetadataCsv = CatalogMetadataCsv()
+    _inventory_csv: CatalogInventoryCsv = CatalogInventoryCsv()
+    _metadata_batches: CatalogMetadataBatches = CatalogMetadataBatches()
+    _metadata_batch_staging: CatalogMetadataBatchStaging = CatalogMetadataBatchStaging()
+    _metadata_batch_application: CatalogMetadataBatchApplication = CatalogMetadataBatchApplication()
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
@@ -468,6 +416,14 @@ class ComponentCatalogDomainService:
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
         self._project_import_acceptance = CatalogProjectImportAcceptance()
+        self._metadata_schema: CatalogMetadataSchema = CatalogMetadataSchema()
+        self._metadata_fields: CatalogMetadataFields = CatalogMetadataFields(self._metadata_schema)
+        self._metadata_grid: CatalogMetadataGrid = CatalogMetadataGrid()
+        self._metadata_csv: CatalogMetadataCsv = CatalogMetadataCsv()
+        self._inventory_csv: CatalogInventoryCsv = CatalogInventoryCsv()
+        self._metadata_batches = CatalogMetadataBatches()
+        self._metadata_batch_staging = CatalogMetadataBatchStaging()
+        self._metadata_batch_application = CatalogMetadataBatchApplication()
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -538,179 +494,6 @@ class ComponentCatalogDomainService:
         raise NotImplementedError("Catalog persistence must provide a PostgreSQL connection")
         yield  # pragma: no cover
 
-
-    def _ensure_metadata_schema(self, conn: Any) -> None:
-        """Create the metadata-editing registry and durable batch tables.
-
-        The DDL stays beside the catalog invariants while PostgreSQL initialization
-        applies it behind the versioned schema fence.
-        """
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS catalog_field_definitions (
-                id TEXT PRIMARY KEY,
-                field_key TEXT NOT NULL UNIQUE,
-                label TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                field_group TEXT NOT NULL DEFAULT 'custom',
-                field_type TEXT NOT NULL DEFAULT 'text',
-                unit TEXT NOT NULL DEFAULT '',
-                enum_values_json TEXT NOT NULL DEFAULT '[]',
-                storage_kind TEXT NOT NULL DEFAULT 'extra',
-                storage_key TEXT NOT NULL,
-                built_in INTEGER NOT NULL DEFAULT 0,
-                required INTEGER NOT NULL DEFAULT 0,
-                display_order INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0,
-                created_by TEXT NOT NULL DEFAULT '',
-                updated_by TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS catalog_field_definition_events (
-                id TEXT PRIMARY KEY,
-                field_id TEXT NOT NULL REFERENCES catalog_field_definitions(id),
-                event_type TEXT NOT NULL,
-                actor TEXT NOT NULL DEFAULT '',
-                before_json TEXT NOT NULL DEFAULT '{}',
-                after_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS catalog_grid_preferences (
-                user_email TEXT PRIMARY KEY,
-                layout_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS catalog_metadata_batches (
-                id TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'draft',
-                schema_version TEXT NOT NULL,
-                change_summary TEXT NOT NULL DEFAULT '',
-                unknown_fields_json TEXT NOT NULL DEFAULT '[]',
-                created_by TEXT NOT NULL DEFAULT '',
-                total_items INTEGER NOT NULL DEFAULT 0,
-                valid_items INTEGER NOT NULL DEFAULT 0,
-                applied_items INTEGER NOT NULL DEFAULT 0,
-                failed_items INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS catalog_metadata_batch_items (
-                id TEXT PRIMARY KEY,
-                batch_id TEXT NOT NULL REFERENCES catalog_metadata_batches(id) ON DELETE CASCADE,
-                component_id TEXT NOT NULL REFERENCES components(id) ON DELETE CASCADE,
-                expected_revision_id TEXT NOT NULL,
-                patch_json TEXT NOT NULL DEFAULT '{}',
-                diff_json TEXT NOT NULL DEFAULT '[]',
-                validation_status TEXT NOT NULL DEFAULT 'valid',
-                error_message TEXT NOT NULL DEFAULT '',
-                applied_revision_id TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(batch_id, component_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS revision_validation_evidence_links (
-                revision_id TEXT NOT NULL REFERENCES component_revisions(id) ON DELETE CASCADE,
-                asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-                source_run_id TEXT NOT NULL REFERENCES asset_validation_runs(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(revision_id, asset_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_catalog_fields_order ON catalog_field_definitions(archived, display_order, field_key);
-            CREATE INDEX IF NOT EXISTS idx_metadata_batches_actor ON catalog_metadata_batches(created_by, created_at);
-            CREATE INDEX IF NOT EXISTS idx_metadata_batch_items_batch ON catalog_metadata_batch_items(batch_id, validation_status);
-            """
-        )
-        now = _utc_now_iso()
-        for index, field in enumerate(BUILTIN_METADATA_FIELDS):
-            field_id = f"builtin:{field['key']}"
-            conn.execute(
-                """
-                INSERT INTO catalog_field_definitions (
-                    id, field_key, label, description, field_group, field_type, unit,
-                    enum_values_json, storage_kind, storage_key, built_in, required,
-                    display_order, archived, created_by, updated_by, created_at, updated_at
-                ) VALUES (%s, %s, %s, '', %s, %s, %s, '[]', 'column', %s, 1, %s, %s, 0, 'system', 'system', %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                (
-                    field_id,
-                    field["key"],
-                    field["label"],
-                    field["group"],
-                    field["type"],
-                    field.get("unit", ""),
-                    field["key"],
-                    int(bool(field.get("required"))),
-                    index,
-                    now,
-                    now,
-                ),
-            )
-        legacy_keys: set[str] = set()
-        for row in conn.execute(
-            "SELECT cr.extra_fields FROM components c "
-            "JOIN component_revisions cr ON cr.id = c.current_revision_id WHERE c.is_active = 1"
-        ).fetchall():
-            legacy_keys.update(str(key) for key in _json_loads(row["extra_fields"], {}) if str(key).strip())
-        self._ensure_extra_field_definitions(conn, legacy_keys, actor="system:migration")
-
-    def _ensure_extra_field_definitions(
-        self,
-        conn: Any,
-        storage_keys: Iterable[str],
-        *,
-        actor: str,
-    ) -> None:
-        reserved = {
-            "reference", "footprint", "lib_id", "ki_keywords", "ki_description",
-            *(str(field["key"]).casefold() for field in BUILTIN_METADATA_FIELDS),
-            *(str(label).casefold() for label in SYMBOL_METADATA_LABEL_TO_KEY),
-        }
-        existing_rows = [dict(row) for row in conn.execute("SELECT * FROM catalog_field_definitions").fetchall()]
-        existing_storage = {
-            str(row["storage_key"]): row for row in existing_rows if str(row["storage_kind"]) == "extra"
-        }
-        used_keys = {str(row["field_key"]) for row in existing_rows}
-        order_row = conn.execute("SELECT COALESCE(MAX(display_order), -1) AS value FROM catalog_field_definitions").fetchone()
-        next_order = int(order_row["value"] if order_row and order_row["value"] is not None else -1) + 1
-        now = _utc_now_iso()
-        for raw_key in sorted({str(key).strip() for key in storage_keys if str(key).strip()}, key=str.casefold):
-            if raw_key in existing_storage or raw_key.casefold() in reserved:
-                continue
-            base_key = re.sub(r"[^a-z0-9_]+", "_", raw_key.casefold()).strip("_") or "field"
-            field_key = base_key
-            if field_key in used_keys:
-                field_key = f"{base_key}_{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()[:8]}"
-            while field_key in used_keys:
-                field_key = f"{field_key}_2"
-            field_id = f"discovered:{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()[:24]}"
-            conn.execute(
-                """
-                INSERT INTO catalog_field_definitions (
-                    id, field_key, label, description, field_group, field_type, unit,
-                    enum_values_json, storage_kind, storage_key, built_in, required,
-                    display_order, archived, created_by, updated_by, created_at, updated_at
-                ) VALUES (%s, %s, %s, 'Discovered from existing KiCad component metadata', 'custom',
-                          'text', '', '[]', 'extra', %s, 0, 0, %s, 0, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                (field_id, field_key, raw_key, raw_key, next_order, actor, actor, now, now),
-            )
-            row = conn.execute("SELECT * FROM catalog_field_definitions WHERE id = %s", (field_id,)).fetchone()
-            if row:
-                payload = self._metadata_field_payload(dict(row))
-                self._append_field_event(conn, field_id, "created", actor, None, payload)
-                existing_storage[raw_key] = dict(row)
-                used_keys.add(field_key)
-                next_order += 1
 
     def _resolve_kicad_cli(self) -> str | None:
         runtime = self._catalog_runtime
@@ -792,120 +575,6 @@ class ComponentCatalogDomainService:
             raise ValueError("Unsupported asset type")
         return mapping[asset_type]
 
-    def _search_document(self, payload: dict[str, Any]) -> str:
-        fixed = " ".join(
-            str(payload.get(key) or "")
-            for key in (
-                "name",
-                "value",
-                "description",
-                "manufacturer",
-                "mpn",
-                "package_name",
-                "category",
-                "vendor",
-                "vendor_part_number",
-                "sap_code",
-            )
-        ).strip()
-        extra_fields = payload.get("extra_fields") or {}
-        extra = " ".join(f"{key} {value}" for key, value in dict(extra_fields).items())
-        return f"{fixed} {extra}".strip()
-
-    def _fts_query(self, query: str) -> str:
-        tokens = re.findall(r"[A-Za-z0-9_]+", query.strip().lower())
-        return " ".join(f"{token}*" for token in tokens[:8])
-
-    def _keywords(self, payload: dict[str, Any]) -> list[str]:
-        return _dedupe(
-            [
-                str(payload.get("value") or ""),
-                str(payload.get("manufacturer") or ""),
-                str(payload.get("mpn") or ""),
-                str(payload.get("package_name") or ""),
-                str(payload.get("category") or ""),
-                str(payload.get("vendor") or ""),
-            ]
-        )
-
-    def _normalize_metadata(self, payload: dict[str, Any]) -> dict[str, Any]:
-        requested_kind = str(payload.get("identity_kind") or "").strip().lower()
-        mpn_source = str(payload.get("mpn_source") or "").strip().lower()
-        identity_kind = requested_kind or (
-            IDENTITY_KIND_PROVISIONAL_IPN
-            if mpn_source in {MPN_SOURCE_PROVISIONAL_IPN, "fallback_ipn"}
-            else IDENTITY_KIND_MPN
-        )
-        if identity_kind not in {IDENTITY_KIND_MPN, IDENTITY_KIND_PROVISIONAL_IPN}:
-            raise ValueError("identity_kind must be 'mpn' or 'provisional_ipn'")
-        normalized = {
-            "value": str(payload.get("value") or "").strip(),
-            "description": str(payload.get("description") or "").strip(),
-            "datasheet_url": str(payload.get("datasheet_url") or payload.get("datasheet") or "").strip(),
-            "manufacturer": str(payload.get("manufacturer") or "").strip(),
-            "mpn": str(payload.get("mpn") or payload.get("manufacturer_part_number") or "").strip(),
-            "category": str(payload.get("category") or "").strip(),
-            "package_name": str(payload.get("package_name") or "").strip(),
-            "vendor": str(payload.get("vendor") or "").strip(),
-            "vendor_part_number": str(payload.get("vendor_part_number") or "").strip(),
-            "mass_g": str(payload.get("mass_g") or "").strip(),
-            "rqjc_c_w": str(payload.get("rqjc_c_w") or "").strip(),
-            "rqjc_top_c_w": str(payload.get("rqjc_top_c_w") or "").strip(),
-            "temp_max_c": str(payload.get("temp_max_c") or "").strip(),
-            "temp_min_c": str(payload.get("temp_min_c") or "").strip(),
-            "power_dissipation_w": str(payload.get("power_dissipation_w") or "").strip(),
-            "rate": str(payload.get("rate") or "").strip(),
-            "sap_code": str(payload.get("sap_code") or "").strip(),
-            "identity_kind": identity_kind,
-            "identity_source": str(payload.get("identity_source") or "").strip(),
-            "source_internal_part_number": str(
-                payload.get("source_internal_part_number")
-                or payload.get("internal_part_number")
-                or ""
-            ).strip(),
-        }
-        for field in ("value", "description", "datasheet_url", "manufacturer"):
-            if not normalized[field]:
-                raise ValueError(f"{field} is required")
-        if identity_kind == IDENTITY_KIND_MPN and not normalized["mpn"]:
-            raise ValueError("mpn is required for manufacturer-part identities")
-        if identity_kind == IDENTITY_KIND_PROVISIONAL_IPN:
-            normalized["mpn"] = ""
-            if not normalized["identity_source"]:
-                raise ValueError("identity_source is required for provisional parts")
-            if not normalized["source_internal_part_number"]:
-                normalized["source_internal_part_number"] = str(payload.get("name") or "").strip()
-            if not normalized["source_internal_part_number"]:
-                raise ValueError("source_internal_part_number is required for provisional parts")
-        # An explicit name wins. Database-library imports carry an internal part
-        # number that is not the manufacturer part number, and deriving the name
-        # from `mpn` would drop it from the record entirely.
-        normalized["name"] = (
-            str(payload.get("name") or "").strip()
-            or normalized["mpn"]
-            or normalized["value"]
-        )
-        normalized["summary"] = normalized["description"]
-        normalized["normalized_manufacturer"] = _normalize_identity_value(normalized["manufacturer"])
-        normalized["normalized_mpn"] = _normalize_identity_value(normalized["mpn"])
-        normalized["normalized_part_number"] = _normalize_identity_value(
-            normalized["mpn"]
-            if identity_kind == IDENTITY_KIND_MPN
-            else normalized["source_internal_part_number"]
-        )
-        normalized["mpn_source"] = (
-            MPN_SOURCE_MANUFACTURER
-            if identity_kind == IDENTITY_KIND_MPN
-            else MPN_SOURCE_PROVISIONAL_IPN
-        )
-        raw_extra_fields = payload.get("extra_fields") or payload.get("fields") or {}
-        normalized["extra_fields"] = {
-            str(key): str(value or "")
-            for key, value in dict(raw_extra_fields).items()
-            if str(key).strip()
-        }
-        return normalized
-
     def _unique_slug(self, conn: Any, base: str) -> str:
         self._catalog_locks.lock_slug_allocation(conn, base)
         slug = _slugify(base or "component")
@@ -937,8 +606,8 @@ class ComponentCatalogDomainService:
     ) -> None:
         """Reject a second component with the same orderable or provisional identity."""
         _ = name
-        normalized_manufacturer = _normalize_identity_value(manufacturer)
-        normalized_part_number = _normalize_identity_value(
+        normalized_manufacturer = normalize_identity_value(manufacturer)
+        normalized_part_number = normalize_identity_value(
             mpn if identity_kind == IDENTITY_KIND_MPN else source_internal_part_number
         )
         if acquire_identity_lock:
@@ -1416,7 +1085,7 @@ class ComponentCatalogDomainService:
             proposal,
             metadata_overrides,
         )
-        metadata = self._normalize_metadata(normalized_input)
+        metadata = normalize_metadata(normalized_input)
         candidates_by_type = self._project_import_assets.group_import_assets(proposal)
         # An asset type may instead be satisfied by an existing catalog asset. That is
         # a reference, not a copy: the same assets row is linked into this revision, so
@@ -2236,7 +1905,7 @@ class ComponentCatalogDomainService:
 
     def create_manual_component(self, *, actor: str = "", change_summary: str = "Create component", **payload: Any) -> dict[str, Any]:
         self.initialize()
-        metadata = self._normalize_metadata(payload)
+        metadata = normalize_metadata(payload)
         now = _utc_now_iso()
         component_id = str(uuid.uuid4())
         with self._connect() as conn:
@@ -2269,7 +1938,7 @@ class ComponentCatalogDomainService:
         external_id: str = "",
         change_kind: str = "metadata",
     ) -> tuple[str, str]:
-        self._ensure_extra_field_definitions(
+        self._metadata_schema.ensure_extra_field_definitions(
             conn,
             metadata.get("extra_fields", {}).keys(),
             actor=actor or "system:catalog",
@@ -2326,9 +1995,9 @@ class ComponentCatalogDomainService:
                     metadata["rate"],
                     metadata["sap_code"],
                     metadata["summary"],
-                    json.dumps(self._keywords(metadata), separators=(",", ":")),
+                    json.dumps(metadata_keywords(metadata), separators=(",", ":")),
                     json.dumps(metadata["extra_fields"], sort_keys=True, separators=(",", ":")),
-                    self._search_document(metadata),
+                    metadata_search_document(metadata),
                     now,
                     revision["id"],
                 ),
@@ -2437,9 +2106,9 @@ class ComponentCatalogDomainService:
                 metadata["rate"],
                 metadata["sap_code"],
                 metadata["summary"],
-                json.dumps(self._keywords(metadata), separators=(",", ":")),
+                json.dumps(metadata_keywords(metadata), separators=(",", ":")),
                 json.dumps(metadata["extra_fields"], sort_keys=True, separators=(",", ":")),
-                self._search_document(metadata),
+                metadata_search_document(metadata),
                 now,
                 now,
             ),
@@ -2522,7 +2191,7 @@ class ComponentCatalogDomainService:
                     merged[column] = str(updates[key] or "")
             if "extra_fields" in updates:
                 merged["extra_fields"] = dict(updates["extra_fields"] or {})
-            metadata = self._normalize_metadata(merged)
+            metadata = normalize_metadata(merged)
             unchanged = all(
                 (
                     _json_loads(revision.get(key), {}) == metadata[key]
@@ -2549,194 +2218,45 @@ class ComponentCatalogDomainService:
 
     # ── Metadata field registry and auditable bulk editing ──────────────────
 
-    def _metadata_field_payload(self, row: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "id": str(row["id"]),
-            "key": str(row["field_key"]),
-            "label": str(row["label"]),
-            "description": str(row.get("description") or ""),
-            "group": str(row.get("field_group") or "custom"),
-            "type": str(row.get("field_type") or "text"),
-            "unit": str(row.get("unit") or ""),
-            "enum_values": _json_loads(row.get("enum_values_json"), []),
-            "storage_kind": str(row.get("storage_kind") or "extra"),
-            "storage_key": str(row.get("storage_key") or row["field_key"]),
-            "built_in": bool(row.get("built_in")),
-            "required": bool(row.get("required")),
-            "display_order": int(row.get("display_order") or 0),
-            "archived": bool(row.get("archived")),
-            "created_by": str(row.get("created_by") or ""),
-            "updated_by": str(row.get("updated_by") or ""),
-            "created_at": str(row.get("created_at") or ""),
-            "updated_at": str(row.get("updated_at") or ""),
-        }
-
     def list_metadata_fields(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM catalog_field_definitions "
-                + ("" if include_archived else "WHERE archived = 0 ")
-                + "ORDER BY display_order, field_key"
-            ).fetchall()
-        return [self._metadata_field_payload(dict(row)) for row in rows]
-
-    def _append_field_event(
-        self,
-        conn: Any,
-        field_id: str,
-        event_type: str,
-        actor: str,
-        before: dict[str, Any] | None,
-        after: dict[str, Any] | None,
-    ) -> None:
-        conn.execute(
-            "INSERT INTO catalog_field_definition_events "
-            "(id, field_id, event_type, actor, before_json, after_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (
-                str(uuid.uuid4()), field_id, event_type, actor,
-                json.dumps(before or {}, sort_keys=True, separators=(",", ":")),
-                json.dumps(after or {}, sort_keys=True, separators=(",", ":")),
-                _utc_now_iso(),
-            ),
-        )
+            return self._metadata_fields.list_fields(conn, include_archived=include_archived)
 
     def create_metadata_field(self, payload: dict[str, Any], *, actor: str) -> dict[str, Any]:
         self.initialize()
-        field_key = re.sub(r"[^a-z0-9_]+", "_", str(payload.get("key") or payload.get("label") or "").strip().casefold()).strip("_")
-        if not field_key or field_key in {str(field["key"]) for field in BUILTIN_METADATA_FIELDS}:
-            raise ValueError("Custom field key is empty or reserved")
-        field_type = str(payload.get("type") or "text")
-        if field_type not in METADATA_FIELD_TYPES:
-            raise ValueError("Unsupported metadata field type")
-        enum_values = _dedupe([str(value).strip() for value in payload.get("enum_values") or [] if str(value).strip()])
-        if field_type == "enum" and not enum_values:
-            raise ValueError("Enum fields require at least one option")
-        now = _utc_now_iso()
-        field_id = str(uuid.uuid4())
+        prepared = self._metadata_fields.prepare_create_field(payload)
         with self._connect() as conn:
-            exists = conn.execute("SELECT 1 FROM catalog_field_definitions WHERE field_key = %s", (field_key,)).fetchone()
-            if exists:
-                raise ValueError(f"Metadata field '{field_key}' already exists")
-            order_row = conn.execute("SELECT COALESCE(MAX(display_order), -1) AS value FROM catalog_field_definitions").fetchone()
-            conn.execute(
-                """
-                INSERT INTO catalog_field_definitions (
-                    id, field_key, label, description, field_group, field_type, unit,
-                    enum_values_json, storage_kind, storage_key, built_in, required,
-                    display_order, archived, created_by, updated_by, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, 'custom', %s, %s, %s, 'extra', %s, 0, %s, %s, 0, %s, %s, %s, %s)
-                """,
-                (
-                    field_id, field_key, str(payload.get("label") or field_key).strip(),
-                    str(payload.get("description") or "").strip(), field_type,
-                    str(payload.get("unit") or "").strip(), json.dumps(enum_values), field_key,
-                    int(bool(payload.get("required"))), int(order_row["value"] or 0) + 1,
-                    actor, actor, now, now,
-                ),
-            )
-            row = dict(conn.execute("SELECT * FROM catalog_field_definitions WHERE id = %s", (field_id,)).fetchone())
-            after = self._metadata_field_payload(row)
-            self._append_field_event(conn, field_id, "created", actor, None, after)
+            after = self._metadata_fields.create_field(conn, prepared, actor)
             conn.commit()
         return after
 
     def update_metadata_field(self, field_id: str, payload: dict[str, Any], *, actor: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            raw = conn.execute("SELECT * FROM catalog_field_definitions WHERE id = %s", (field_id,)).fetchone()
-            if not raw:
-                raise ValueError("Metadata field not found")
-            before = self._metadata_field_payload(dict(raw))
-            field_type = str(payload.get("type", before["type"]))
-            if field_type not in METADATA_FIELD_TYPES:
-                raise ValueError("Unsupported metadata field type")
-            if before["built_in"] and field_type != before["type"]:
-                raise ValueError("Built-in field types cannot be changed")
-            enum_values = _dedupe([str(value).strip() for value in payload.get("enum_values", before["enum_values"]) if str(value).strip()])
-            if field_type == "enum" and not enum_values:
-                raise ValueError("Enum fields require at least one option")
-            next_required = bool(payload.get("required", before["required"]))
-            if before["built_in"] and next_required != before["required"]:
-                raise ValueError("Built-in field requirements cannot be changed")
-            if not before["built_in"] and (
-                field_type != before["type"] or enum_values != before["enum_values"] or next_required != before["required"]
-            ):
-                rows = conn.execute(
-                    "SELECT extra_fields FROM component_revisions cr JOIN components c ON c.current_revision_id = cr.id WHERE c.is_active = 1"
-                ).fetchall()
-                invalid = 0
-                candidate = {**before, "type": field_type, "enum_values": enum_values, "required": next_required}
-                for row in rows:
-                    value = str(_json_loads(row["extra_fields"], {}).get(before["key"], ""))
-                    if self._validate_metadata_value(candidate, value):
-                        invalid += 1
-                if invalid:
-                    raise ValueError(f"Field schema change would invalidate {invalid} current component value(s)")
-            now = _utc_now_iso()
-            display_order = before["display_order"] if payload.get("display_order") is None else int(payload["display_order"])
-            conn.execute(
-                """
-                UPDATE catalog_field_definitions SET label = %s, description = %s, field_type = %s, unit = %s,
-                    enum_values_json = %s, required = %s, display_order = %s, updated_by = %s, updated_at = %s
-                WHERE id = %s
-                """,
-                (
-                    str(payload.get("label", before["label"])).strip() or before["label"],
-                    str(payload.get("description", before["description"])).strip(), field_type,
-                    str(payload.get("unit", before["unit"])).strip(), json.dumps(enum_values),
-                    int(next_required),
-                    display_order, actor, now, field_id,
-                ),
-            )
-            after = self._metadata_field_payload(dict(conn.execute("SELECT * FROM catalog_field_definitions WHERE id = %s", (field_id,)).fetchone()))
-            self._append_field_event(conn, field_id, "updated", actor, before, after)
+            after = self._metadata_fields.update_field(conn, field_id, payload, actor)
             conn.commit()
         return after
 
     def set_metadata_field_archived(self, field_id: str, archived: bool, *, actor: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            raw = conn.execute("SELECT * FROM catalog_field_definitions WHERE id = %s", (field_id,)).fetchone()
-            if not raw:
-                raise ValueError("Metadata field not found")
-            before = self._metadata_field_payload(dict(raw))
-            if before["built_in"]:
-                raise ValueError("Built-in fields cannot be archived")
-            conn.execute(
-                "UPDATE catalog_field_definitions SET archived = %s, updated_by = %s, updated_at = %s WHERE id = %s",
-                (int(archived), actor, _utc_now_iso(), field_id),
-            )
-            after = self._metadata_field_payload(dict(conn.execute("SELECT * FROM catalog_field_definitions WHERE id = %s", (field_id,)).fetchone()))
-            self._append_field_event(conn, field_id, "archived" if archived else "restored", actor, before, after)
+            after = self._metadata_fields.set_field_archived(conn, field_id, archived, actor)
             conn.commit()
         return after
 
     def get_metadata_grid_preferences(self, user_email: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute("SELECT layout_json FROM catalog_grid_preferences WHERE user_email = %s", (user_email.casefold(),)).fetchone()
-        return _json_loads(row["layout_json"], {}) if row else {}
+            return self._metadata_grid.get_preferences(conn, user_email)
 
     def save_metadata_grid_preferences(self, user_email: str, layout: dict[str, Any]) -> dict[str, Any]:
         self.initialize()
-        normalized = {
-            "visible": [str(value) for value in layout.get("visible") or []],
-            "order": [str(value) for value in layout.get("order") or []],
-            "widths": {str(key): max(80, min(600, int(value))) for key, value in dict(layout.get("widths") or {}).items()},
-            "pinned": [str(value) for value in layout.get("pinned") or []],
-        }
-        now = _utc_now_iso()
+        prepared = self._metadata_grid.prepare_preferences(user_email, layout)
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO catalog_grid_preferences (user_email, layout_json, updated_at) VALUES (%s, %s, %s)
-                ON CONFLICT(user_email) DO UPDATE SET layout_json = excluded.layout_json, updated_at = excluded.updated_at
-                """,
-                (user_email.casefold(), json.dumps(normalized, separators=(",", ":")), now),
-            )
+            self._metadata_grid.save_preferences(conn, prepared)
             conn.commit()
-        return normalized
+        return prepared.layout
 
     def metadata_grid(self, *, field_keys: list[str] | None = None, **filters: Any) -> dict[str, Any]:
         fields = self.list_metadata_fields()
@@ -2746,87 +2266,16 @@ class ComponentCatalogDomainService:
         result = self.list_components(lightweight=True, include_inactive=False, **filters)
         component_ids = [str(item["id"]) for item in result["items"]]
         if component_ids:
-            column_keys = sorted({
-                str(field["storage_key"])
-                for field in fields
-                if field["storage_kind"] == "column"
-            })
-            needs_extras = any(field["storage_kind"] == "extra" for field in fields)
-            selected_columns = ["component_id", "revision_id", *column_keys]
-            if needs_extras:
-                selected_columns.append("extra_fields")
-            placeholders = ",".join("%s" for _ in component_ids)
+            prepared = self._metadata_grid.prepare_rows(component_ids, fields)
             with self._connect() as conn:
-                rows = conn.execute(
-                    f"SELECT {', '.join(selected_columns)} FROM component_heads "
-                    f"WHERE component_id IN ({placeholders})",
-                    tuple(component_ids),
-                ).fetchall()
-            by_component = {str(row["component_id"]): dict(row) for row in rows}
-            for item in result["items"]:
-                head = by_component.get(str(item["id"]), {})
-                for key in column_keys:
-                    if key in head:
-                        item[key] = str(head[key] or "")
-                if needs_extras:
-                    item["extra_fields"] = _json_loads(head.get("extra_fields"), {})
+                rows = self._metadata_grid.fetch_rows(conn, prepared)
+            self._metadata_grid.hydrate_rows(prepared, rows, result["items"])
         return {**result, "schema": METADATA_SCHEMA_VERSION, "fields": fields}
-
-    def _validate_metadata_value(self, field: dict[str, Any], value: str) -> str:
-        value = str(value or "").strip()
-        if not value:
-            return "Value is required" if field.get("required") else ""
-        field_type = str(field.get("type") or "text")
-        if field_type == "number":
-            try:
-                float(value)
-            except ValueError:
-                return "Enter a valid number"
-        elif field_type == "url":
-            parsed = urlparse(value)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                return "Enter a valid HTTP(S) URL"
-        elif field_type == "boolean" and value.casefold() not in {"true", "false", "1", "0", "yes", "no"}:
-            return "Enter true or false"
-        elif field_type == "enum" and value not in field.get("enum_values", []):
-            return "Choose a configured enum value"
-        return ""
-
-    def _metadata_batch_payload(self, conn: Any, batch_id: str) -> dict[str, Any] | None:
-        batch = conn.execute("SELECT * FROM catalog_metadata_batches WHERE id = %s", (batch_id,)).fetchone()
-        if not batch:
-            return None
-        items = conn.execute(
-            "SELECT item.*, cr.name, cr.mpn FROM catalog_metadata_batch_items item "
-            "JOIN components c ON c.id = item.component_id "
-            "JOIN component_revisions cr ON cr.id = c.current_revision_id "
-            "WHERE item.batch_id = %s ORDER BY cr.manufacturer, cr.mpn, item.id",
-            (batch_id,),
-        ).fetchall()
-        return {
-            "id": str(batch["id"]), "source": str(batch["source"]), "status": str(batch["status"]),
-            "schema_version": str(batch["schema_version"]), "change_summary": str(batch["change_summary"]),
-            "unknown_fields": _json_loads(batch["unknown_fields_json"], []),
-            "created_by": str(batch["created_by"]), "total_items": int(batch["total_items"]),
-            "valid_items": int(batch["valid_items"]), "applied_items": int(batch["applied_items"]),
-            "failed_items": int(batch["failed_items"]), "created_at": str(batch["created_at"]),
-            "updated_at": str(batch["updated_at"]),
-            "items": [
-                {
-                    "id": str(item["id"]), "component_id": str(item["component_id"]),
-                    "expected_revision_id": str(item["expected_revision_id"]), "name": str(item["name"]),
-                    "mpn": str(item["mpn"]), "patch": _json_loads(item["patch_json"], {}),
-                    "diff": _json_loads(item["diff_json"], []), "validation_status": str(item["validation_status"]),
-                    "error_message": str(item["error_message"]), "applied_revision_id": str(item["applied_revision_id"]),
-                }
-                for item in items
-            ],
-        }
 
     def get_metadata_batch(self, batch_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            return self._metadata_batch_payload(conn, batch_id)
+            return self._metadata_batches.batch_payload(conn, batch_id)
 
     def stage_metadata_batch(
         self,
@@ -2848,90 +2297,31 @@ class ComponentCatalogDomainService:
             fields[str(proposal["key"])] = {**proposal, "storage_kind": "extra", "storage_key": proposal["key"], "archived": False}
         valid_count = 0
         with self._connect() as conn:
-            identity_counts: dict[tuple[str, str, str], int] = {}
-            for raw_item in items:
-                component_id = str(raw_item.get("component_id") or "")
-                component = conn.execute(
-                    "SELECT cr.manufacturer, cr.mpn, cr.name FROM components c "
-                    "JOIN component_revisions cr ON cr.id = c.current_revision_id "
-                    "WHERE c.id = %s AND c.is_active = 1",
-                    (component_id,),
-                ).fetchone()
-                if not component:
-                    continue
-                patch = dict(raw_item.get("patch") or {})
-                manufacturer = str(patch.get("manufacturer", component["manufacturer"]) or "").strip().casefold()
-                mpn = str(patch.get("mpn", component["mpn"]) or "").strip().casefold()
-                name = str(patch.get("name", component["name"]) or "").strip().casefold()
-                if manufacturer and mpn:
-                    identity = (manufacturer, mpn, name)
-                    identity_counts[identity] = identity_counts.get(identity, 0) + 1
-            duplicate_identities = {identity for identity, count in identity_counts.items() if count > 1}
-            conn.execute(
-                """
-                INSERT INTO catalog_metadata_batches (
-                    id, source, status, schema_version, change_summary, unknown_fields_json, created_by,
-                    total_items, valid_items, applied_items, failed_items, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 0, %s, %s)
-                """,
-                (
-                    batch_id, source, "needs_fields" if proposed_fields else "ready", METADATA_SCHEMA_VERSION,
-                    change_summary.strip() or "Bulk update component metadata",
-                    json.dumps(proposed_fields or [], separators=(",", ":")), actor, len(items), now, now,
-                ),
+            duplicate_identities = self._metadata_batch_staging.duplicate_identities(conn, items)
+            self._metadata_batches.insert_batch(
+                conn,
+                batch_id=batch_id,
+                source=source,
+                status="needs_fields" if proposed_fields else "ready",
+                schema_version=METADATA_SCHEMA_VERSION,
+                change_summary=change_summary.strip() or "Bulk update component metadata",
+                unknown_fields_json=json.dumps(proposed_fields or [], separators=(",", ":")),
+                created_by=actor,
+                total_items=len(items),
+                created_at=now,
+                updated_at=now,
             )
             for raw_item in items:
-                component_id = str(raw_item.get("component_id") or "")
-                expected_revision_id = str(raw_item.get("expected_revision_id") or "")
-                component = conn.execute(
-                    "SELECT c.is_active, cr.* FROM components c JOIN component_revisions cr ON cr.id = c.current_revision_id WHERE c.id = %s",
-                    (component_id,),
-                ).fetchone()
-                errors: list[str] = []
-                diff: list[dict[str, str]] = []
-                normalized_patch: dict[str, str] = {}
-                if not component or not bool(component["is_active"]):
-                    errors.append("Component was not found or is inactive")
-                elif str(component["id"]) != expected_revision_id:
-                    errors.append("Component revision conflict: refresh or re-export before applying")
-                else:
-                    extras = _json_loads(component["extra_fields"], {})
-                    for field_key, raw_value in dict(raw_item.get("patch") or {}).items():
-                        field = fields.get(str(field_key))
-                        if not field or field.get("archived"):
-                            errors.append(f"Unknown or archived field: {field_key}")
-                            continue
-                        value = str(raw_value or "").strip()
-                        validation_error = self._validate_metadata_value(field, value)
-                        if validation_error:
-                            errors.append(f"{field['label']}: {validation_error}")
-                            continue
-                        before = str(component[field["storage_key"]] or "") if field["storage_kind"] == "column" else str(extras.get(field["storage_key"], ""))
-                        if before != value:
-                            normalized_patch[str(field_key)] = value
-                            diff.append({"field": str(field_key), "label": str(field["label"]), "before": before, "after": value})
-                    for field_key, field in fields.items():
-                        if not field.get("required") or field.get("archived"):
-                            continue
-                        if field["storage_kind"] == "column":
-                            resulting = normalized_patch.get(field_key, str(component[field["storage_key"]] or ""))
-                        else:
-                            resulting = normalized_patch.get(field_key, str(extras.get(field["storage_key"], "")))
-                        required_error = self._validate_metadata_value(field, resulting)
-                        if required_error:
-                            errors.append(f"{field['label']}: {required_error}")
-                    target_manufacturer = normalized_patch.get("manufacturer", str(component["manufacturer"] or ""))
-                    target_mpn = normalized_patch.get("mpn", str(component["mpn"] or ""))
-                    target_name = normalized_patch.get("name", str(component["name"] or ""))
-                    if (
-                        target_manufacturer.strip().casefold(),
-                        target_mpn.strip().casefold(),
-                        target_name.strip().casefold(),
-                    ) in duplicate_identities:
-                        errors.append(
-                            "Multiple rows in this batch resolve to the same manufacturer, "
-                            "manufacturer part number and name"
-                        )
+                preparation = self._metadata_batch_staging.prepare_item(
+                    conn, raw_item, fields, duplicate_identities
+                )
+                component_id = preparation.component_id
+                expected_revision_id = preparation.expected_revision_id
+                normalized_patch = preparation.normalized_patch
+                diff = preparation.diff
+                errors = list(preparation.errors)
+                if preparation.target_identity is not None:
+                    target_manufacturer, target_mpn, target_name = preparation.target_identity
                     try:
                         self._assert_component_identity_available(
                             conn,
@@ -2946,30 +2336,29 @@ class ComponentCatalogDomainService:
                 status = "invalid" if errors else "valid" if diff else "noop"
                 if status == "valid":
                     valid_count += 1
-                conn.execute(
-                    """
-                    INSERT INTO catalog_metadata_batch_items (
-                        id, batch_id, component_id, expected_revision_id, patch_json, diff_json,
-                        validation_status, error_message, applied_revision_id, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '', %s, %s)
-                    """,
-                    (
-                        str(uuid.uuid4()), batch_id, component_id, expected_revision_id,
-                        json.dumps(normalized_patch, sort_keys=True, separators=(",", ":")),
-                        json.dumps(diff, separators=(",", ":")), status, "; ".join(errors), now, now,
-                    ),
+                self._metadata_batches.insert_batch_item(
+                    conn,
+                    item_id=str(uuid.uuid4()),
+                    batch_id=batch_id,
+                    component_id=component_id,
+                    expected_revision_id=expected_revision_id,
+                    patch_json=json.dumps(normalized_patch, sort_keys=True, separators=(",", ":")),
+                    diff_json=json.dumps(diff, separators=(",", ":")),
+                    validation_status=status,
+                    error_message="; ".join(errors),
+                    created_at=now,
+                    updated_at=now,
                 )
-            conn.execute("UPDATE catalog_metadata_batches SET valid_items = %s WHERE id = %s", (valid_count, batch_id))
+            self._metadata_batches.update_valid_items(conn, batch_id, valid_count)
             conn.commit()
-            return self._metadata_batch_payload(conn, batch_id) or {}
+            return self._metadata_batches.batch_payload(conn, batch_id) or {}
 
     def approve_metadata_batch_fields(self, batch_id: str, *, actor: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            batch = conn.execute("SELECT * FROM catalog_metadata_batches WHERE id = %s", (batch_id,)).fetchone()
-            if not batch:
+            proposals = self._metadata_batches.fetch_batch_field_proposals(conn, batch_id)
+            if proposals is None:
                 raise ValueError("Metadata batch not found")
-            proposals = _json_loads(batch["unknown_fields_json"], [])
         for proposal in proposals:
             try:
                 self.create_metadata_field(proposal, actor=actor)
@@ -2977,12 +2366,13 @@ class ComponentCatalogDomainService:
                 if "already exists" not in str(exc):
                     raise
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE catalog_metadata_batches SET status = 'ready', unknown_fields_json = '[]', updated_at = %s WHERE id = %s",
-                (_utc_now_iso(), batch_id),
+            self._metadata_batches.mark_fields_approved(
+                conn,
+                batch_id,
+                _utc_now_iso(),
             )
             conn.commit()
-            return self._metadata_batch_payload(conn, batch_id) or {}
+            return self._metadata_batches.batch_payload(conn, batch_id) or {}
 
     def _inherit_validation_evidence(self, conn: Any, parent_revision_id: str, revision_id: str) -> None:
         return self._revision_kernel.inherit_validation_evidence(
@@ -2994,17 +2384,10 @@ class ComponentCatalogDomainService:
     def apply_metadata_batch_item(self, item_id: str, *, actor: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            item = conn.execute(
-                "SELECT item.*, batch.change_summary, batch.id AS metadata_batch_id FROM catalog_metadata_batch_items item "
-                "JOIN catalog_metadata_batches batch ON batch.id = item.batch_id WHERE item.id = %s",
-                (item_id,),
-            ).fetchone()
-            if not item:
-                raise ValueError("Metadata batch item not found")
-            if str(item["validation_status"]) == "applied":
-                return {"item_id": item_id, "status": "applied", "revision_id": str(item["applied_revision_id"])}
-            if str(item["validation_status"]) != "valid":
-                raise ValueError("Metadata batch item is not valid")
+            item = self._metadata_batches.fetch_item_for_apply(conn, item_id)
+            early_result = self._metadata_batch_application.classify_item(item_id, item)
+            if early_result is not None:
+                return early_result
             component_id = str(item["component_id"])
             self._lock_component_for_mutation(conn, component_id)
             component, revision = self._active_revision_row(conn, component_id, released=False)
@@ -3013,19 +2396,9 @@ class ComponentCatalogDomainService:
             if str(revision["id"]) != str(item["expected_revision_id"]):
                 raise ValueError("Component revision conflict: current revision changed after preview")
             definitions = {field["key"]: field for field in self.list_metadata_fields()}
-            patch = _json_loads(item["patch_json"], {})
-            merged = {**revision, "extra_fields": _json_loads(revision.get("extra_fields"), {})}
-            for field_key, value in patch.items():
-                field = definitions.get(field_key)
-                if not field:
-                    raise ValueError(f"Metadata field {field_key} is unavailable")
-                if field["storage_kind"] == "column":
-                    merged[field["storage_key"]] = value
-                else:
-                    merged["extra_fields"][field["storage_key"]] = value
-            metadata = self._normalize_metadata(merged)
+            prepared = self._metadata_batch_application.prepare_revision(item, revision, definitions)
+            metadata = prepared.metadata
             self._lock_component_identity(conn, metadata["manufacturer"], metadata["mpn"])
-            parent_revision_id = str(revision["id"])
             _, revision_id = self._upsert_component_metadata_row(
                 conn,
                 component_id=component_id,
@@ -3033,31 +2406,29 @@ class ComponentCatalogDomainService:
                 now=_utc_now_iso(),
                 existing_component_id=component_id,
                 actor=actor,
-                change_summary=str(item["change_summary"]),
-                expected_revision_id=parent_revision_id,
+                change_summary=prepared.change_summary,
+                expected_revision_id=prepared.parent_revision_id,
                 finalize_revision=False,
                 change_kind="metadata_bulk",
             )
             conn.execute("UPDATE component_revisions SET release_status = 'qa_review' WHERE id = %s", (revision_id,))
-            self._inherit_validation_evidence(conn, parent_revision_id, revision_id)
+            self._inherit_validation_evidence(conn, prepared.parent_revision_id, revision_id)
             self._finalize_revision(
                 conn,
                 component_id=component_id,
                 revision_id=revision_id,
                 event_type="revision.created",
                 actor=actor,
-                details={
-                    "change_kind": "metadata_bulk", "change_summary": str(item["change_summary"]),
-                    "metadata_batch_id": str(item["metadata_batch_id"]),
-                    "changed_fields": sorted(patch), "workflow_stage": "qa_review",
-                },
+                details=prepared.finalize_details,
             )
-            conn.execute(
-                "UPDATE catalog_metadata_batch_items SET validation_status = 'applied', applied_revision_id = %s, updated_at = %s WHERE id = %s",
-                (revision_id, _utc_now_iso(), item_id),
+            self._metadata_batches.mark_item_applied(
+                conn,
+                item_id,
+                revision_id,
+                _utc_now_iso(),
             )
             conn.commit()
-        return {"item_id": item_id, "status": "applied", "revision_id": revision_id}
+        return self._metadata_batch_application.applied_result(item_id, revision_id)
 
     def apply_metadata_batch(
         self,
@@ -3069,18 +2440,15 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            batch = conn.execute("SELECT * FROM catalog_metadata_batches WHERE id = %s", (batch_id,)).fetchone()
+            batch = self._metadata_batches.fetch_batch_for_apply(conn, batch_id)
             if not batch:
                 raise ValueError("Metadata batch not found")
             if str(batch["status"]) == "needs_fields":
                 raise ValueError("Unknown CSV fields must be approved before applying")
-            rows = conn.execute(
-                "SELECT id FROM catalog_metadata_batch_items WHERE batch_id = %s AND validation_status = 'valid' ORDER BY id",
-                (batch_id,),
-            ).fetchall()
-        selected = set(item_ids or [])
-        ids = [str(row["id"]) for row in rows if not selected or str(row["id"]) in selected]
-        if selected and not ids:
+            rows = self._metadata_batches.fetch_valid_item_rows(conn, batch_id)
+        selection = self._metadata_batch_application.select_valid_item_ids(rows, item_ids)
+        ids = list(selection.ids)
+        if selection.selected and not ids:
             raise ValueError("None of the selected metadata batch items are valid")
         applied = 0
         failed = 0
@@ -3093,31 +2461,31 @@ class ComponentCatalogDomainService:
                 failed += 1
                 errors.append({"item_id": item_id, "error": str(exc)})
                 with self._connect() as conn:
-                    conn.execute(
-                        "UPDATE catalog_metadata_batch_items SET validation_status = 'conflict', error_message = %s, updated_at = %s WHERE id = %s",
-                        (str(exc), _utc_now_iso(), item_id),
+                    self._metadata_batches.mark_item_conflict(
+                        conn,
+                        item_id,
+                        str(exc),
+                        _utc_now_iso(),
                     )
                     conn.commit()
             if progress_callback:
                 progress_callback({"completed": index + 1, "total": len(ids), "applied": applied, "failed": failed})
         with self._connect() as conn:
-            totals = conn.execute(
-                "SELECT SUM(CASE WHEN validation_status = 'applied' THEN 1 ELSE 0 END) AS applied, "
-                "SUM(CASE WHEN validation_status IN ('invalid', 'conflict') THEN 1 ELSE 0 END) AS failed, "
-                "SUM(CASE WHEN validation_status = 'valid' THEN 1 ELSE 0 END) AS remaining "
-                "FROM catalog_metadata_batch_items WHERE batch_id = %s",
-                (batch_id,),
-            ).fetchone()
-            total_applied = int(totals["applied"] or 0)
-            total_failed = int(totals["failed"] or 0)
-            remaining = int(totals["remaining"] or 0)
-            status = "completed" if total_failed == 0 and remaining == 0 else "partial"
-            conn.execute(
-                "UPDATE catalog_metadata_batches SET status = %s, valid_items = %s, applied_items = %s, failed_items = %s, updated_at = %s WHERE id = %s",
-                (status, remaining, total_applied, total_failed, _utc_now_iso(), batch_id),
+            totals = self._metadata_batches.calculate_batch_totals(conn, batch_id)
+            accounting = self._metadata_batch_application.account_batch(
+                batch_id, totals, applied, failed, errors
+            )
+            self._metadata_batches.finalize_batch(
+                conn,
+                batch_id=batch_id,
+                status=accounting.status,
+                valid_items=accounting.remaining,
+                applied_items=accounting.total_applied,
+                failed_items=accounting.total_failed,
+                updated_at=_utc_now_iso(),
             )
             conn.commit()
-        return {"batch_id": batch_id, "status": status, "applied": applied, "failed": failed, "errors": errors}
+        return accounting.result
 
     def export_metadata_csv(self, field_keys: list[str] | None = None) -> str:
         return "".join(self.iter_metadata_csv(field_keys=field_keys))
@@ -3125,44 +2493,14 @@ class ComponentCatalogDomainService:
     def iter_metadata_csv(self, field_keys: list[str] | None = None) -> Iterator[str]:
         self.initialize()
         fields = self.list_metadata_fields()
-        if field_keys is not None:
-            requested = {str(key) for key in field_keys}
-            known = {str(field["key"]) for field in fields}
-            unknown = sorted(requested - known)
-            if unknown:
-                raise ValueError(f"Unknown or archived metadata field(s): {', '.join(unknown)}")
-            fields = [field for field in fields if str(field["key"]) in requested]
-        custom = [field for field in fields if field["storage_kind"] == "extra"]
-        fixed = [field for field in fields if field["storage_kind"] == "column"]
-        headers = ["_prism_schema_version", "component_id", "expected_revision_id", "revision", "workflow_stage"]
-        headers.extend(field["key"] for field in fixed)
-        headers.extend(f"custom:{field['key']}" for field in custom)
+        prepared = self._metadata_csv.prepare_export(
+            fields,
+            field_keys,
+            schema_version=METADATA_SCHEMA_VERSION,
+        )
 
         def generate() -> Iterator[str]:
-            header_output = io.StringIO()
-            csv.DictWriter(header_output, fieldnames=headers, extrasaction="ignore").writeheader()
-            yield header_output.getvalue()
-
-            def render_row(row: Any) -> str:
-                extras = _json_loads(row["extra_fields"], {})
-                payload = {
-                    "_prism_schema_version": METADATA_SCHEMA_VERSION,
-                    "component_id": str(row["component_id"]), "expected_revision_id": str(row["id"]),
-                    "revision": str(row["version"]), "workflow_stage": str(row["release_status"]),
-                }
-                payload.update({
-                    field["key"]: self._metadata_csv_export_value(field, str(row[field["storage_key"]] or ""))
-                    for field in fixed
-                })
-                payload.update({
-                    f"custom:{field['key']}": self._metadata_csv_export_value(
-                        field, str(extras.get(field["storage_key"], "")),
-                    )
-                    for field in custom
-                })
-                output = io.StringIO()
-                csv.DictWriter(output, fieldnames=headers, extrasaction="ignore").writerow(payload)
-                return output.getvalue()
+            yield self._metadata_csv.render_header(prepared)
 
             with self._connect() as conn:
                 sql = (
@@ -3175,83 +2513,14 @@ class ComponentCatalogDomainService:
                 else:
                     rows = iter(conn.execute(sql).fetchall())
                 for row in rows:
-                    yield render_row(row)
+                    yield self._metadata_csv.render_row(prepared, row)
 
         return generate()
 
-    def _metadata_csv_export_value(self, field: dict[str, Any], value: str) -> str:
-        # CSV has no type information and spreadsheet applications aggressively
-        # coerce text such as 0207, TRUE, dates, and long part numbers. An invisible
-        # text marker survives spreadsheet save/export and is removed on re-import.
-        if value and str(field.get("type") or "text") in {"text", "enum"}:
-            return f"{CSV_SPREADSHEET_TEXT_GUARD}{value}"
-        return value
-
-    def _metadata_csv_import_value(self, field: dict[str, Any] | None, value: str) -> str:
-        normalized = str(value or "").removeprefix(CSV_SPREADSHEET_TEXT_GUARD).strip()
-        if field and str(field.get("type") or "text") == "boolean":
-            lowered = normalized.casefold()
-            if lowered in {"true", "1", "yes"}:
-                return "true"
-            if lowered in {"false", "0", "no"}:
-                return "false"
-        return normalized
-
-    def _metadata_csv_values_equal(self, field: dict[str, Any] | None, before: str, after: str) -> bool:
-        if before == after:
-            return True
-        field_type = str((field or {}).get("type") or "text")
-        before_folded = before.casefold()
-        after_folded = after.casefold()
-        boolean_tokens = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
-        if field_type == "boolean":
-            return boolean_tokens.get(before_folded) == boolean_tokens.get(after_folded)
-        if before_folded in {"true", "false"} and after_folded in {"true", "false"}:
-            return before_folded == after_folded
-        if field_type == "number":
-            try:
-                return Decimal(before) == Decimal(after)
-            except InvalidOperation:
-                return False
-        return False
-
     def preview_metadata_csv(self, file_content: str, *, actor: str, change_summary: str = "Import component metadata from CSV") -> dict[str, Any]:
         self.initialize()
-        reader = csv.DictReader(io.StringIO(file_content.lstrip("\ufeff")))
-        if not reader.fieldnames:
-            raise ValueError("CSV file is empty")
-        reserved = {"_prism_schema_version", "component_id", "expected_revision_id", "revision", "workflow_stage"}
         fields = {field["key"]: field for field in self.list_metadata_fields(include_archived=True)}
-        proposed: list[dict[str, Any]] = []
-        header_to_key: dict[str, str] = {}
-        for header in reader.fieldnames:
-            if header in reserved:
-                continue
-            key = header.removeprefix("custom:")
-            if key not in fields:
-                proposed_key = re.sub(r"[^a-z0-9_]+", "_", key.casefold()).strip("_")
-                if not proposed_key:
-                    continue
-                proposal = {"key": proposed_key, "label": key, "description": "Imported from CSV", "type": "text", "enum_values": []}
-                if proposed_key not in {item["key"] for item in proposed}:
-                    proposed.append(proposal)
-                header_to_key[header] = proposed_key
-            else:
-                header_to_key[header] = key
-        parsed_rows: list[tuple[int, str, str, dict[str, str]]] = []
-        for index, row in enumerate(reader, start=2):
-            component_id = str(row.get("component_id") or "").strip()
-            revision_id = str(row.get("expected_revision_id") or "").strip()
-            if not component_id or not revision_id:
-                raise ValueError(f"Row {index}: component_id and expected_revision_id are required")
-            patch = {
-                field_key: self._metadata_csv_import_value(
-                    fields.get(field_key) or next((field for field in proposed if field["key"] == field_key), None),
-                    str(row.get(header) or ""),
-                )
-                for header, field_key in header_to_key.items()
-            }
-            parsed_rows.append((index, component_id, revision_id, patch))
+        parsed = self._metadata_csv.parse_preview(file_content, list(fields.values()))
 
         with self._connect() as conn:
             current_rows = {
@@ -3262,79 +2531,35 @@ class ComponentCatalogDomainService:
                 ).fetchall()
             }
 
-        proposed_by_key = {str(field["key"]): field for field in proposed}
-        items: list[dict[str, Any]] = []
-        skipped_unchanged = 0
-        for _, component_id, revision_id, patch in parsed_rows:
-            current = current_rows.get(component_id)
-            if not current:
-                # Preserve missing/inactive rows so the staged review can explain them.
-                items.append({"component_id": component_id, "expected_revision_id": revision_id, "patch": patch})
-                continue
-            extras = _json_loads(current.get("extra_fields"), {})
-            changed_patch: dict[str, str] = {}
-            for field_key, value in patch.items():
-                field = fields.get(field_key) or proposed_by_key.get(field_key)
-                if not field:
-                    changed_patch[field_key] = value
-                    continue
-                storage_kind = str(field.get("storage_kind") or "extra")
-                storage_key = str(field.get("storage_key") or field_key)
-                before = str(current.get(storage_key) or "") if storage_kind == "column" else str(extras.get(storage_key, ""))
-                if not self._metadata_csv_values_equal(field, before, value):
-                    changed_patch[field_key] = value
-            if changed_patch:
-                items.append({
-                    "component_id": component_id,
-                    "expected_revision_id": revision_id,
-                    "patch": changed_patch,
-                })
-            else:
-                skipped_unchanged += 1
-
-        used_field_keys = {field_key for item in items for field_key in item["patch"]}
-        used_proposals = [field for field in proposed if str(field["key"]) in used_field_keys]
+        changes = self._metadata_csv.filter_preview_changes(
+            parsed.parsed_rows,
+            current_rows,
+            fields,
+            parsed.proposed_fields,
+        )
         batch = self.stage_metadata_batch(
-            items,
+            changes.items,
             source="csv",
             actor=actor,
             change_summary=change_summary,
-            proposed_fields=used_proposals,
+            proposed_fields=changes.used_proposals,
         )
         return {
             **batch,
-            "source_rows": len(parsed_rows),
-            "skipped_unchanged_rows": skipped_unchanged,
+            "source_rows": len(parsed.parsed_rows),
+            "skipped_unchanged_rows": changes.skipped_unchanged_rows,
         }
-
-    def _normalize_csv_row(self, row: dict[str, str], row_index: int) -> dict[str, str]:
-        normalized = {(_slugify(key, key).replace("-", "_")): (value or "").strip() for key, value in row.items()}
-        for required in CSV_REQUIRED_COLUMNS:
-            if not normalized.get(required, "").strip():
-                raise ValueError(f"Row {row_index}: missing required column '{required}'")
-        return normalized
 
     def import_metadata_csv(self, file_content: str) -> dict[str, Any]:
         self.initialize()
-        reader = csv.DictReader(io.StringIO(file_content))
-        if not reader.fieldnames:
-            raise ValueError("CSV file is empty")
-
-        rows: list[dict[str, str]] = []
-        errors: list[str] = []
-        for index, row in enumerate(reader, start=2):
-            try:
-                rows.append(self._normalize_csv_row({str(k): str(v or "") for k, v in row.items()}, index))
-            except ValueError as exc:
-                errors.append(str(exc))
-        if errors:
-            raise ValueError("\n".join(errors))
+        parsed = self._metadata_csv.parse_import(file_content)
 
         created = 0
         updated = 0
         with self._connect() as conn:
             now = _utc_now_iso()
-            for row in rows:
+            for prepared_row in parsed.rows:
+                row = prepared_row.row
                 mpn = row["manufacturer_part_number"]
                 existing = conn.execute(
                     """
@@ -3346,36 +2571,7 @@ class ComponentCatalogDomainService:
                     """,
                     (mpn,),
                 ).fetchone()
-                asset_links = []
-                if row.get("symbol_file_path"):
-                    asset_links.append(("symbol", row["symbol_file_path"], row.get("symbol_target_library", ""), row.get("symbol_target_name", "")))
-                if row.get("footprint_file_path"):
-                    asset_links.append(("footprint", row["footprint_file_path"], row.get("footprint_target_library", ""), row.get("footprint_target_name", "")))
-                if row.get("model_3d_file_path"):
-                    asset_links.append(("3dmodel", row["model_3d_file_path"], "", ""))
-                if row.get("spice_file_path"):
-                    asset_links.append(("spice", row["spice_file_path"], "", ""))
-
-                payload = {
-                    "value": row["value"],
-                    "description": row["description"],
-                    "datasheet_url": row["datasheet"],
-                    "manufacturer": row["manufacturer"],
-                    "mpn": row["manufacturer_part_number"],
-                    "category": row.get("category", ""),
-                    "package_name": row.get("package_name", ""),
-                    "vendor": row.get("vendor", ""),
-                    "vendor_part_number": row.get("vendor_part_number", ""),
-                    "mass_g": row.get("mass_g", ""),
-                    "rqjc_c_w": row.get("rqjc_c_w", ""),
-                    "rqjc_top_c_w": row.get("rqjc_top_c_w", ""),
-                    "temp_max_c": row.get("temp_max_c", ""),
-                    "temp_min_c": row.get("temp_min_c", ""),
-                    "power_dissipation_w": row.get("power_dissipation_w", ""),
-                    "rate": row.get("rate", ""),
-                    "sap_code": row.get("sap_code", ""),
-                }
-                normalized = self._normalize_metadata(payload)
+                normalized = normalize_metadata(prepared_row.payload)
                 if existing:
                     component_id, revision_id = self._upsert_component_metadata_row(
                         conn,
@@ -3400,7 +2596,7 @@ class ComponentCatalogDomainService:
                     )
                     created += 1
 
-                for asset_type, file_path, target_library, target_name in asset_links:
+                for asset_type, file_path, target_library, target_name in prepared_row.asset_links:
                     asset = self._resolve_existing_asset(
                         conn,
                         asset_type=asset_type,
@@ -3425,113 +2621,36 @@ class ComponentCatalogDomainService:
 
     def export_inventory_csv(self) -> str:
         self.initialize()
-        output = io.StringIO()
-        writer = csv.DictWriter(
-            output,
-            fieldnames=(
-                "component_id", "manufacturer", "mpn", "quantity", "uom", "inventory_status"
-            ),
-        )
-        writer.writeheader()
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT component.id AS component_id, revision.manufacturer, revision.mpn,
-                       COALESCE(SUM(inventory.quantity), 0) AS quantity,
-                       COALESCE(MIN(inventory.uom), '') AS uom,
-                       COALESCE(MIN(inventory.inventory_status), '') AS inventory_status
-                FROM components component
-                JOIN component_revisions revision ON revision.id = component.current_revision_id
-                LEFT JOIN inventory_levels inventory
-                  ON inventory.component_id = component.id AND inventory.source = 'csv'
-                WHERE component.identity_kind = 'mpn'
-                GROUP BY component.id, revision.manufacturer, revision.mpn
-                ORDER BY lower(revision.manufacturer), lower(revision.mpn), component.id
-                """
-            ).fetchall()
-        for row in rows:
-            writer.writerow(dict(row))
-        return output.getvalue()
+            rows = self._inventory_csv.fetch_export_rows(conn)
+        return self._inventory_csv.render_export(rows)
 
     def import_inventory_csv(self, file_content: str) -> dict[str, Any]:
         self.initialize()
-        reader = csv.DictReader(io.StringIO(file_content))
-        if not reader.fieldnames:
-            raise ValueError("CSV file is empty")
+        reader = self._inventory_csv.parse(file_content)
         updated = 0
         not_found = 0
         errors: list[str] = []
         with self._connect() as conn:
             for index, row in enumerate(reader, start=2):
-                component_id = str(row.get("component_id") or "").strip()
-                manufacturer = str(row.get("manufacturer") or "").strip()
-                mpn = str(row.get("manufacturer_part_number") or row.get("mpn") or "").strip()
-                if not component_id and (not manufacturer or not mpn):
-                    errors.append(f"Row {index}: component_id or manufacturer+mpn is required")
+                try:
+                    identity = self._inventory_csv.prepare_identity(row, index)
+                except ValueError as exc:
+                    errors.append(str(exc))
                     continue
-                if component_id:
-                    component = conn.execute(
-                        """
-                        SELECT component.id, component.identity_kind,
-                               component.normalized_manufacturer, component.normalized_part_number
-                        FROM components component WHERE component.id = %s
-                        """,
-                        (component_id,),
-                    ).fetchone()
-                else:
-                    component = conn.execute(
-                        """
-                        SELECT id, identity_kind, normalized_manufacturer, normalized_part_number
-                        FROM components
-                        WHERE identity_kind = 'mpn'
-                          AND normalized_manufacturer = %s AND normalized_part_number = %s
-                        """,
-                        (_normalize_identity_value(manufacturer), _normalize_identity_value(mpn)),
-                    ).fetchone()
+                component = self._inventory_csv.find_component(conn, identity)
                 if not component:
                     not_found += 1
                     errors.append(f"Row {index}: component identity was not found")
                     continue
-                if str(component["identity_kind"]) != IDENTITY_KIND_MPN:
-                    errors.append(f"Row {index}: provisional components cannot receive MPN inventory")
-                    continue
-                if manufacturer and _normalize_identity_value(manufacturer) != str(component["normalized_manufacturer"]):
-                    errors.append(f"Row {index}: manufacturer does not match component_id")
-                    continue
-                if mpn and _normalize_identity_value(mpn) != str(component["normalized_part_number"]):
-                    errors.append(f"Row {index}: mpn does not match component_id")
-                    continue
                 try:
-                    quantity = float(row.get("quantity") or row.get("stock_quantity") or 0)
-                except (TypeError, ValueError):
-                    errors.append(f"Row {index}: quantity must be numeric")
+                    self._inventory_csv.validate_component(component, identity, index)
+                    prepared = self._inventory_csv.prepare_upsert(row, index)
+                except ValueError as exc:
+                    errors.append(str(exc))
                     continue
                 now = _utc_now_iso()
-                conn.execute(
-                    """
-                    INSERT INTO inventory_levels (
-                        source, component_id, location_key, source_record_id, quantity, uom,
-                        inventory_status, fetch_status, fetched_at, updated_at
-                    ) VALUES ('csv', %s, '', %s, %s, %s, %s, 'ok', %s, %s)
-                    ON CONFLICT(source, component_id, location_key) DO UPDATE SET
-                        source_record_id = EXCLUDED.source_record_id,
-                        quantity = EXCLUDED.quantity,
-                        uom = EXCLUDED.uom,
-                        inventory_status = EXCLUDED.inventory_status,
-                        fetch_status = EXCLUDED.fetch_status,
-                        fetched_at = EXCLUDED.fetched_at,
-                        updated_at = EXCLUDED.updated_at
-                    """,
-                    (
-                        component["id"],
-                        f"csv:{index}",
-                        quantity,
-                        str(row.get("uom") or row.get("stock_uom") or ""),
-                        str(row.get("inventory_status") or ""),
-                        now,
-                        now,
-                    ),
-                )
+                self._inventory_csv.upsert(conn, component["id"], index, prepared, now)
                 updated += 1
             conn.commit()
         return {"updated": updated, "not_found": not_found, "errors": errors}
