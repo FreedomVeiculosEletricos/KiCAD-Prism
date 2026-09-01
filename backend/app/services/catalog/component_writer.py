@@ -97,7 +97,7 @@ def metadata_matches_revision(revision: dict[str, Any], metadata: dict[str, Any]
             if key == "extra_fields"
             else str(revision.get(key) or "") == str(metadata[key])
         )
-        for key in metadata
+        for key in (*_METADATA_COLUMNS, "extra_fields")
     )
 
 

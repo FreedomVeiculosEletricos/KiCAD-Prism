@@ -200,3 +200,27 @@ dependencies, or collaborators depending back on the facade are prohibited.
 After Catalog PR 8, continue the planned waves for catalog API/UI, design
 comparison, viewer UI, jobs/ingestion, Release Studio, fabrication/document
 tooling, and finally mechanical migration-file separation.
+
+## Approved compatibility-facade size exception
+
+The completed decomposition retains `component_catalog_domain.py` as a 2,132
+line compatibility facade for the alpha lifecycle. This is an explicit waiver
+from the original 500-line facade/orchestrator target, not permission for a new
+god module. The stable historical surface has 183 forwarding signatures, and
+preserving them explicitly keeps runtime callers, tests, maintenance tooling,
+and third-party integrations inspectable without the prohibited alternatives
+of mixins or dynamic `__getattr__` delegation.
+
+The exception has these hard bounds:
+
+- the facade contains transaction and connection scopes plus explicit
+  delegation, but no domain implementation;
+- new catalog behavior must be implemented in `backend/app/services/catalog/`;
+- the checked-in 2,132-line architecture ceiling may only shrink and must never
+  increase;
+- collaborators must not import or retain a reference to the facade; and
+- after the alpha compatibility window, callers should migrate to supported
+  narrow services so forwarding methods and their ceiling can be retired.
+
+This exception does not relax the 500-line limit for any new catalog facade,
+composition root, or orchestrator.
