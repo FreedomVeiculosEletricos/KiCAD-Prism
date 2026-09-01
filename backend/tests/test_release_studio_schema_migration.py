@@ -1783,6 +1783,8 @@ class ReleaseStudioPostgresSchemaTests(unittest.TestCase):
                 (18, "release_studio_source_defaults"),
                 (19, "release_studio_project_signoff"),
                 (20, "project_file_anchor"),
+                (21, "project_metadata"),
+                (22, "project_metadata_repository"),
             ],
         )
 
