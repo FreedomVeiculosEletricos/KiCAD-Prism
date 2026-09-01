@@ -6,7 +6,6 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,11 +15,10 @@ from app.services.catalog.metadata_schema import (
     METADATA_FIELD_TYPES,
 )
 from app.services.catalog.metadata_normalization import dedupe
-from app.services.catalog.normalization import json_loads as _json_loads
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from app.services.catalog.normalization import (
+    json_loads as _json_loads,
+    utc_now_iso as _utc_now_iso,
+)
 
 
 def validate_metadata_value(field: dict[str, Any], value: str) -> str:

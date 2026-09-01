@@ -6,10 +6,9 @@ import hashlib
 import json
 import re
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from app.services.catalog.normalization import json_loads
+from app.services.catalog.normalization import json_loads, utc_now_iso as _utc_now_iso
 
 
 SYMBOL_METADATA_LABEL_TO_KEY = {
@@ -51,10 +50,6 @@ BUILTIN_METADATA_FIELDS: tuple[dict[str, Any], ...] = (
     {"key": "rate", "label": "Rate", "group": "engineering", "type": "number"},
     {"key": "sap_code", "label": "SAP Code", "group": "core", "type": "text"},
 )
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class CatalogMetadataSchema:

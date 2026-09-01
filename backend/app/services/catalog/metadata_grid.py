@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 from typing import Any
 
-from app.services.catalog.normalization import json_loads as _json_loads
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from app.services.catalog.normalization import (
+    json_loads as _json_loads,
+    utc_now_iso as _utc_now_iso,
+)
 
 
 @dataclass(frozen=True)

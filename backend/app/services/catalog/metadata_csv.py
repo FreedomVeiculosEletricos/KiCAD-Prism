@@ -9,7 +9,8 @@ import io
 import re
 from typing import Any, Mapping
 
-from app.services.catalog.normalization import json_loads as _json_loads
+from app.services.catalog.metadata_schema import METADATA_SCHEMA_VERSION
+from app.services.catalog.normalization import json_loads as _json_loads, slugify
 
 
 CSV_REQUIRED_COLUMNS = (
@@ -77,11 +78,6 @@ class ParsedMetadataCsvImport:
     rows: list[PreparedMetadataCsvImportRow]
 
 
-def _slugify(value: str, default: str = "component") -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", (value or "").strip().lower()).strip("._-")
-    return cleaned or default
-
-
 class CatalogMetadataCsv:
     """Stateless metadata CSV operations."""
 
@@ -90,7 +86,7 @@ class CatalogMetadataCsv:
         fields: list[dict[str, Any]],
         field_keys: list[str] | None = None,
         *,
-        schema_version: str = "prism.component_metadata_a1",
+        schema_version: str = METADATA_SCHEMA_VERSION,
     ) -> PreparedMetadataCsvExport:
         selected = list(fields)
         if field_keys is not None:
@@ -284,7 +280,7 @@ class CatalogMetadataCsv:
     @staticmethod
     def normalize_csv_row(row: dict[str, str], row_index: int) -> dict[str, str]:
         normalized = {
-            _slugify(key, key).replace("-", "_"): (value or "").strip()
+            slugify(key, key).replace("-", "_"): (value or "").strip()
             for key, value in row.items()
         }
         for required in CSV_REQUIRED_COLUMNS:
