@@ -27,7 +27,37 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 from app.core.config import settings
+from app.services.catalog.component_history import CatalogComponentHistoryReads
+from app.services.catalog.component_read_models import (
+    CatalogComponentReadModels,
+    SUPPLY_KIND_LOCAL,
+    SUPPLY_KIND_VENDOR,
+    SUPPLY_LOCAL_SOURCE_NAMES,
+    SUPPLY_VENDOR_SOURCE_NAMES,
+    supply_source_payload as _supply_source_payload,
+)
+from app.services.catalog.component_queries import CatalogComponentQueries
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
+from app.services.catalog.normalization import (
+    json_loads as _json_loads,
+    preview_base_kind as _preview_base_kind,
+    preview_kind as _preview_kind,
+    preview_unit as _preview_unit,
+    preview_unit_label as _preview_unit_label,
+    sha256_bytes as _sha256_bytes,
+    sha256_file as _sha256_file,
+)
+from app.services.catalog.revision_comparison import CatalogRevisionComparison
+from app.services.catalog.revision_kernel import (
+    CatalogRevisionKernel,
+    LEGACY_WORKFLOW_STAGE_MAP,
+    REVISION_MANIFEST_A0,
+    REVISION_MANIFEST_A1,
+    REVISION_MANIFEST_A2,
+    REVISION_MANIFEST_A3,
+    WORKFLOW_STAGES,
+    normalize_workflow_stage,
+)
 from app.services.catalog.runtime import (
     CatalogRuntime, DBL_EXPORT_DIRNAME, DEFAULT_STORE_DIRNAME, KLC_VALIDATION_DIRNAME,
     _ASSET_BROWSE_CACHE_TTL_SECONDS,
@@ -40,10 +70,6 @@ PREVIEW_KIND_FOOTPRINT = "footprint"
 PREVIEW_STATUS_READY = "ready"
 PREVIEW_STATUS_FAILED = "failed"
 PREVIEW_PIPELINE_VERSION = "prism-preview-a2-multi-unit"
-REVISION_MANIFEST_A0 = "prism.revision_manifest_a0"
-REVISION_MANIFEST_A1 = "prism.revision_manifest_a1"
-REVISION_MANIFEST_A2 = "prism.revision_manifest_a2"
-REVISION_MANIFEST_A3 = "prism.revision_manifest_a3"
 
 IDENTITY_KIND_MPN = "mpn"
 IDENTITY_KIND_PROVISIONAL_IPN = "provisional_ipn"
@@ -54,53 +80,11 @@ SOURCE_MANUAL = "manual"
 SOURCE_EXTERNAL = "external"
 SUPPORTED_ASSET_TYPES = ("symbol", "footprint", "3dmodel", "spice")
 PLACE_REQUIRED_ASSET_TYPES = ("symbol", "footprint")
-WORKFLOW_STAGES = ("open", "in_progress", "qa_review", "done", "released", "archived")
-LEGACY_WORKFLOW_STAGE_MAP = {
-    "draft": "open",
-    "in_review": "qa_review",
-    "qa_approved": "done",
-    "released": "released",
-    "deprecated": "archived",
-}
 RELEASE_STATES = WORKFLOW_STAGES
 
 STATE_METADATA_ONLY = "metadata_only"
 STATE_FILES_PARTIAL = "files_partial"
 STATE_PLACE_READY = "place_ready"
-
-# Availability sources shown in the remote-provider payload. Everything today
-# is local inventory; distributor adapters (supply_quotes) extend
-# SUPPLY_VENDOR_SOURCE_NAMES when they land.
-SUPPLY_KIND_VENDOR = "vendor"
-SUPPLY_KIND_LOCAL = "local"
-SUPPLY_VENDOR_SOURCE_NAMES: dict[str, str] = {}
-SUPPLY_LOCAL_SOURCE_NAMES: dict[str, str] = {
-    "csv": "CSV",
-    "inventree": "InvenTree",
-    "sap": "SAP",
-    "manufacturo": "Manufacturo",
-    "partsdb": "PartsDB",
-}
-
-
-def _supply_source_payload(row: dict[str, Any]) -> dict[str, Any]:
-    source = str(row.get("source") or "")
-    kind = (
-        SUPPLY_KIND_VENDOR if source in SUPPLY_VENDOR_SOURCE_NAMES else SUPPLY_KIND_LOCAL
-    )
-    display_name = SUPPLY_VENDOR_SOURCE_NAMES.get(source) or SUPPLY_LOCAL_SOURCE_NAMES.get(
-        source
-    ) or source.replace("_", " ").title()
-    return {
-        "kind": kind,
-        "id": source,
-        "display_name": display_name,
-        "stock": float(row.get("quantity") or 0),
-        "uom": str(row.get("uom") or ""),
-        "stock_status": str(row.get("inventory_status") or ""),
-        "fetch_status": str(row.get("fetch_status") or "ok"),
-        "fetched_at": str(row.get("fetched_at") or ""),
-    }
 
 VALIDATION_STATUS_PASSED = "passed"
 VALIDATION_STATUS_WARNING = "warning"
@@ -208,26 +192,6 @@ BUILTIN_METADATA_FIELDS: tuple[dict[str, Any], ...] = (
 _TOP_LEVEL_PROPERTY_RE = re.compile(r'^([ \t]+)\(property "([^"]+)" ')
 
 
-def _preview_base_kind(kind: str) -> str:
-    return kind.split(":unit", 1)[0]
-
-
-def _preview_unit(kind: str) -> int:
-    match = re.search(r":unit(\d+)$", kind)
-    return max(1, int(match.group(1))) if match else 1
-
-
-def _preview_kind(kind: str, unit: int) -> str:
-    return kind if unit <= 1 else f"{kind}:unit{unit}"
-
-
-def _preview_unit_label(kind: str) -> str:
-    unit = _preview_unit(kind)
-    if unit <= 26:
-        return f"Unit {chr(64 + unit)}"
-    return f"Unit {unit}"
-
-
 @dataclass
 class CatalogPreview:
     preview_id: str
@@ -270,18 +234,6 @@ def _remote_library_nickname(library_name: str) -> str:
 
 def _escape_symbol_property_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _sha256_file(file_path: Path) -> str:
-    digest = hashlib.sha256()
-    with file_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _symbol_property_block(name: str, value: str, *, indent: str = "    ", hidden: bool = True) -> str:
@@ -456,24 +408,12 @@ def _release_allows_remote(release_status: str) -> bool:
 
 
 def _normalize_workflow_stage(stage: str) -> str:
-    normalized = (stage or "").strip().lower()
-    return LEGACY_WORKFLOW_STAGE_MAP.get(normalized, normalized)
+    return normalize_workflow_stage(stage)
 
 
 def _normalize_identity_value(value: Any) -> str:
     """Canonical catalog identity normalization: trim and lowercase only."""
     return str(value or "").strip().lower()
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if value in (None, ""):
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(str(value))
-    except json.JSONDecodeError:
-        return default
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -499,6 +439,11 @@ def _dbl_symbol_library_name(part_number: str, symbol_asset: dict[str, Any] | No
 
 class ComponentCatalogDomainService:
     _catalog_locks: CatalogLockOperations = NoopCatalogLocks()
+    _revision_kernel: CatalogRevisionKernel = CatalogRevisionKernel(_catalog_locks)
+    _revision_comparison: CatalogRevisionComparison = CatalogRevisionComparison(_revision_kernel)
+    _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
+    _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
+    _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
@@ -506,6 +451,11 @@ class ComponentCatalogDomainService:
             database_path=self._database_path(database_url),
         )
         self._catalog_locks: CatalogLockOperations = NoopCatalogLocks()
+        self._revision_kernel = CatalogRevisionKernel(self._catalog_locks)
+        self._revision_comparison = CatalogRevisionComparison(self._revision_kernel)
+        self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
+        self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
+        self._component_queries = CatalogComponentQueries(self._component_read_models)
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -1008,12 +958,10 @@ class ComponentCatalogDomainService:
             raise ValueError("A component with this manufacturer-part identity already exists")
 
     def _component_row(self, conn: Any, component_id: str) -> dict[str, Any] | None:
-        row = conn.execute("SELECT * FROM components WHERE id = %s", (component_id,)).fetchone()
-        return dict(row) if row else None
+        return self._revision_kernel.component_row(conn, component_id)
 
     def _revision_row(self, conn: Any, revision_id: str) -> dict[str, Any] | None:
-        row = conn.execute("SELECT * FROM component_revisions WHERE id = %s", (revision_id,)).fetchone()
-        return dict(row) if row else None
+        return self._revision_kernel.revision_row(conn, revision_id)
 
     def _active_revision_row(
         self,
@@ -1022,13 +970,7 @@ class ComponentCatalogDomainService:
         *,
         released: bool = False,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        component = self._component_row(conn, component_id)
-        if not component:
-            return None, None
-        revision_id = component["released_revision_id"] if released else component["current_revision_id"]
-        if not revision_id:
-            return component, None
-        return component, self._revision_row(conn, str(revision_id))
+        return self._revision_kernel.active_revision_row(conn, component_id, released=released)
 
     def _append_audit_event(
         self,
@@ -1040,131 +982,17 @@ class ComponentCatalogDomainService:
         actor: str = "",
         details: dict[str, Any] | None = None,
     ) -> None:
-        self._catalog_locks.lock_audit_append(conn, component_id)
-        previous = conn.execute(
-            "SELECT sequence, event_hash FROM catalog_audit_events WHERE component_id = %s ORDER BY sequence DESC LIMIT 1",
-            (component_id,),
-        ).fetchone()
-        previous_hash = str(previous["event_hash"]) if previous else ""
-        sequence = int(previous["sequence"] or 0) + 1 if previous else 1
-        created_at = _utc_now_iso()
-        event_id = str(uuid.uuid4())
-        details_json = json.dumps(details or {}, sort_keys=True, separators=(",", ":"))
-        canonical = json.dumps(
-            {
-                "id": event_id,
-                "component_id": component_id,
-                "revision_id": revision_id,
-                "event_type": event_type,
-                "actor": actor,
-                "details": json.loads(details_json),
-                "previous_hash": previous_hash,
-                "created_at": created_at,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        event_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        conn.execute(
-            """
-            INSERT INTO catalog_audit_events (
-                id, component_id, sequence, revision_id, event_type, actor, details_json,
-                previous_hash, event_hash, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                event_id,
-                component_id,
-                sequence,
-                revision_id,
-                event_type,
-                actor,
-                details_json,
-                previous_hash,
-                event_hash,
-                created_at,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO catalog_meta (key, value) VALUES (%s, %s) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            (f"audit_head:{component_id}", event_hash),
+        return self._revision_kernel.append_audit_event(
+            conn,
+            component_id=component_id,
+            revision_id=revision_id,
+            event_type=event_type,
+            actor=actor,
+            details=details,
         )
 
     def _revision_manifest_hash(self, conn: Any, revision_id: str) -> str:
-        revision = self._revision_row(conn, revision_id)
-        if not revision:
-            return ""
-        excluded = {
-            "id",
-            "component_id",
-            "release_status",
-            "manifest_hash",
-            "manifest_schema",
-            "created_at",
-            "updated_at",
-            "version",
-            "parent_revision_id",
-            "change_kind",
-            "change_summary",
-            "created_by",
-        }
-        metadata = {key: revision[key] for key in sorted(revision) if key not in excluded}
-        assets = [
-            {
-                "asset_type": str(asset["asset_type"]),
-                "sha256": str(asset["sha256"]),
-                "target_library": str(asset["target_library"]),
-                "target_name": str(asset["target_name"]),
-                "required": bool(asset["required"]),
-            }
-            for asset in self._load_assets_for_revision(conn, revision_id)
-        ]
-        manifest_schema = str(revision.get("manifest_schema") or REVISION_MANIFEST_A0)
-        payload: dict[str, Any] = {"metadata": metadata, "assets": assets}
-        if manifest_schema == REVISION_MANIFEST_A1:
-            payload = {
-                "schema": REVISION_MANIFEST_A1,
-                **payload,
-                "previews": [
-                    {
-                        "asset_id": str(preview["asset_id"]),
-                        "kind": str(preview["kind"]),
-                        "sha256": str(preview["sha256"]),
-                        "generator_fingerprint": str(preview["generator_fingerprint"]),
-                    }
-                    for preview in self._load_preview_evidence_for_revision(conn, revision_id)
-                    if str(preview["status"]) == PREVIEW_STATUS_READY
-                ],
-            }
-        elif manifest_schema == REVISION_MANIFEST_A2:
-            payload = {"schema": REVISION_MANIFEST_A2, **payload}
-        elif manifest_schema == REVISION_MANIFEST_A3:
-            payload = {
-                "schema": REVISION_MANIFEST_A3,
-                **payload,
-                "representations": [
-                    {
-                        "label": str(item["label"]),
-                        "symbol_asset_id": str(item["symbol_asset_id"] or ""),
-                        "footprint_asset_id": str(item["footprint_asset_id"] or ""),
-                        "is_default": bool(item["is_default"]),
-                        "display_order": int(item["display_order"]),
-                        "source_internal_part_number": str(item["source_internal_part_number"] or ""),
-                        "provenance": _json_loads(item["provenance_json"], {}),
-                    }
-                    for item in conn.execute(
-                        "SELECT * FROM revision_representations WHERE revision_id = %s "
-                        "ORDER BY display_order, label, COALESCE(symbol_asset_id, ''), "
-                        "COALESCE(footprint_asset_id, '')",
-                        (revision_id,),
-                    ).fetchall()
-                ],
-            }
-        elif manifest_schema != REVISION_MANIFEST_A0:
-            raise ValueError(f"Unsupported revision manifest schema: {manifest_schema}")
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return self._revision_kernel.revision_manifest_hash(conn, revision_id)
 
     def _finalize_revision(
         self,
@@ -1201,139 +1029,17 @@ class ComponentCatalogDomainService:
         change_summary: str = "",
         expected_revision_id: str = "",
     ) -> dict[str, Any]:
-        self._catalog_locks.lock_revision_clone(conn, component_id)
-        component, current = self._active_revision_row(conn, component_id, released=False)
-        if not component or not current:
-            raise ValueError("Component not found")
-        if expected_revision_id and str(current["id"]) != expected_revision_id:
-            raise ValueError("Component revision conflict: refresh the component before saving")
-
-        now = _utc_now_iso()
-        next_version = int(
-            conn.execute(
-                "SELECT COALESCE(MAX(version), 0) AS max_version FROM component_revisions WHERE component_id = %s",
-                (component_id,),
-            ).fetchone()["max_version"]
-        ) + 1
-        parent_status = _normalize_workflow_stage(str(current["release_status"]))
-        # Preserve in-flight workflow across asset/metadata clones. Only branch
-        # back to open when starting new work from a released/archived revision.
-        if change_kind == "new_draft" or parent_status in {"released", "archived"}:
-            next_status = "open"
-        elif parent_status == "done":
-            next_status = "in_progress"
-        else:
-            next_status = parent_status if parent_status in WORKFLOW_STAGES else "open"
-        revision_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO component_revisions (
-                id, component_id, version, parent_revision_id, change_kind, change_summary, created_by,
-                manifest_hash, manifest_schema, release_status, name, value, description, datasheet_url,
-                manufacturer, mpn, normalized_manufacturer, normalized_mpn, mpn_source,
-                category, package_name, vendor, vendor_part_number, mass_g,
-                rqjc_c_w, rqjc_top_c_w, temp_max_c, temp_min_c, power_dissipation_w, rate, sap_code,
-                summary, keywords, extra_fields, search_document, created_at, updated_at
-            )
-            SELECT
-                %s, component_id, %s, id, %s, %s, %s, '', %s, %s, name, value, description, datasheet_url,
-                manufacturer, mpn, normalized_manufacturer, normalized_mpn, mpn_source,
-                category, package_name, vendor, vendor_part_number, mass_g,
-                rqjc_c_w, rqjc_top_c_w, temp_max_c, temp_min_c, power_dissipation_w, rate, sap_code,
-                summary, keywords, extra_fields, search_document, %s, %s
-            FROM component_revisions
-            WHERE id = %s
-            """,
-            (
-                revision_id,
-                next_version,
-                change_kind,
-                change_summary,
-                actor,
-                REVISION_MANIFEST_A3,
-                next_status,
-                now,
-                now,
-                current["id"],
-            ),
+        return self._revision_kernel.clone_revision(
+            conn,
+            component_id,
+            actor=actor,
+            change_kind=change_kind,
+            change_summary=change_summary,
+            expected_revision_id=expected_revision_id,
         )
-        conn.execute(
-            """
-            INSERT INTO revision_assets (revision_id, asset_type, asset_id, required, created_at, updated_at)
-            SELECT %s, asset_type, asset_id, required, %s, %s
-            FROM revision_assets
-            WHERE revision_id = %s
-            """,
-            (revision_id, now, now, current["id"]),
-        )
-        for representation in conn.execute(
-            """
-            SELECT label, symbol_asset_id, footprint_asset_id, is_default, display_order,
-                   source_internal_part_number, provenance_json
-            FROM revision_representations
-            WHERE revision_id = %s
-            ORDER BY display_order, id
-            """,
-            (current["id"],),
-        ).fetchall():
-            conn.execute(
-                """
-                INSERT INTO revision_representations (
-                    id, revision_id, label, symbol_asset_id, footprint_asset_id, is_default,
-                    display_order, source_internal_part_number, provenance_json, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    str(uuid.uuid4()), revision_id, representation["label"],
-                    representation["symbol_asset_id"], representation["footprint_asset_id"],
-                    representation["is_default"], representation["display_order"],
-                    representation["source_internal_part_number"], representation["provenance_json"],
-                    now, now,
-                ),
-            )
-        conn.execute(
-            """
-            INSERT INTO revision_previews (revision_id, asset_id, kind, preview_id, created_at)
-            SELECT %s, asset_id, kind, preview_id, %s
-            FROM revision_previews
-            WHERE revision_id = %s
-            """,
-            (revision_id, now, current["id"]),
-        )
-        conn.execute(
-            """
-            INSERT INTO revision_preview_outputs (revision_id, asset_id, kind, preview_id, generated_at)
-            SELECT %s, asset_id, kind, preview_id, %s
-            FROM revision_preview_outputs
-            WHERE revision_id = %s
-            """,
-            (revision_id, now, current["id"]),
-        )
-        conn.execute(
-            "UPDATE components SET current_revision_id = %s, updated_at = %s WHERE id = %s",
-            (revision_id, now, component_id),
-        )
-        self._inherit_validation_evidence(conn, str(current["id"]), revision_id)
-        return self._revision_row(conn, revision_id) or {}
 
     def _load_assets_for_revision(self, conn: Any, revision_id: str) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """
-            SELECT a.*, ra.required
-            FROM revision_assets ra
-            JOIN assets a ON a.id = ra.asset_id
-            WHERE ra.revision_id = %s
-            ORDER BY CASE a.asset_type
-                WHEN 'symbol' THEN 1
-                WHEN 'footprint' THEN 2
-                WHEN '3dmodel' THEN 3
-                WHEN 'spice' THEN 4
-                ELSE 99
-            END, a.target_library, a.target_name, a.sha256
-            """,
-            (revision_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        return self._revision_kernel.load_assets_for_revision(conn, revision_id)
 
     def _load_representations_for_revision(
         self,
@@ -1343,191 +1049,24 @@ class ComponentCatalogDomainService:
         assets: list[dict[str, Any]] | None = None,
         previews: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        assets = assets if assets is not None else self._load_assets_for_revision(conn, revision_id)
-        previews = previews if previews is not None else self._load_previews_for_revision(conn, revision_id)
-        assets_by_id = {str(asset["id"]): asset for asset in assets}
-        previews_by_asset: dict[str, list[dict[str, Any]]] = {}
-        for preview in previews:
-            previews_by_asset.setdefault(str(preview["asset_id"]), []).append(preview)
-
-        def asset_payload(asset_id: Any) -> dict[str, Any] | None:
-            asset = assets_by_id.get(str(asset_id or ""))
-            if not asset:
-                return None
-            ready_preview = next(
-                (
-                    preview
-                    for preview in previews_by_asset.get(str(asset["id"]), [])
-                    if str(preview.get("status") or "") == PREVIEW_STATUS_READY
-                ),
-                None,
-            )
-            return {
-                "id": str(asset["id"]),
-                "asset_type": str(asset["asset_type"]),
-                "name": str(asset["name"]),
-                "target_library": str(asset["target_library"]),
-                "target_name": str(asset["target_name"]),
-                "sha256": str(asset["sha256"]),
-                "preview_id": str(ready_preview["id"]) if ready_preview else "",
-            }
-
-        rows = conn.execute(
-            "SELECT * FROM revision_representations WHERE revision_id = %s "
-            "ORDER BY display_order, id",
-            (revision_id,),
-        ).fetchall()
-        return [
-            {
-                "id": str(row["id"]),
-                "revision_id": str(row["revision_id"]),
-                "label": str(row["label"]),
-                "symbol": asset_payload(row["symbol_asset_id"]),
-                "footprint": asset_payload(row["footprint_asset_id"]),
-                "is_default": bool(row["is_default"]),
-                "display_order": int(row["display_order"]),
-                "source_internal_part_number": str(row["source_internal_part_number"] or ""),
-                "provenance": _json_loads(row["provenance_json"], {}),
-            }
-            for row in rows
-        ]
+        return self._component_read_models.load_representations_for_revision(
+            conn, revision_id, assets=assets, previews=previews
+        )
 
     def _local_inventory(self, conn: Any, component_id: str) -> dict[str, Any] | None:
-        row = conn.execute(
-            """
-            SELECT source, SUM(quantity) AS quantity, MIN(uom) AS uom,
-                   MIN(inventory_status) AS inventory_status,
-                   MIN(fetch_status) AS fetch_status, MAX(fetched_at) AS fetched_at
-            FROM inventory_levels
-            WHERE component_id = %s
-            GROUP BY source
-            ORDER BY CASE source WHEN 'inventree' THEN 1 WHEN 'csv' THEN 2 ELSE 99 END, source
-            LIMIT 1
-            """,
-            (component_id,),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "source": str(row["source"]),
-            "quantity": float(row["quantity"] or 0),
-            "uom": str(row["uom"] or ""),
-            "inventory_status": str(row["inventory_status"] or ""),
-            "fetch_status": str(row["fetch_status"] or "ok"),
-            "fetched_at": str(row["fetched_at"] or ""),
-        }
+        return self._component_read_models.local_inventory(conn, component_id)
 
     def _supply_sources(self, conn: Any, component_id: str) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """
-            SELECT source, SUM(quantity) AS quantity, MIN(uom) AS uom,
-                   MIN(inventory_status) AS inventory_status,
-                   MIN(fetch_status) AS fetch_status, MAX(fetched_at) AS fetched_at
-            FROM inventory_levels
-            WHERE component_id = %s
-            GROUP BY source
-            ORDER BY CASE source WHEN 'inventree' THEN 1 WHEN 'csv' THEN 2 ELSE 99 END, source
-            """,
-            (component_id,),
-        ).fetchall()
-        return [_supply_source_payload(dict(row)) for row in rows]
+        return self._component_read_models.supply_sources(conn, component_id)
 
     def _load_previews_for_assets(self, conn: Any, asset_ids: list[str]) -> list[dict[str, Any]]:
-        if not asset_ids:
-            return []
-        placeholders = ",".join("%s" for _ in asset_ids)
-        rows = conn.execute(
-            f"SELECT * FROM asset_previews WHERE asset_id IN ({placeholders}) ORDER BY kind, updated_at DESC",
-            tuple(asset_ids),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        return self._component_read_models.load_previews_for_assets(conn, asset_ids)
 
     def _load_previews_for_revision(self, conn: Any, revision_id: str) -> list[dict[str, Any]]:
-        output_rows = conn.execute(
-            """
-            SELECT preview.*
-            FROM revision_preview_outputs link
-            JOIN asset_preview_versions preview ON preview.id = link.preview_id
-            JOIN revision_assets ra
-              ON ra.revision_id = link.revision_id AND ra.asset_id = link.asset_id
-            WHERE link.revision_id = %s
-            """,
-            (revision_id,),
-        ).fetchall()
-        evidence_rows = conn.execute(
-            """
-            SELECT preview.*
-            FROM revision_previews link
-            JOIN asset_preview_versions preview ON preview.id = link.preview_id
-            JOIN revision_assets ra
-              ON ra.revision_id = link.revision_id AND ra.asset_id = link.asset_id
-            WHERE link.revision_id = %s
-            """,
-            (revision_id,),
-        ).fetchall()
-        # Preview outputs are regenerated derived data while revision_previews
-        # are immutable legacy evidence. Compare their semantic (asset, kind,
-        # unit) identity rather than their raw kind: old records may encode
-        # Unit A as `symbol`, while regenerated records use `symbol:unit1`.
-        # Returning both made the UI show two Unit A tabs.
-        previews = {
-            (str(row["asset_id"]), _preview_base_kind(str(row["kind"])), _preview_unit(str(row["kind"]))): dict(row)
-            for row in evidence_rows
-        }
-        previews.update({
-            (str(row["asset_id"]), _preview_base_kind(str(row["kind"])), _preview_unit(str(row["kind"]))): dict(row)
-            for row in output_rows
-        })
-        return sorted(previews.values(), key=lambda row: (str(row["kind"]), str(row["asset_id"]), str(row["created_at"]), str(row["id"])))
+        return self._component_read_models.load_previews_for_revision(conn, revision_id)
 
     def _load_preview_evidence_for_revision(self, conn: Any, revision_id: str) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """
-            SELECT preview.*
-            FROM revision_previews link
-            JOIN asset_preview_versions preview ON preview.id = link.preview_id
-            WHERE link.revision_id = %s
-            ORDER BY preview.kind, preview.asset_id, preview.created_at, preview.id
-            """,
-            (revision_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def _load_previews_for_revisions(self, conn: Any, revision_ids: list[str]) -> list[dict[str, Any]]:
-        if not revision_ids:
-            return []
-        placeholders = ",".join("%s" for _ in revision_ids)
-        output_rows = conn.execute(
-            f"""
-            SELECT preview.*, link.revision_id
-            FROM revision_preview_outputs link
-            JOIN asset_preview_versions preview ON preview.id = link.preview_id
-            JOIN revision_assets ra
-              ON ra.revision_id = link.revision_id AND ra.asset_id = link.asset_id
-            WHERE link.revision_id IN ({placeholders})
-            """,
-            tuple(revision_ids),
-        ).fetchall()
-        evidence_rows = conn.execute(
-            f"""
-            SELECT preview.*, link.revision_id
-            FROM revision_previews link
-            JOIN asset_preview_versions preview ON preview.id = link.preview_id
-            JOIN revision_assets ra
-              ON ra.revision_id = link.revision_id AND ra.asset_id = link.asset_id
-            WHERE link.revision_id IN ({placeholders})
-            """,
-            tuple(revision_ids),
-        ).fetchall()
-        previews = {
-            (str(row["revision_id"]), str(row["asset_id"]), _preview_base_kind(str(row["kind"])), _preview_unit(str(row["kind"]))): dict(row)
-            for row in evidence_rows
-        }
-        previews.update({
-            (str(row["revision_id"]), str(row["asset_id"]), _preview_base_kind(str(row["kind"])), _preview_unit(str(row["kind"]))): dict(row)
-            for row in output_rows
-        })
-        return sorted(previews.values(), key=lambda row: (str(row["revision_id"]), str(row["kind"]), str(row["asset_id"]), str(row["created_at"]), str(row["id"])))
+        return self._revision_kernel.load_preview_evidence_for_revision(conn, revision_id)
 
     def _latest_validation_runs_for_assets(
         self,
@@ -1535,94 +1074,17 @@ class ComponentCatalogDomainService:
         revision_id: str,
         asset_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
-        if not asset_ids:
-            return {}
-        placeholders = ",".join("%s" for _ in asset_ids)
-        rows = conn.execute(
-            f"""
-            SELECT *
-            FROM asset_validation_runs
-            WHERE revision_id = %s AND asset_id IN ({placeholders})
-            ORDER BY asset_id, finished_at DESC, created_at DESC
-            """,
-            (revision_id, *asset_ids),
-        ).fetchall()
-        latest: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            asset_id = str(row["asset_id"])
-            if asset_id not in latest:
-                latest[asset_id] = dict(row)
-        missing_asset_ids = [asset_id for asset_id in asset_ids if asset_id not in latest]
-        if missing_asset_ids:
-            inherited_placeholders = ",".join("%s" for _ in missing_asset_ids)
-            inherited_rows = conn.execute(
-                f"""
-                SELECT run.*, run.revision_id AS inherited_from_revision_id,
-                       link.revision_id AS inherited_for_revision_id
-                FROM revision_validation_evidence_links link
-                JOIN asset_validation_runs run ON run.id = link.source_run_id
-                WHERE link.revision_id = %s AND link.asset_id IN ({inherited_placeholders})
-                """,
-                (revision_id, *missing_asset_ids),
-            ).fetchall()
-            for row in inherited_rows:
-                latest[str(row["asset_id"])] = dict(row)
-        return latest
+        return self._component_read_models.latest_validation_runs_for_assets(
+            conn, revision_id, asset_ids
+        )
 
     def _validation_run_payload(self, row: dict[str, Any], *, include_findings: bool = False, conn: Any | None = None) -> dict[str, Any]:
-        run_id = str(row["id"])
-        payload = {
-            "id": run_id,
-            "component_id": str(row["component_id"]),
-            "revision_id": str(row["revision_id"]),
-            "asset_id": str(row["asset_id"]),
-            "asset_type": str(row["asset_type"]),
-            "checker_type": str(row["checker_type"]),
-            "status": str(row["status"]),
-            "error_count": int(row["error_count"] or 0),
-            "warning_count": int(row["warning_count"] or 0),
-            "exit_code": row["exit_code"],
-            "tool_version": str(row["tool_version"] or ""),
-            "created_at": str(row["created_at"] or ""),
-            "finished_at": str(row["finished_at"] or ""),
-            "inherited": bool(row.get("inherited_for_revision_id")),
-            "inherited_from_revision_id": str(row.get("inherited_from_revision_id") or ""),
-            "reports": {
-                "summary": f"/api/catalog/validation/runs/{run_id}",
-                "json": f"/api/catalog/validation/runs/{run_id}/report.json",
-                "junit": f"/api/catalog/validation/runs/{run_id}/report.junit.xml",
-                "stdout": f"/api/catalog/validation/runs/{run_id}/stdout",
-                "stderr": f"/api/catalog/validation/runs/{run_id}/stderr",
-            },
-        }
-        if include_findings and conn is not None:
-            payload["findings"] = self._validation_findings_payload(conn, run_id)
-        return payload
+        return self._component_read_models.validation_run_payload(
+            row, include_findings=include_findings, conn=conn
+        )
 
     def _validation_findings_payload(self, conn: Any, run_id: str) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM asset_validation_findings
-            WHERE run_id = %s
-            ORDER BY CASE severity WHEN 'error' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END, rule_code, message
-            """,
-            (run_id,),
-        ).fetchall()
-        return [
-            {
-                "id": str(row["id"]),
-                "run_id": str(row["run_id"]),
-                "severity": str(row["severity"]),
-                "rule_code": str(row["rule_code"]),
-                "rule_url": str(row["rule_url"]),
-                "message": str(row["message"]),
-                "details": _json_loads(row["details_json"], []),
-                "object_name": str(row["object_name"] or ""),
-                "created_at": str(row["created_at"]),
-            }
-            for row in rows
-        ]
+        return self._component_read_models.validation_findings_payload(conn, run_id)
 
     def _component_validation_summary(
         self,
@@ -1632,79 +1094,15 @@ class ComponentCatalogDomainService:
         *,
         preloaded_runs: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        relevant_assets = [asset for asset in assets if str(asset["asset_type"]) in {"symbol", "footprint"}]
-        latest = (
-            preloaded_runs
-            if preloaded_runs is not None
-            else self._latest_validation_runs_for_assets(
-                conn,
-                revision_id,
-                [str(asset["id"]) for asset in relevant_assets],
-            )
+        return self._component_read_models.component_validation_summary(
+            conn,
+            revision_id,
+            assets,
+            preloaded_runs=preloaded_runs,
         )
-        asset_payloads: list[dict[str, Any]] = []
-        error_count = 0
-        warning_count = 0
-        statuses: list[str] = []
-        for asset in relevant_assets:
-            asset_id = str(asset["id"])
-            run = latest.get(asset_id)
-            validation = self._validation_run_payload(run) if run else None
-            status = str(run["status"]) if run else VALIDATION_STATUS_NOT_RUN
-            statuses.append(status)
-            if run:
-                error_count += int(run["error_count"] or 0)
-                warning_count += int(run["warning_count"] or 0)
-            asset_payloads.append(
-                {
-                    "asset_id": asset_id,
-                    "asset_type": str(asset["asset_type"]),
-                    "asset_name": str(asset["name"]),
-                    "target_library": str(asset["target_library"]),
-                    "target_name": str(asset["target_name"]),
-                    "status": status,
-                    "latest_run": validation,
-                }
-            )
-
-        if not relevant_assets:
-            status = VALIDATION_STATUS_NOT_RUN
-        elif VALIDATION_STATUS_FAILED in statuses:
-            status = VALIDATION_STATUS_FAILED
-        elif VALIDATION_STATUS_WARNING in statuses:
-            status = VALIDATION_STATUS_WARNING
-        elif VALIDATION_STATUS_SKIPPED in statuses:
-            status = VALIDATION_STATUS_SKIPPED
-        elif VALIDATION_STATUS_NOT_RUN in statuses:
-            status = VALIDATION_STATUS_NOT_RUN
-        else:
-            status = VALIDATION_STATUS_PASSED
-
-        required = set(PLACE_REQUIRED_ASSET_TYPES)
-        present_required = {str(asset["asset_type"]) for asset in relevant_assets if bool(asset.get("required", True))}
-        missing_required = sorted(required - present_required)
-        return {
-            "status": status,
-            "enabled": bool(settings.CATALOG_KLC_ENABLED),
-            "release_gate": self._klc_release_gate(),
-            "revision_id": revision_id,
-            "error_count": error_count,
-            "warning_count": warning_count,
-            "missing_required_assets": missing_required,
-            "assets": asset_payloads,
-        }
 
     def _availability(self, assets: list[dict[str, Any]], release_status: str, is_active: bool) -> tuple[str, list[str], bool]:
-        asset_types = {str(asset["asset_type"]) for asset in assets}
-        missing = [asset_type for asset_type in PLACE_REQUIRED_ASSET_TYPES if asset_type not in asset_types]
-        if missing and len(missing) == len(PLACE_REQUIRED_ASSET_TYPES):
-            state = STATE_METADATA_ONLY
-        elif missing:
-            state = STATE_FILES_PARTIAL
-        else:
-            state = STATE_PLACE_READY
-        place_enabled = is_active and not missing and _release_allows_remote(release_status)
-        return state, missing, place_enabled
+        return self._component_read_models.availability(assets, release_status, is_active)
 
     def _component_payload(
         self,
@@ -1718,557 +1116,65 @@ class ComponentCatalogDomainService:
         preloaded_validation_runs: dict[str, dict[str, Any]] | None = None,
         representation_id: str = "",
     ) -> dict[str, Any]:
-        assets = preloaded_assets if preloaded_assets is not None else self._load_assets_for_revision(conn, str(revision_row["id"]))
-        previews = preloaded_previews if preloaded_previews is not None else self._load_previews_for_revision(conn, str(revision_row["id"]))
-        representations = self._load_representations_for_revision(
-            conn, str(revision_row["id"]), assets=assets, previews=previews
-        )
-        default_representation = next((item for item in representations if item["is_default"]), None)
-        effective_representation = default_representation
-        if representation_id:
-            effective_representation = next(
-                (item for item in representations if item["id"] == representation_id), None
-            )
-            if not effective_representation:
-                raise ValueError("Representation was not found on this revision")
-            if not effective_representation.get("symbol") or not effective_representation.get("footprint"):
-                raise ValueError("Selected representation is incomplete")
-        symbol_asset = effective_representation.get("symbol") if effective_representation else None
-        footprint_asset = effective_representation.get("footprint") if effective_representation else None
-        missing_assets = [
-            kind
-            for kind, value in (("symbol", symbol_asset), ("footprint", footprint_asset))
-            if not value
-        ]
-        availability_state = (
-            STATE_PLACE_READY if not missing_assets else STATE_FILES_PARTIAL if len(missing_assets) == 1 else STATE_METADATA_ONLY
-        )
-        place_enabled = (
-            bool(component_row["is_active"])
-            and str(component_row.get("identity_kind") or IDENTITY_KIND_MPN) == IDENTITY_KIND_MPN
-            and not missing_assets
-            and _release_allows_remote(str(revision_row["release_status"]))
-        )
-        local_inventory = self._local_inventory(conn, str(component_row["id"]))
-        supply_sources = self._supply_sources(conn, str(component_row["id"]))
-        validation_summary = self._component_validation_summary(
+        return self._component_read_models.component_payload(
             conn,
-            str(revision_row["id"]),
-            assets,
-            preloaded_runs=preloaded_validation_runs,
+            component_row,
+            revision_row,
+            released_view=released_view,
+            preloaded_assets=preloaded_assets,
+            preloaded_previews=preloaded_previews,
+            preloaded_validation_runs=preloaded_validation_runs,
+            representation_id=representation_id,
         )
-        preview_payloads = [
-            {
-                "id": str(preview["id"]),
-                "asset_id": str(preview["asset_id"]),
-                "kind": _preview_base_kind(str(preview["kind"])),
-                "preview_key": str(preview["kind"]),
-                "unit": _preview_unit(str(preview["kind"])),
-                "unit_label": _preview_unit_label(str(preview["kind"])),
-                "status": str(preview["status"]),
-                "content_type": str(preview["content_type"]),
-                "file_path": str(preview["file_path"]),
-                "generation_error": str(preview["generation_error"]),
-                "sha256": str(preview.get("sha256") or ""),
-                "generator_fingerprint": str(preview.get("generator_fingerprint") or ""),
-                "generator_version": str(preview.get("generator_version") or ""),
-                "updated_at": str(preview.get("updated_at") or preview.get("created_at") or ""),
-            }
-            for preview in previews
-        ]
-        keywords = _json_loads(revision_row.get("keywords"), [])
-        return {
-            "id": str(component_row["id"]),
-            "slug": str(component_row["slug"]),
-            "external_source": str(component_row["external_source"]),
-            "external_id": str(component_row["external_id"]),
-            "external_workflow_source": str(component_row.get("external_workflow_source", "")),
-            "external_workflow_id": str(component_row.get("external_workflow_id", "")),
-            "external_workflow_url": str(component_row.get("external_workflow_url", "")),
-            "external_url": str(component_row.get("external_url", "")),
-            "external_payload": _json_loads(component_row.get("external_payload_json"), {}),
-            "external_updated_at": str(component_row.get("external_updated_at") or ""),
-            "sync_status": str(component_row.get("sync_status", "")),
-            "sync_error": str(component_row.get("sync_error", "")),
-            "source": str(component_row["source"]),
-            "identity_kind": str(component_row.get("identity_kind") or IDENTITY_KIND_MPN),
-            "name": str(revision_row["name"]),
-            "value": str(revision_row["value"]),
-            "manufacturer": str(revision_row["manufacturer"]),
-            "mpn": str(revision_row["mpn"]),
-            "description": str(revision_row["description"]),
-            "package_name": str(revision_row["package_name"]),
-            "category": str(revision_row["category"]),
-            "datasheet_url": str(revision_row["datasheet_url"]),
-            "vendor": str(revision_row["vendor"]),
-            "vendor_part_number": str(revision_row["vendor_part_number"]),
-            "mass_g": str(revision_row["mass_g"]),
-            "rqjc_c_w": str(revision_row["rqjc_c_w"]),
-            "rqjc_top_c_w": str(revision_row["rqjc_top_c_w"]),
-            "temp_max_c": str(revision_row["temp_max_c"]),
-            "temp_min_c": str(revision_row["temp_min_c"]),
-            "power_dissipation_w": str(revision_row["power_dissipation_w"]),
-            "rate": str(revision_row["rate"]),
-            "sap_code": str(revision_row["sap_code"]),
-            "keywords": list(keywords),
-            "extra_fields": _json_loads(revision_row.get("extra_fields"), {}),
-            "availability_state": availability_state,
-            "missing_assets": missing_assets,
-            "place_enabled": place_enabled,
-            "local_inventory": local_inventory,
-            "stock_known": local_inventory is not None,
-            "stock_quantity": float(local_inventory["quantity"]) if local_inventory else 0.0,
-            "stock_uom": str(local_inventory["uom"]) if local_inventory else "",
-            "inventory_status": str(local_inventory["inventory_status"]) if local_inventory else "",
-            "supply": {"sources": supply_sources},
-            "serial_number": "",
-            "lot_number": "",
-            "pedigree": "",
-            "last_synced_at": str(local_inventory["fetched_at"]) if local_inventory else "",
-            "is_active": bool(component_row["is_active"]),
-            "revision_id": str(revision_row["id"]),
-            "revision": int(revision_row["version"]),
-            "version": f"{int(revision_row['version'])}.0.0",
-            "parent_revision_id": str(revision_row.get("parent_revision_id", "")),
-            "change_kind": str(revision_row.get("change_kind", "")),
-            "change_summary": str(revision_row.get("change_summary", "")),
-            "created_by": str(revision_row.get("created_by", "")),
-            "manifest_hash": str(revision_row.get("manifest_hash", "")),
-            "component_created_at": str(component_row.get("created_at", "")),
-            "component_updated_at": str(component_row.get("updated_at", "")),
-            "revision_created_at": str(revision_row.get("created_at", "")),
-            "revision_updated_at": str(revision_row.get("updated_at", "")),
-            "current_revision_id": str(component_row.get("current_revision_id", "")),
-            "released_revision_id": str(component_row.get("released_revision_id", "")),
-            "is_historical_revision": str(revision_row["id"]) != str(component_row.get("current_revision_id", "")),
-            "summary": str(revision_row["summary"]),
-            "library_name": str(symbol_asset["target_library"]) if symbol_asset else "",
-            "symbol_name": str(symbol_asset["target_name"]) if symbol_asset else "",
-            "representations": representations,
-            "default_representation_id": str(default_representation["id"]) if default_representation else "",
-            "effective_representation_id": str(effective_representation["id"]) if effective_representation else "",
-            "release_status": _normalize_workflow_stage(str(revision_row["release_status"])),
-            "workflow_stage": _normalize_workflow_stage(str(revision_row["release_status"])),
-            "released_view": released_view,
-            "assets": [
-                {
-                    "id": str(asset["id"]),
-                    "asset_type": str(asset["asset_type"]),
-                    "name": str(asset["name"]),
-                    "target_library": str(asset["target_library"]),
-                    "target_name": str(asset["target_name"]),
-                    "source_group": str(asset["source_group"]),
-                    "sha256": str(asset["sha256"]),
-                    "size_bytes": int(asset["size_bytes"]),
-                    "content_type": str(asset["content_type"]),
-                    "required": bool(asset["required"]),
-                }
-                for asset in assets
-            ],
-            "previews": preview_payloads,
-            "validation": validation_summary,
-        }
 
     def list_component_revisions(self, component_id: str) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if not self._component_row(conn, component_id):
-                raise ValueError("Component not found")
-            rows = conn.execute(
-                """
-                SELECT id, component_id, version, parent_revision_id, change_kind, change_summary,
-                       created_by, manifest_hash, release_status, created_at, updated_at
-                FROM component_revisions
-                WHERE component_id = %s
-                ORDER BY version DESC
-                """,
-                (component_id,),
-            ).fetchall()
-            return [
-                {
-                    **dict(row),
-                    "release_status": _normalize_workflow_stage(str(row["release_status"])),
-                    "workflow_stage": _normalize_workflow_stage(str(row["release_status"])),
-                }
-                for row in rows
-            ]
+            return self._component_history_reads.list_component_revisions(conn, component_id)
 
     def list_component_audit_events(self, component_id: str) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if not self._component_row(conn, component_id):
-                raise ValueError("Component not found")
-            rows = conn.execute(
-                """
-                SELECT id, component_id, sequence, revision_id, event_type, actor, details_json,
-                       previous_hash, event_hash, created_at
-                FROM catalog_audit_events
-                WHERE component_id = %s
-                ORDER BY sequence DESC
-                """,
-                (component_id,),
-            ).fetchall()
-            return [
-                {**dict(row), "details": _json_loads(row["details_json"], {})}
-                for row in rows
-            ]
+            return self._component_history_reads.list_component_audit_events(conn, component_id)
 
     def verify_component_audit_chain(self, component_id: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            if not self._component_row(conn, component_id):
-                raise ValueError("Component not found")
-            rows = conn.execute(
-                """
-                SELECT id, component_id, sequence, revision_id, event_type, actor, details_json,
-                       previous_hash, event_hash, created_at
-                FROM catalog_audit_events
-                WHERE component_id = %s
-                ORDER BY sequence
-                """,
-                (component_id,),
-            ).fetchall()
-            if not rows:
-                return {
-                    "valid": False,
-                    "coverage": "missing",
-                    "reason": "missing_audit_events",
-                    "event_count": 0,
-                    "verified_count": 0,
-                    "first_invalid_event_id": "",
-                    "head_hash": "",
-                }
-            coverage = (
-                "legacy_snapshot"
-                if any(str(row["event_type"]) == "audit.migrated" for row in rows)
-                else "complete"
-            )
-            previous_hash = ""
-            for index, row in enumerate(rows):
-                expected_sequence = index + 1
-                if int(row["sequence"] or 0) != expected_sequence:
-                    return {
-                        "valid": False,
-                        "coverage": coverage,
-                        "reason": "audit_sequence_gap",
-                        "event_count": len(rows),
-                        "verified_count": index,
-                        "first_invalid_event_id": str(row["id"]),
-                        "head_hash": previous_hash,
-                    }
-                details = _json_loads(row["details_json"], {})
-                canonical = json.dumps(
-                    {
-                        "id": str(row["id"]),
-                        "component_id": str(row["component_id"]),
-                        "revision_id": str(row["revision_id"]),
-                        "event_type": str(row["event_type"]),
-                        "actor": str(row["actor"]),
-                        "details": details,
-                        "previous_hash": str(row["previous_hash"]),
-                        "created_at": str(row["created_at"]),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                expected_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-                if str(row["previous_hash"]) != previous_hash or str(row["event_hash"]) != expected_hash:
-                    return {
-                        "valid": False,
-                        "coverage": coverage,
-                        "reason": "audit_hash_mismatch",
-                        "event_count": len(rows),
-                        "verified_count": index,
-                        "first_invalid_event_id": str(row["id"]),
-                        "head_hash": previous_hash,
-                    }
-                previous_hash = expected_hash
-
-            anchor = conn.execute(
-                "SELECT value FROM catalog_meta WHERE key = %s",
-                (f"audit_head:{component_id}",),
-            ).fetchone()
-            anchored_head = str(anchor["value"]) if anchor else ""
-            if anchored_head != previous_hash:
-                return {
-                    "valid": False,
-                    "coverage": coverage,
-                    "reason": "audit_head_mismatch",
-                    "event_count": len(rows),
-                    "verified_count": len(rows),
-                    "first_invalid_event_id": "",
-                    "head_hash": previous_hash,
-                    "anchored_head_hash": anchored_head,
-                }
-
-            revisions = conn.execute(
-                "SELECT id, manifest_hash FROM component_revisions WHERE component_id = %s ORDER BY version",
-                (component_id,),
-            ).fetchall()
-            for revision in revisions:
-                revision_id = str(revision["id"])
-                expected_manifest = self._revision_manifest_hash(conn, revision_id)
-                if str(revision["manifest_hash"]) != expected_manifest:
-                    return {
-                        "valid": False,
-                        "coverage": coverage,
-                        "reason": "revision_manifest_mismatch",
-                        "event_count": len(rows),
-                        "verified_count": len(rows),
-                        "first_invalid_event_id": "",
-                        "first_invalid_revision_id": revision_id,
-                        "head_hash": previous_hash,
-                    }
-
-            assets = conn.execute(
-                """
-                SELECT DISTINCT asset.id, asset.canonical_path, asset.sha256
-                FROM revision_assets link
-                JOIN component_revisions revision ON revision.id = link.revision_id
-                JOIN assets asset ON asset.id = link.asset_id
-                WHERE revision.component_id = %s
-                """,
-                (component_id,),
-            ).fetchall()
-            for asset in assets:
-                path = Path(str(asset["canonical_path"]))
-                if not path.is_file() or _sha256_file(path) != str(asset["sha256"]):
-                    return {
-                        "valid": False,
-                        "coverage": coverage,
-                        "reason": "asset_content_mismatch",
-                        "event_count": len(rows),
-                        "verified_count": len(rows),
-                        "first_invalid_event_id": "",
-                        "first_invalid_asset_id": str(asset["id"]),
-                        "head_hash": previous_hash,
-                    }
-
-            return {
-                "valid": True,
-                "coverage": coverage,
-                "reason": "",
-                "event_count": len(rows),
-                "verified_count": len(rows),
-                "revision_count": len(revisions),
-                "asset_count": len(assets),
-                "first_invalid_event_id": "",
-                "head_hash": previous_hash,
-                "anchored_head_hash": anchored_head,
-            }
+            return self._component_history_reads.verify_component_audit_chain(conn, component_id)
 
     def get_component_revision(self, component_id: str, revision_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            component = self._component_row(conn, component_id)
-            revision = self._revision_row(conn, revision_id)
-            if not component or not revision or str(revision["component_id"]) != component_id:
-                return None
-            return self._component_payload(conn, component, revision)
+            return self._component_read_models.get_component_revision(
+                conn, component_id, revision_id
+            )
 
     def compare_component_revisions(self, component_id: str, before_revision_id: str, after_revision_id: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            component = self._component_row(conn, component_id)
-            before = self._revision_row(conn, before_revision_id)
-            after = self._revision_row(conn, after_revision_id)
-            if not component or not before or not after:
-                raise ValueError("Component revision not found")
-            if str(before["component_id"]) != component_id or str(after["component_id"]) != component_id:
-                raise ValueError("Component revision does not belong to this component")
-            fixed_fields = (
-                "name", "value", "description", "datasheet_url", "manufacturer", "mpn", "category",
-                "package_name", "vendor", "vendor_part_number", "mass_g", "rqjc_c_w", "rqjc_top_c_w",
-                "temp_max_c", "temp_min_c", "power_dissipation_w", "rate", "sap_code",
+            return self._revision_comparison.compare_component_revisions(
+                conn,
+                component_id,
+                before_revision_id,
+                after_revision_id,
             )
-            before_metadata = {field: str(before.get(field) or "") for field in fixed_fields}
-            after_metadata = {field: str(after.get(field) or "") for field in fixed_fields}
-            before_extra = _json_loads(before.get("extra_fields"), {})
-            after_extra = _json_loads(after.get("extra_fields"), {})
-            for field in sorted(set(before_extra) | set(after_extra)):
-                before_metadata[f"field:{field}"] = str(before_extra.get(field) or "")
-                after_metadata[f"field:{field}"] = str(after_extra.get(field) or "")
-            metadata_changes = []
-            for field in sorted(set(before_metadata) | set(after_metadata)):
-                old_value = before_metadata.get(field, "")
-                new_value = after_metadata.get(field, "")
-                status = "unchanged" if old_value == new_value else "added" if not old_value else "removed" if not new_value else "modified"
-                metadata_changes.append({"field": field, "before": old_value, "after": new_value, "status": status})
-
-            def asset_map(revision_id: str) -> dict[str, dict[str, Any]]:
-                # 3D and SPICE files remain immutable, hashed revision assets, but
-                # comparison intentionally focuses on the authoring surfaces where a
-                # reviewer can make a meaningful visual/semantic decision today.
-                assets = [
-                    asset
-                    for asset in self._load_assets_for_revision(conn, revision_id)
-                    if str(asset["asset_type"]) in {"symbol", "footprint"}
-                ]
-                previews = self._load_previews_for_revision(conn, revision_id)
-                previews_by_asset: dict[str, list[dict[str, Any]]] = {}
-                for preview in previews:
-                    previews_by_asset.setdefault(str(preview["asset_id"]), []).append(preview)
-                result: dict[str, dict[str, Any]] = {}
-                for asset in assets:
-                    key = f"{asset['asset_type']}:{asset['target_library']}:{asset['target_name']}"
-                    asset_previews = sorted(
-                        previews_by_asset.get(str(asset["id"]), []),
-                        key=lambda item: (_preview_unit(str(item["kind"])), str(item["id"])),
-                    )
-                    preview = asset_previews[0] if asset_previews else None
-                    preview_payloads = [
-                        {
-                            "previewId": str(item["id"]),
-                            "previewStatus": str(item["status"]),
-                            "previewSha256": str(item["sha256"]),
-                            "previewGeneratorFingerprint": str(item["generator_fingerprint"]),
-                            "unit": _preview_unit(str(item["kind"])),
-                            "unitLabel": _preview_unit_label(str(item["kind"])),
-                        }
-                        for item in asset_previews
-                    ]
-                    result[key] = {
-                        "assetId": str(asset["id"]),
-                        "assetType": str(asset["asset_type"]),
-                        "targetLibrary": str(asset["target_library"]),
-                        "targetName": str(asset["target_name"]),
-                        "sha256": str(asset["sha256"]),
-                        "sizeBytes": int(asset["size_bytes"]),
-                        "previewId": str(preview["id"]) if preview else "",
-                        "previewStatus": str(preview["status"]) if preview else "",
-                        "previewSha256": str(preview["sha256"]) if preview else "",
-                        "previewGeneratorFingerprint": str(preview["generator_fingerprint"]) if preview else "",
-                        "previews": preview_payloads,
-                    }
-                return result
-
-            before_assets = asset_map(before_revision_id)
-            after_assets = asset_map(after_revision_id)
-            asset_changes = []
-            for key in sorted(set(before_assets) | set(after_assets)):
-                old_asset = before_assets.get(key)
-                new_asset = after_assets.get(key)
-                status = (
-                    "added"
-                    if old_asset is None
-                    else "removed"
-                    if new_asset is None
-                    else "unchanged"
-                    # Preview bytes are derived and may be regenerated with
-                    # nondeterministic SVG metadata. The immutable CAD asset hash
-                    # is the authoring identity; preview churn is never a design
-                    # modification on its own.
-                    if old_asset["sha256"] == new_asset["sha256"]
-                    else "modified"
-                )
-                asset_changes.append({"key": key, "before": old_asset, "after": new_asset, "status": status})
-            changed_metadata = sum(change["status"] != "unchanged" for change in metadata_changes)
-            changed_assets = sum(change["status"] != "unchanged" for change in asset_changes)
-            def representation_map(revision_id: str) -> dict[str, dict[str, Any]]:
-                rows = conn.execute(
-                    "SELECT * FROM revision_representations WHERE revision_id = %s ORDER BY display_order, id",
-                    (revision_id,),
-                ).fetchall()
-                return {
-                    f"{row['symbol_asset_id'] or ''}:{row['footprint_asset_id'] or ''}": {
-                        "label": str(row["label"]),
-                        "symbolAssetId": str(row["symbol_asset_id"] or ""),
-                        "footprintAssetId": str(row["footprint_asset_id"] or ""),
-                        "isDefault": bool(row["is_default"]),
-                        "displayOrder": int(row["display_order"]),
-                        "sourceInternalPartNumber": str(row["source_internal_part_number"] or ""),
-                        "provenance": _json_loads(row.get("provenance_json"), {}),
-                    }
-                    for row in rows
-                }
-
-            before_representations = representation_map(before_revision_id)
-            after_representations = representation_map(after_revision_id)
-            representation_changes = []
-            for key in sorted(set(before_representations) | set(after_representations)):
-                old_representation = before_representations.get(key)
-                new_representation = after_representations.get(key)
-                status = (
-                    "added" if old_representation is None else
-                    "removed" if new_representation is None else
-                    "unchanged" if old_representation == new_representation else
-                    "modified"
-                )
-                representation_changes.append(
-                    {"key": key, "before": old_representation, "after": new_representation, "status": status}
-                )
-            changed_representations = sum(
-                change["status"] != "unchanged" for change in representation_changes
-            )
-            return {
-                "componentId": component_id,
-                "before": {"revisionId": before_revision_id, "version": int(before["version"]), "manifestHash": str(before["manifest_hash"])},
-                "after": {"revisionId": after_revision_id, "version": int(after["version"]), "manifestHash": str(after["manifest_hash"])},
-                "summary": {"metadataChanges": changed_metadata, "assetChanges": changed_assets, "representationChanges": changed_representations},
-                "metadataChanges": metadata_changes,
-                "assetChanges": asset_changes,
-                "representationChanges": representation_changes,
-            }
 
     def list_component_usage(self, component_id: str, *, include_history: bool = False) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if not self._component_row(conn, component_id):
-                raise ValueError("Component not found")
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM component_usage
-                WHERE component_id = %s AND (%s = 1 OR is_current = 1)
-                ORDER BY last_seen_at DESC, project_id, source_revision
-                """,
-                (component_id, 1 if include_history else 0),
-            ).fetchall()
-            return [
-                {
-                    **dict(row),
-                    "references": _json_loads(row["references_json"], []),
-                    "details": _json_loads(row["details_json"], []),
-                    "is_current": bool(row["is_current"]),
-                }
-                for row in rows
-            ]
+            return self._component_history_reads.list_component_usage(
+                conn, component_id, include_history=include_history
+            )
 
     def list_component_review_decisions(self, component_id: str) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if not self._component_row(conn, component_id):
-                raise ValueError("Component not found")
-            rows = conn.execute(
-                "SELECT * FROM component_review_decisions WHERE component_id = %s ORDER BY created_at DESC, id DESC",
-                (component_id,),
-            ).fetchall()
-            return [
-                {
-                    **dict(row),
-                    "validation": _json_loads(row["validation_json"], {}),
-                    "policy": _json_loads(row["policy_json"], {}),
-                }
-                for row in rows
-            ]
+            return self._component_history_reads.list_component_review_decisions(conn, component_id)
 
     def list_component_release_records(self, component_id: str) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if not self._component_row(conn, component_id):
-                raise ValueError("Component not found")
-            rows = conn.execute(
-                "SELECT * FROM component_release_records WHERE component_id = %s ORDER BY created_at DESC, id DESC",
-                (component_id,),
-            ).fetchall()
-            return [
-                {
-                    **dict(row),
-                    "validation": _json_loads(row["validation_json"], {}),
-                    "policy": _json_loads(row["policy_json"], {}),
-                }
-                for row in rows
-            ]
+            return self._component_history_reads.list_component_release_records(conn, component_id)
 
     def catalog_preview_path(self, preview_id: str) -> tuple[Path, str] | None:
         self.initialize()
@@ -3173,85 +2079,6 @@ class ComponentCatalogDomainService:
                 removed.append(session_id)
         return {"removed": len(removed), "session_ids": removed}
 
-    def _component_summary_payload(
-        self,
-        component_row: dict[str, Any],
-        revision_row: dict[str, Any],
-        assets: list[dict[str, Any]],
-        *,
-        released_view: bool = False,
-        validation_summary: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        availability_state, missing_assets, place_enabled = self._availability(
-            assets,
-            str(revision_row["release_status"]),
-            bool(component_row["is_active"]),
-        )
-        if str(component_row.get("identity_kind") or IDENTITY_KIND_MPN) != IDENTITY_KIND_MPN:
-            place_enabled = False
-        symbol_asset = next((asset for asset in assets if asset["asset_type"] == "symbol"), None)
-        # Lightweight payloads are used by the KiCad remote panel; avoid validation lookups on search paths.
-        validation_summary = validation_summary or {
-            "status": VALIDATION_STATUS_NOT_RUN,
-            "enabled": bool(settings.CATALOG_KLC_ENABLED),
-            "release_gate": self._klc_release_gate(),
-            "revision_id": str(revision_row["id"]),
-            "error_count": 0,
-            "warning_count": 0,
-            "missing_required_assets": [],
-            "assets": [],
-        }
-        return {
-            "id": str(component_row["id"]),
-            "slug": str(component_row["slug"]),
-            "source": str(component_row["source"]),
-            "identity_kind": str(component_row.get("identity_kind") or IDENTITY_KIND_MPN),
-            "name": str(revision_row["name"]),
-            "value": str(revision_row["value"]),
-            "manufacturer": str(revision_row["manufacturer"]),
-            "mpn": str(revision_row["mpn"]),
-            "description": str(revision_row["description"]),
-            "package_name": str(revision_row["package_name"]),
-            "category": str(revision_row["category"]),
-            "datasheet_url": str(revision_row["datasheet_url"]),
-            "vendor": str(revision_row["vendor"]),
-            "vendor_part_number": str(revision_row["vendor_part_number"]),
-            "mass_g": str(revision_row["mass_g"]),
-            "rqjc_c_w": str(revision_row["rqjc_c_w"]),
-            "rqjc_top_c_w": str(revision_row["rqjc_top_c_w"]),
-            "temp_max_c": str(revision_row["temp_max_c"]),
-            "temp_min_c": str(revision_row["temp_min_c"]),
-            "power_dissipation_w": str(revision_row["power_dissipation_w"]),
-            "rate": str(revision_row["rate"]),
-            "sap_code": str(revision_row["sap_code"]),
-            "extra_fields": _json_loads(revision_row.get("extra_fields"), {}),
-            "summary": str(revision_row["summary"]),
-            "revision": int(revision_row["version"]),
-            "version": f"{int(revision_row['version'])}.0.0",
-            "library_name": str(symbol_asset["target_library"]) if symbol_asset else "",
-            "symbol_name": str(symbol_asset["target_name"]) if symbol_asset else "",
-            "availability_state": availability_state,
-            "missing_assets": missing_assets,
-            "place_enabled": place_enabled,
-            "local_inventory": None,
-            "stock_known": False,
-            "stock_quantity": 0.0,
-            "stock_uom": "",
-            "inventory_status": "",
-            "release_status": _normalize_workflow_stage(str(revision_row["release_status"])),
-            "workflow_stage": _normalize_workflow_stage(str(revision_row["release_status"])),
-            "released_view": released_view,
-            "revision_id": str(revision_row["id"]),
-            "revision_updated_at": str(revision_row["updated_at"]),
-            # Who authored the current revision. Stored all along, but omitted here,
-            # so every catalog row rendered as "Unknown author".
-            "created_by": str(revision_row.get("created_by") or ""),
-            "component_updated_at": str(component_row["updated_at"]),
-            "assets": [],
-            "previews": [],
-            "validation": validation_summary,
-        }
-
     def list_components(
         self,
         *,
@@ -3270,315 +2097,23 @@ class ComponentCatalogDomainService:
         sort_dir: str = "asc",
     ) -> dict[str, Any]:
         self.initialize()
-        offset = (page - 1) * page_size
-        revision_ref = "rr" if released_only else "cr"
-        revision_join_column = "released_revision_id" if released_only else "current_revision_id"
-        filters: list[str] = []
-        params: list[Any] = []
-
-        if not include_inactive:
-            filters.append("c.is_active = 1")
-        if source:
-            filters.append("c.source = %s")
-            params.append(source)
-        if category is not None:
-            filters.append(f"{revision_ref}.category = %s")
-            params.append(category)
-        requested_workflow_stages = _dedupe(
-            [
-                normalized
-                for raw_stage in str(workflow_stage or "").split(",")
-                if (normalized := _normalize_workflow_stage(raw_stage.strip()))
-            ]
+        plan = self._component_queries.prepare_list_components(
+            query=query,
+            source=source,
+            availability_state=availability_state,
+            workflow_stage=workflow_stage,
+            validation_status=validation_status,
+            category=category,
+            include_inactive=include_inactive,
+            page=page,
+            page_size=page_size,
+            released_only=released_only,
+            lightweight=lightweight,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
-        if requested_workflow_stages:
-            unsupported_stages = [
-                stage for stage in requested_workflow_stages if stage not in WORKFLOW_STAGES
-            ]
-            if unsupported_stages:
-                raise ValueError("Unsupported workflow stage")
-            placeholders = ",".join("%s" for _ in requested_workflow_stages)
-            filters.append(f"{revision_ref}.release_status IN ({placeholders})")
-            params.extend(requested_workflow_stages)
-        if availability_state:
-            symbol_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_symbol "
-                f"WHERE ra_symbol.revision_id = {revision_ref}.id AND ra_symbol.asset_type = 'symbol')"
-            )
-            footprint_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_footprint "
-                f"WHERE ra_footprint.revision_id = {revision_ref}.id AND ra_footprint.asset_type = 'footprint')"
-            )
-            if availability_state == STATE_PLACE_READY:
-                filters.append(f"{symbol_exists} AND {footprint_exists}")
-            elif availability_state == STATE_METADATA_ONLY:
-                filters.append(f"NOT {symbol_exists} AND NOT {footprint_exists}")
-            elif availability_state == STATE_FILES_PARTIAL:
-                filters.append(f"(({symbol_exists}) <> ({footprint_exists}))")
-            else:
-                raise ValueError("Unsupported availability state")
-        if validation_status:
-            supported_validation_statuses = {
-                VALIDATION_STATUS_PASSED,
-                VALIDATION_STATUS_WARNING,
-                VALIDATION_STATUS_FAILED,
-                VALIDATION_STATUS_SKIPPED,
-                VALIDATION_STATUS_NOT_RUN,
-            }
-            if validation_status not in supported_validation_statuses:
-                raise ValueError("Unsupported validation status")
-
-            relevant_assets_exist = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_validation_any "
-                f"JOIN assets asset_validation_any ON asset_validation_any.id = ra_validation_any.asset_id "
-                f"WHERE ra_validation_any.revision_id = {revision_ref}.id "
-                f"AND asset_validation_any.asset_type IN ('symbol', 'footprint'))"
-            )
-
-            def latest_status_exists(status: str, suffix: str) -> str:
-                # Scope runs to the revision (direct or inherited evidence). Matching
-                # by asset_id alone incorrectly picks status from unrelated revisions.
-                return (
-                    f"EXISTS (SELECT 1 FROM revision_assets ra_validation_{suffix} "
-                    f"JOIN assets asset_validation_{suffix} ON asset_validation_{suffix}.id = ra_validation_{suffix}.asset_id "
-                    f"WHERE ra_validation_{suffix}.revision_id = {revision_ref}.id "
-                    f"AND asset_validation_{suffix}.asset_type IN ('symbol', 'footprint') "
-                    f"AND COALESCE(("
-                    f"SELECT avr_validation_{suffix}.status "
-                    f"FROM asset_validation_runs avr_validation_{suffix} "
-                    f"WHERE avr_validation_{suffix}.revision_id = {revision_ref}.id "
-                    f"AND avr_validation_{suffix}.asset_id = asset_validation_{suffix}.id "
-                    f"ORDER BY avr_validation_{suffix}.finished_at DESC, avr_validation_{suffix}.created_at DESC "
-                    f"LIMIT 1"
-                    f"), COALESCE(("
-                    f"SELECT inherited_run_{suffix}.status "
-                    f"FROM revision_validation_evidence_links inherited_link_{suffix} "
-                    f"JOIN asset_validation_runs inherited_run_{suffix} "
-                    f"  ON inherited_run_{suffix}.id = inherited_link_{suffix}.source_run_id "
-                    f"WHERE inherited_link_{suffix}.revision_id = {revision_ref}.id "
-                    f"AND inherited_link_{suffix}.asset_id = asset_validation_{suffix}.id "
-                    f"LIMIT 1"
-                    f"), '{VALIDATION_STATUS_NOT_RUN}')) = '{status}')"
-                )
-
-            failed_exists = latest_status_exists(VALIDATION_STATUS_FAILED, "failed")
-            warning_exists = latest_status_exists(VALIDATION_STATUS_WARNING, "warning")
-            skipped_exists = latest_status_exists(VALIDATION_STATUS_SKIPPED, "skipped")
-            not_run_exists = latest_status_exists(VALIDATION_STATUS_NOT_RUN, "not_run")
-
-            if validation_status == VALIDATION_STATUS_FAILED:
-                filters.append(failed_exists)
-            elif validation_status == VALIDATION_STATUS_WARNING:
-                filters.append(f"NOT {failed_exists} AND {warning_exists}")
-            elif validation_status == VALIDATION_STATUS_SKIPPED:
-                filters.append(f"NOT {failed_exists} AND NOT {warning_exists} AND {skipped_exists}")
-            elif validation_status == VALIDATION_STATUS_NOT_RUN:
-                filters.append(
-                    f"(NOT {relevant_assets_exist} OR "
-                    f"(NOT {failed_exists} AND NOT {warning_exists} AND NOT {skipped_exists} AND {not_run_exists}))"
-                )
-            elif validation_status == VALIDATION_STATUS_PASSED:
-                filters.append(
-                    f"{relevant_assets_exist} AND NOT {failed_exists} AND NOT {warning_exists} "
-                    f"AND NOT {skipped_exists} AND NOT {not_run_exists}"
-                )
-        if released_only:
-            filters.append("c.released_revision_id <> ''")
-            filters.append("rr.release_status = 'released'")
-        query_text = query.strip()
-        # Postgres catalog search uses search_document (+ optional pg_trgm). The
-        # legacy SQLite FTS branch is intentionally disabled to avoid rowid MATCH.
-        if query_text:
-            filters.append(
-                f"(LOWER({revision_ref}.search_document) LIKE LOWER(%s) "
-                f"OR LOWER({revision_ref}.created_by) LIKE LOWER(%s))"
-            )
-            params.extend([f"%{query_text}%", f"%{query_text}%"])
-        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
-        sort_columns = {
-            "name": f"{revision_ref}.name",
-            "mpn": f"{revision_ref}.mpn",
-            "manufacturer": f"{revision_ref}.manufacturer",
-            "category": f"{revision_ref}.category",
-            "package_name": f"{revision_ref}.package_name",
-            "workflow_stage": f"{revision_ref}.release_status",
-            "release_status": f"{revision_ref}.release_status",
-            "updated_at": f"{revision_ref}.updated_at",
-        }
-        sort_direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
-        sort_column = sort_columns.get(sort_by)
-        if sort_by == "availability_state":
-            symbol_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_symbol_sort "
-                f"WHERE ra_symbol_sort.revision_id = {revision_ref}.id AND ra_symbol_sort.asset_type = 'symbol')"
-            )
-            footprint_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_footprint_sort "
-                f"WHERE ra_footprint_sort.revision_id = {revision_ref}.id AND ra_footprint_sort.asset_type = 'footprint')"
-            )
-            sort_column = f"CASE WHEN {symbol_exists} AND {footprint_exists} THEN 0 WHEN ({symbol_exists}) <> ({footprint_exists}) THEN 1 ELSE 2 END"
-
-        if sort_column:
-            order_sql = f"ORDER BY {sort_column} {sort_direction}, {revision_ref}.updated_at DESC"
-            order_params = []
-        elif query_text:
-            order_sql = (
-                f"ORDER BY CASE "
-                f"WHEN LOWER({revision_ref}.mpn) = LOWER(%s) THEN 0 "
-                f"WHEN LOWER({revision_ref}.mpn) LIKE LOWER(%s) THEN 1 "
-                f"WHEN LOWER({revision_ref}.name) LIKE LOWER(%s) THEN 2 "
-                f"ELSE 3 END, {revision_ref}.updated_at DESC"
-            )
-            order_params: list[Any] = [query_text, f"{query_text}%", f"{query_text}%"]
-        else:
-            order_sql = f"ORDER BY {revision_ref}.updated_at DESC"
-            order_params = []
-
         with self._connect() as conn:
-            total = int(
-                conn.execute(
-                    f"""
-                    SELECT COUNT(1) AS total
-                    FROM components c
-                    JOIN component_revisions {revision_ref} ON {revision_ref}.id = c.{revision_join_column}
-                    {where_sql}
-                    """,
-                    tuple(params),
-                ).fetchone()["total"]
-            )
-            rows = conn.execute(
-                f"""
-                SELECT c.*, {revision_ref}.id AS revision_id
-                FROM components c
-                JOIN component_revisions {revision_ref} ON {revision_ref}.id = c.{revision_join_column}
-                {where_sql}
-                {order_sql}
-                LIMIT %s OFFSET %s
-                """,
-                tuple(params + order_params + [page_size, offset]),
-            ).fetchall()
-            row_pairs: list[tuple[dict[str, Any], str]] = []
-            for row in rows:
-                component_row = dict(row)
-                revision_id = str(component_row.pop("revision_id"))
-                row_pairs.append((component_row, revision_id))
-
-            revision_ids = [revision_id for _, revision_id in row_pairs]
-            revisions_by_id: dict[str, dict[str, Any]] = {}
-            if revision_ids:
-                placeholders = ",".join("%s" for _ in revision_ids)
-                revision_rows = conn.execute(
-                    f"SELECT * FROM component_revisions WHERE id IN ({placeholders})",
-                    tuple(revision_ids),
-                ).fetchall()
-                revisions_by_id = {str(revision["id"]): dict(revision) for revision in revision_rows}
-
-            parsed_rows = []
-            for component_row, revision_id in row_pairs:
-                revision = revisions_by_id.get(revision_id)
-                if revision:
-                    parsed_rows.append((component_row, revision))
-
-            revision_ids = [str(rev["id"]) for _, rev in parsed_rows]
-            assets_by_revision: dict[str, list[dict[str, Any]]] = {}
-            all_asset_ids: list[str] = []
-            if revision_ids:
-                placeholders = ",".join("%s" for _ in revision_ids)
-                all_assets_rows = [
-                    dict(r) for r in conn.execute(
-                        f"""
-                        SELECT a.*, ra.required, ra.revision_id
-                        FROM revision_assets ra
-                        JOIN assets a ON a.id = ra.asset_id
-                        WHERE ra.revision_id IN ({placeholders})
-                        ORDER BY CASE a.asset_type
-                            WHEN 'symbol' THEN 1 WHEN 'footprint' THEN 2
-                            WHEN '3dmodel' THEN 3 WHEN 'spice' THEN 4 ELSE 99
-                        END, a.target_library, a.target_name
-                        """,
-                        tuple(revision_ids),
-                    ).fetchall()
-                ]
-                for asset_row in all_assets_rows:
-                    rev_id = str(asset_row.pop("revision_id"))
-                    assets_by_revision.setdefault(rev_id, []).append(asset_row)
-                    all_asset_ids.append(str(asset_row["id"]))
-
-            previews_by_revision: dict[str, list[dict[str, Any]]] = {}
-            validation_by_revision: dict[str, dict[str, dict[str, Any]]] = {}
-            if not lightweight:
-                for preview_row in self._load_previews_for_revisions(conn, revision_ids):
-                    preview_revision_id = str(preview_row.pop("revision_id"))
-                    previews_by_revision.setdefault(preview_revision_id, []).append(preview_row)
-            if revision_ids:
-                placeholders = ",".join("%s" for _ in revision_ids)
-                validation_rows = conn.execute(
-                    f"""
-                    SELECT *
-                    FROM asset_validation_runs
-                    WHERE revision_id IN ({placeholders})
-                    ORDER BY revision_id, asset_id, finished_at DESC, created_at DESC
-                    """,
-                    tuple(revision_ids),
-                ).fetchall()
-                for validation_row in validation_rows:
-                    revision_id = str(validation_row["revision_id"])
-                    asset_id = str(validation_row["asset_id"])
-                    revision_runs = validation_by_revision.setdefault(revision_id, {})
-                    if asset_id not in revision_runs:
-                        revision_runs[asset_id] = dict(validation_row)
-                inherited_rows = conn.execute(
-                    f"""
-                    SELECT run.*, run.revision_id AS inherited_from_revision_id,
-                           link.revision_id AS inherited_for_revision_id, link.asset_id AS linked_asset_id
-                    FROM revision_validation_evidence_links link
-                    JOIN asset_validation_runs run ON run.id = link.source_run_id
-                    WHERE link.revision_id IN ({placeholders})
-                    """,
-                    tuple(revision_ids),
-                ).fetchall()
-                for inherited_row in inherited_rows:
-                    revision_id = str(inherited_row["inherited_for_revision_id"])
-                    asset_id = str(inherited_row["linked_asset_id"])
-                    revision_runs = validation_by_revision.setdefault(revision_id, {})
-                    if asset_id not in revision_runs:
-                        revision_runs[asset_id] = dict(inherited_row)
-
-            items = []
-            for component_row, revision_row in parsed_rows:
-                rev_assets = assets_by_revision.get(str(revision_row["id"]), [])
-                if lightweight:
-                    validation = self._component_validation_summary(
-                        conn,
-                        str(revision_row["id"]),
-                        rev_assets,
-                        preloaded_runs=validation_by_revision.get(str(revision_row["id"]), {}),
-                    )
-                    items.append(
-                        self._component_summary_payload(
-                            component_row,
-                            revision_row,
-                            rev_assets,
-                            released_view=released_only,
-                            validation_summary=validation,
-                        )
-                    )
-                    continue
-                rev_previews = previews_by_revision.get(str(revision_row["id"]), [])
-                items.append(
-                    self._component_payload(
-                        conn,
-                        component_row,
-                        revision_row,
-                        released_view=released_only,
-                        preloaded_assets=rev_assets,
-                        preloaded_previews=rev_previews,
-                        preloaded_validation_runs=validation_by_revision.get(str(revision_row["id"]), {}),
-                    )
-                )
-
-        pages = max(1, (total + page_size - 1) // page_size)
-        return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
+            return self._component_queries.execute_list_components(conn, plan)
 
     def list_components_flat(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self.list_components(page=1, page_size=10000, **kwargs)["items"]
@@ -3890,17 +2425,7 @@ class ComponentCatalogDomainService:
         if runtime.category_cache is not None and (now - runtime.category_cache_ts) < runtime.category_cache_ttl:
             return runtime.category_cache
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT rr.category AS name, COUNT(1) AS count
-                FROM components c
-                JOIN component_revisions rr ON rr.id = c.released_revision_id
-                WHERE c.is_active = 1 AND c.released_revision_id <> '' AND rr.release_status = 'released'
-                GROUP BY rr.category
-                ORDER BY rr.category
-                """
-            ).fetchall()
-        result = [{"name": str(row["name"] or ""), "count": int(row["count"])} for row in rows]
+            result = self._component_queries.list_categories(conn)
         runtime.category_cache = result
         runtime.category_cache_ts = now
         return result
@@ -3915,18 +2440,11 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            component, revision = self._active_revision_row(conn, component_id, released=released_only)
-            if not component or not revision:
-                return None
-            if not include_inactive and not component["is_active"]:
-                return None
-            if released_only and _normalize_workflow_stage(str(revision["release_status"])) != "released":
-                return None
-            return self._component_payload(
+            return self._component_read_models.get_component(
                 conn,
-                component,
-                revision,
-                released_view=released_only,
+                component_id,
+                include_inactive=include_inactive,
+                released_only=released_only,
                 representation_id=representation_id,
             )
 
@@ -4909,32 +3427,11 @@ class ComponentCatalogDomainService:
             return self._metadata_batch_payload(conn, batch_id) or {}
 
     def _inherit_validation_evidence(self, conn: Any, parent_revision_id: str, revision_id: str) -> None:
-        # Inherit only for assets still attached to the child revision so replaced
-        # or detached CAD does not keep stale validation evidence links.
-        assets = conn.execute(
-            "SELECT asset_id FROM revision_assets WHERE revision_id = %s AND asset_type IN ('symbol', 'footprint')",
-            (revision_id,),
-        ).fetchall()
-        for asset in assets:
-            run = conn.execute(
-                "SELECT id FROM asset_validation_runs WHERE revision_id = %s AND asset_id = %s ORDER BY finished_at DESC, created_at DESC LIMIT 1",
-                (parent_revision_id, asset["asset_id"]),
-            ).fetchone()
-            if not run:
-                run = conn.execute(
-                    "SELECT source_run_id AS id FROM revision_validation_evidence_links WHERE revision_id = %s AND asset_id = %s",
-                    (parent_revision_id, asset["asset_id"]),
-                ).fetchone()
-            if run:
-                conn.execute(
-                    """
-                    INSERT INTO revision_validation_evidence_links (revision_id, asset_id, source_run_id, created_at)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT(revision_id, asset_id) DO UPDATE SET
-                        source_run_id = excluded.source_run_id, created_at = excluded.created_at
-                    """,
-                    (revision_id, asset["asset_id"], run["id"], _utc_now_iso()),
-                )
+        return self._revision_kernel.inherit_validation_evidence(
+            conn,
+            parent_revision_id,
+            revision_id,
+        )
 
     def apply_metadata_batch_item(self, item_id: str, *, actor: str) -> dict[str, Any]:
         self.initialize()
