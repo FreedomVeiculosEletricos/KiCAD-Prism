@@ -47,6 +47,10 @@ from app.services.catalog.normalization import (
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_file,
 )
+from app.services.catalog.project_import_sessions import CatalogProjectImportSessions
+from app.services.catalog.project_import_matching import CatalogProjectImportMatching
+from app.services.catalog.project_import_assets import CatalogProjectImportAssets
+from app.services.catalog.project_import_acceptance import CatalogProjectImportAcceptance
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
@@ -444,6 +448,10 @@ class ComponentCatalogDomainService:
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
+    _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
+    _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
+    _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
+    _project_import_acceptance: CatalogProjectImportAcceptance = CatalogProjectImportAcceptance()
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._catalog_runtime = CatalogRuntime(
@@ -456,6 +464,10 @@ class ComponentCatalogDomainService:
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
         self._component_queries = CatalogComponentQueries(self._component_read_models)
+        self._project_import_sessions = CatalogProjectImportSessions()
+        self._project_import_matching = CatalogProjectImportMatching()
+        self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
+        self._project_import_acceptance = CatalogProjectImportAcceptance()
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -1254,26 +1266,17 @@ class ComponentCatalogDomainService:
         now = _utc_now_iso()
         session_id = str(uuid.uuid4())
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO project_component_import_sessions (
-                    id, scope, project_id, project_ids_json, project_revisions_json,
-                    source_revision, selection_json, status,
-                    created_by, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s)
-                """,
-                (
-                    session_id,
-                    scope,
-                    project_id,
-                    json.dumps(sorted(set(project_ids or ([project_id] if project_id else []))), separators=(",", ":")),
-                    json.dumps(project_revisions or {}, sort_keys=True, separators=(",", ":")),
-                    source_revision,
-                    json.dumps(selection or {}, sort_keys=True, separators=(",", ":")),
-                    actor,
-                    now,
-                    now,
-                ),
+            self._project_import_sessions.create_session(
+                conn,
+                session_id=session_id,
+                scope=scope,
+                project_id=project_id,
+                project_ids=project_ids or ([project_id] if project_id else []),
+                project_revisions=project_revisions or {},
+                source_revision=source_revision,
+                selection=selection or {},
+                actor=actor,
+                now=now,
             )
             conn.commit()
         return self.get_project_import_session(session_id) or {}
@@ -1281,180 +1284,65 @@ class ComponentCatalogDomainService:
     def get_project_import_session(self, session_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM project_component_import_sessions WHERE id = %s",
-                (session_id,),
-            ).fetchone()
-            if not row:
-                return None
-            payload = dict(row)
-            payload["selection"] = _json_loads(payload.pop("selection_json"), {})
-            payload["project_ids"] = _json_loads(payload.pop("project_ids_json"), [])
-            payload["project_revisions"] = _json_loads(payload.pop("project_revisions_json"), {})
-            count = conn.execute(
-                "SELECT COUNT(1) AS count FROM project_component_import_proposals WHERE session_id = %s",
-                (session_id,),
-            ).fetchone()
-            payload["proposal_count"] = int(count["count"] if count else 0)
-            return payload
+            return self._project_import_sessions.get_session(conn, session_id)
 
     def list_project_import_sessions(self, *, created_by: str = "", include_all: bool = False) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            if include_all:
-                rows = conn.execute(
-                    "SELECT id FROM project_component_import_sessions ORDER BY created_at DESC LIMIT 100"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT id FROM project_component_import_sessions
-                    WHERE created_by = %s ORDER BY created_at DESC LIMIT 100
-                    """,
-                    (created_by,),
-                ).fetchall()
-        return [session for row in rows if (session := self.get_project_import_session(str(row["id"]))) is not None]
+            session_ids = self._project_import_sessions.list_session_ids(
+                conn,
+                created_by=created_by,
+                include_all=include_all,
+            )
+        return [session for session_id in session_ids if (session := self.get_project_import_session(session_id)) is not None]
 
     def update_project_import_session(self, session_id: str, *, status: str, error_message: str = "") -> None:
         if status not in {"queued", "uploading", "scanning", "staged", "failed"}:
             raise ValueError("Unsupported project import session status")
         self.initialize()
         with self._connect() as conn:
-            result = conn.execute(
-                "UPDATE project_component_import_sessions SET status = %s, error_message = %s, updated_at = %s WHERE id = %s",
-                (status, error_message, _utc_now_iso(), session_id),
+            self._project_import_sessions.update_session(
+                conn,
+                session_id,
+                status=status,
+                error_message=error_message,
+                now=_utc_now_iso(),
             )
-            if result.rowcount == 0:
-                raise ValueError("Project import session not found")
             conn.commit()
 
     def stage_project_import_proposals(self, session_id: str, proposals: list[dict[str, Any]]) -> None:
         self.initialize()
         now = _utc_now_iso()
         with self._connect() as conn:
-            if not conn.execute(
-                "SELECT 1 FROM project_component_import_sessions WHERE id = %s",
-                (session_id,),
-            ).fetchone():
-                raise ValueError("Project import session not found")
-            conn.execute("DELETE FROM project_component_import_proposals WHERE session_id = %s", (session_id,))
-            for proposal in proposals:
-                conn.execute(
-                    """
-                    INSERT INTO project_component_import_proposals (
-                        id, session_id, dedupe_key, component_uid, reference, metadata_json, assets_json,
-                        provenance_json, findings_json, status, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'candidate', %s, %s)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        session_id,
-                        str(proposal["dedupe_key"]),
-                        str(proposal.get("component_uid") or ""),
-                        str(proposal.get("reference") or ""),
-                        json.dumps(proposal.get("metadata") or {}, sort_keys=True, separators=(",", ":")),
-                        json.dumps(proposal.get("assets") or [], sort_keys=True, separators=(",", ":")),
-                        json.dumps(proposal.get("provenance") or [], sort_keys=True, separators=(",", ":")),
-                        json.dumps(proposal.get("findings") or [], sort_keys=True, separators=(",", ":")),
-                        now,
-                        now,
-                    ),
-                )
-            conn.execute(
-                "UPDATE project_component_import_sessions SET status = 'staged', updated_at = %s WHERE id = %s",
-                (now, session_id),
-            )
+            self._project_import_sessions.stage_proposals(conn, session_id, proposals, now=now)
             conn.commit()
 
     def list_project_import_proposals(self, session_id: str) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM project_component_import_proposals WHERE session_id = %s ORDER BY reference, id",
-                (session_id,),
-            ).fetchall()
-            proposals: list[dict[str, Any]] = []
-            for row in rows:
-                proposal = dict(row)
-                proposal["metadata"] = _json_loads(proposal.pop("metadata_json"), {})
-                proposal["assets"] = _json_loads(proposal.pop("assets_json"), [])
-                proposal["provenance"] = _json_loads(proposal.pop("provenance_json"), [])
-                proposal["findings"] = _json_loads(proposal.pop("findings_json"), [])
-                proposal["draft"] = _json_loads(proposal.pop("draft_json", "{}"), {})
-                proposals.append(proposal)
-            return proposals
+            return self._project_import_sessions.list_proposals(conn, session_id)
 
     def get_project_import_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM project_component_import_proposals WHERE id = %s",
-                (proposal_id,),
-            ).fetchone()
-            if not row:
-                return None
-            proposal = dict(row)
-            proposal["metadata"] = _json_loads(proposal.pop("metadata_json"), {})
-            proposal["assets"] = _json_loads(proposal.pop("assets_json"), [])
-            proposal["provenance"] = _json_loads(proposal.pop("provenance_json"), [])
-            proposal["findings"] = _json_loads(proposal.pop("findings_json"), [])
-            proposal["draft"] = _json_loads(proposal.pop("draft_json", "{}"), {})
-            return proposal
+            return self._project_import_sessions.get_proposal(conn, proposal_id)
 
     def save_project_import_drafts(
         self, session_id: str, drafts: dict[str, dict[str, Any]]
     ) -> int:
-        """Persist unaccepted grid edits so remediation survives a reload.
-
-        A large import is rarely resolved in one sitting. Keeping the edits on the
-        proposal, rather than in browser state, also lets a second reviewer pick up
-        where the first stopped.
-        """
         self.initialize()
         if not drafts:
             return 0
         now = _utc_now_iso()
         with self._connect() as conn:
-            updated = 0
-            for proposal_id, draft in drafts.items():
-                cursor = conn.execute(
-                    """
-                    UPDATE project_component_import_proposals
-                    SET draft_json = %s, updated_at = %s
-                    WHERE id = %s AND session_id = %s AND status = 'candidate'
-                    """,
-                    (json.dumps(draft or {}, separators=(",", ":")), now, proposal_id, session_id),
-                )
-                updated += cursor.rowcount
+            updated = self._project_import_sessions.save_drafts(
+                conn,
+                session_id,
+                drafts,
+                now=now,
+            )
             conn.commit()
         return updated
-
-    def _resolve_import_asset_links(self, asset_links: dict[str, str]) -> dict[str, dict[str, Any]]:
-        """Load existing catalog assets an import wants to reference by id."""
-        resolved: dict[str, dict[str, Any]] = {}
-        requested = {
-            str(asset_type): str(asset_id).strip()
-            for asset_type, asset_id in (asset_links or {}).items()
-            if str(asset_id or "").strip()
-        }
-        if not requested:
-            return resolved
-
-        with self._connect() as conn:
-            for asset_type, asset_id in requested.items():
-                row = conn.execute(
-                    "SELECT * FROM assets WHERE id = %s",
-                    (asset_id,),
-                ).fetchone()
-                if not row:
-                    raise ValueError(f"Linked {asset_type} asset was not found in the catalog")
-                asset = dict(row)
-                if str(asset["asset_type"]) != asset_type:
-                    raise ValueError(
-                        f"Linked asset {asset_id} is a {asset['asset_type']}, not a {asset_type}"
-                    )
-                resolved[asset_type] = asset
-        return resolved
 
     def search_assets(
         self,
@@ -1478,281 +1366,35 @@ class ComponentCatalogDomainService:
         page it returns.
         """
         self.initialize()
-        normalized_type = str(asset_type or "").strip().lower()
-        if normalized_type not in {"symbol", "footprint", "3dmodel", "spice"}:
-            raise ValueError("Unsupported asset type")
-
-        term = re.sub(r"\s+", " ", str(query or "").strip())
-        like = f"%{term.lower()}%"
-        bounded_limit = max(1, min(int(limit or 25), 100))
-
-        usage_count_lateral = """
-            LEFT JOIN LATERAL (
-                SELECT COUNT(DISTINCT c.id) AS usage_count
-                FROM revision_assets ra
-                JOIN component_revisions r ON r.id = ra.revision_id
-                JOIN components c ON c.id = r.component_id AND c.is_active = 1
-                WHERE ra.asset_id = a.id
-            ) usage_stats ON true
-        """
-
+        plan = self._project_import_assets.prepare_search_assets(
+            asset_type=asset_type,
+            query=query,
+            limit=limit,
+        )
         with self._connect() as conn:
-            if term:
-                rows = conn.execute(
-                    f"""
-                    SELECT
-                        a.id, a.asset_type, a.name, a.target_library, a.target_name,
-                        a.sha256, a.size_bytes, usage_stats.usage_count
-                    FROM assets a
-                    {usage_count_lateral}
-                    WHERE a.asset_type = %s
-                      AND (
-                        lower(a.name) LIKE %s
-                        OR lower(a.target_name) LIKE %s
-                        OR lower(a.target_library) LIKE %s
-                      )
-                    ORDER BY usage_stats.usage_count DESC, lower(a.target_name), a.name
-                    LIMIT %s
-                    """,
-                    (normalized_type, like, like, like, bounded_limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    f"""
-                    SELECT
-                        a.id, a.asset_type, a.name, a.target_library, a.target_name,
-                        a.sha256, a.size_bytes, usage_stats.usage_count
-                    FROM assets a
-                    {usage_count_lateral}
-                    WHERE a.asset_type = %s
-                    ORDER BY a.target_library, a.target_name, a.name
-                    LIMIT %s
-                    """,
-                    (normalized_type, bounded_limit),
-                ).fetchall()
-
-        return [
-            {
-                "id": str(row["id"]),
-                "asset_type": str(row["asset_type"]),
-                "name": str(row["name"]),
-                "target_library": str(row["target_library"] or ""),
-                "target_name": str(row["target_name"] or ""),
-                "sha256": str(row["sha256"]),
-                "size_bytes": int(row["size_bytes"] or 0),
-                "usage_count": int(row["usage_count"] or 0),
-            }
-            for row in rows
-        ]
-
-    def _record_component_usage(
-        self,
-        conn: Any,
-        *,
-        component_id: str,
-        provenance: list[dict[str, Any]],
-        observed_at: str,
-        source: str = "semantic_scan",
-    ) -> int:
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for raw_source in provenance:
-            project_id = str(raw_source.get("projectId") or "")
-            source_revision = str(raw_source.get("sourceRevision") or "")
-            if not project_id:
-                continue
-            detail = {
-                str(key): value
-                for key, value in raw_source.items()
-                if value not in (None, "", [], {})
-            }
-            grouped.setdefault((project_id, source_revision), []).append(detail)
-
-        for (project_id, source_revision), details in grouped.items():
-            conn.execute(
-                """
-                UPDATE component_usage
-                SET is_current = 0, last_seen_at = %s
-                WHERE component_id = %s AND project_id = %s AND source_revision <> %s AND is_current = 1
-                """,
-                (observed_at, component_id, project_id, source_revision),
-            )
-            references = sorted(
-                {
-                    str(detail.get("reference") or "")
-                    for detail in details
-                    if str(detail.get("reference") or "")
-                }
-            )
-            conn.execute(
-                """
-                INSERT INTO component_usage (
-                    id, component_id, project_id, source_revision, references_json, details_json,
-                    source, is_current, first_seen_at, last_seen_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s, %s)
-                ON CONFLICT(component_id, project_id, source_revision)
-                DO UPDATE SET references_json = excluded.references_json,
-                              details_json = excluded.details_json,
-                              source = excluded.source,
-                              is_current = 1,
-                              last_seen_at = excluded.last_seen_at
-                """,
-                (
-                    str(uuid.uuid4()),
-                    component_id,
-                    project_id,
-                    source_revision,
-                    json.dumps(references, separators=(",", ":")),
-                    json.dumps(details, sort_keys=True, separators=(",", ":")),
-                    source,
-                    observed_at,
-                    observed_at,
-                ),
-            )
-        return len(grouped)
+            return self._project_import_assets.execute_search_assets(conn, plan)
 
     def index_project_component_usage(self, proposals: list[dict[str, Any]]) -> dict[str, int]:
         """Index where-used observations even when no import proposal is accepted."""
         self.initialize()
-        matched_components: set[str] = set()
-        observations = 0
         now = _utc_now_iso()
         with self._connect() as conn:
-            for proposal in proposals:
-                metadata = dict(proposal.get("metadata") or {})
-                manufacturer = str(metadata.get("manufacturer") or "").strip()
-                mpn = str(metadata.get("manufacturer_part_number") or metadata.get("mpn") or "").strip()
-                if not manufacturer or not mpn:
-                    continue
-                component = conn.execute(
-                    """
-                    SELECT component.id
-                    FROM components component
-                    JOIN component_revisions revision ON revision.id = component.current_revision_id
-                    WHERE component.is_active = 1
-                      AND lower(revision.manufacturer) = lower(%s)
-                      AND lower(revision.mpn) = lower(%s)
-                    ORDER BY component.created_at
-                    LIMIT 1
-                    """,
-                    (manufacturer, mpn),
-                ).fetchone()
-                if not component:
-                    continue
-                component_id = str(component["id"])
-                matched_components.add(component_id)
-                observations += self._record_component_usage(
-                    conn,
-                    component_id=component_id,
-                    provenance=list(proposal.get("provenance") or []),
-                    observed_at=now,
-                    source="semantic_scan",
-                )
+            result = self._project_import_matching.index_project_component_usage(
+                conn,
+                proposals,
+                observed_at=now,
+            )
             conn.commit()
-        return {"matched_components": len(matched_components), "observations": observations}
+        return result
 
     def match_component_identities(self, identities: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
         """Resolve manufacturer/MPN identities in one catalog query for import preflight."""
-        requested = {
-            (str(item.get("manufacturer") or "").strip().casefold(), str(item.get("mpn") or "").strip().casefold())
-            for item in identities
-            if str(item.get("manufacturer") or "").strip() and str(item.get("mpn") or "").strip()
-        }
+        requested = self._project_import_matching.normalize_identity_requests(identities)
         if not requested:
             return {}
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT component.id, revision.name, revision.manufacturer, revision.mpn,
-                       revision.id AS revision_id, revision.version
-                FROM components component
-                JOIN component_revisions revision ON revision.id = component.current_revision_id
-                WHERE component.is_active = 1
-                """
-            ).fetchall()
-        matches: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            key = (str(row["manufacturer"] or "").strip().casefold(), str(row["mpn"] or "").strip().casefold())
-            if key not in requested:
-                continue
-            matches["\0".join(key)] = {
-                "component_id": str(row["id"]),
-                "revision_id": str(row["revision_id"]),
-                "version": int(row["version"] or 0),
-                "name": str(row["name"] or row["mpn"] or ""),
-                "manufacturer": str(row["manufacturer"] or ""),
-                "manufacturer_part_number": str(row["mpn"] or ""),
-            }
-        return matches
-
-    def _revision_matches_import(
-        self,
-        conn: Any,
-        revision: dict[str, Any],
-        metadata: dict[str, Any],
-        selected_assets: dict[str, list[dict[str, Any]]],
-    ) -> bool:
-        metadata_fields = (
-            "name",
-            "value",
-            "description",
-            "datasheet_url",
-            "manufacturer",
-            "mpn",
-            "category",
-            "package_name",
-            "vendor",
-            "vendor_part_number",
-            "mass_g",
-            "rqjc_c_w",
-            "rqjc_top_c_w",
-            "temp_max_c",
-            "temp_min_c",
-            "power_dissipation_w",
-            "rate",
-            "sap_code",
-            "summary",
-        )
-        if any(str(revision.get(field) or "") != str(metadata.get(field) or "") for field in metadata_fields):
-            return False
-        if _json_loads(revision.get("extra_fields"), {}) != metadata.get("extra_fields", {}):
-            return False
-        current_assets = {
-            (
-                str(asset["asset_type"]),
-                str(asset["sha256"]),
-                str(asset["target_library"]),
-                str(asset["target_name"]),
-            )
-            for asset in self._load_assets_for_revision(conn, str(revision["id"]))
-        }
-        incoming_assets = {
-            (
-                str(asset_type),
-                str(candidate.get("sha256") or ""),
-                str(candidate.get("target_library") or "Prism_Imported"),
-                str(candidate.get("target_name") or Path(str(candidate.get("filename") or "asset")).stem),
-            )
-            for asset_type, candidates in selected_assets.items()
-            for candidate in candidates
-        }
-        return incoming_assets.issubset(current_assets)
-
-    def _validate_project_import_asset_paths(
-        self,
-        proposal: dict[str, Any],
-        selected_assets: dict[str, list[dict[str, Any]]],
-    ) -> None:
-        imports_root = (self._store_root / "imports" / str(proposal["session_id"])).resolve()
-        for asset_type, candidates in selected_assets.items():
-            for asset in candidates:
-                staged_path = Path(str(asset.get("staged_path") or "")).resolve()
-                try:
-                    staged_path.relative_to(imports_root)
-                except ValueError as exc:
-                    raise ValueError("Import proposal contains an invalid staged asset path") from exc
-                if not staged_path.is_file() or _sha256_file(staged_path) != str(asset.get("sha256") or ""):
-                    raise ValueError(f"Staged {asset_type} asset is missing or has changed")
+            return self._project_import_matching.match_component_identities(conn, requested)
 
     def accept_project_import_proposal(
         self,
@@ -1770,114 +1412,50 @@ class ComponentCatalogDomainService:
             raise ValueError("Import proposal not found")
         if proposal["status"] != "candidate":
             raise ValueError("Project import proposal has already been resolved")
-        source_metadata = dict(proposal["metadata"])
-        fields = dict(source_metadata.get("fields") or {})
-        normalized_input: dict[str, Any] = {
-            "value": source_metadata.get("value"),
-            "description": source_metadata.get("description"),
-            "datasheet": source_metadata.get("datasheet"),
-            "manufacturer": source_metadata.get("manufacturer"),
-            "manufacturer_part_number": source_metadata.get("manufacturer_part_number"),
-            "package_name": source_metadata.get("footprint"),
-            "vendor": fields.get("Vendor", ""),
-            "vendor_part_number": fields.get("Vendor Part Number", ""),
-            "mass_g": fields.get("Mass (g)", ""),
-            "rqjc_c_w": fields.get("RQjC (C/W)", ""),
-            "rqjc_top_c_w": fields.get("RQjC_top (C/W)", ""),
-            "temp_max_c": fields.get("Temp_max (C)", ""),
-            "temp_min_c": fields.get("Temp_min (C)", ""),
-            "power_dissipation_w": fields.get("Power Dissipation (W)", ""),
-            "rate": fields.get("Rate", ""),
-            "extra_fields": fields,
-            **(metadata_overrides or {}),
-        }
+        normalized_input = self._project_import_acceptance.build_normalized_input(
+            proposal,
+            metadata_overrides,
+        )
         metadata = self._normalize_metadata(normalized_input)
-        assets = list(proposal["assets"])
-        by_type: dict[str, list[dict[str, Any]]] = {}
-        for asset in assets:
-            by_type.setdefault(str(asset.get("asset_type") or ""), []).append(asset)
+        candidates_by_type = self._project_import_assets.group_import_assets(proposal)
         # An asset type may instead be satisfied by an existing catalog asset. That is
         # a reference, not a copy: the same assets row is linked into this revision, so
         # one shared 0603 footprint serves every part that uses it.
-        linked_assets = self._resolve_import_asset_links(asset_links or {})
-
-        selected_by_type: dict[str, list[dict[str, Any]]] = {}
-        requested_selections = asset_selections or {}
-        for asset_type, candidates in by_type.items():
-            if asset_type in linked_assets:
-                # The reviewer chose an existing catalog asset; the project's own
-                # candidates for this type are deliberately not imported.
-                continue
-            selection_was_explicit = asset_type in requested_selections
-            selected_hashes = set(requested_selections.get(asset_type) or [])
-            selected = [candidate for candidate in candidates if str(candidate.get("sha256") or "") in selected_hashes]
-            if selected_hashes and len(selected) != len(selected_hashes):
-                raise ValueError(f"Asset selection for {asset_type} contains an unknown content hash")
-            if asset_type in PLACE_REQUIRED_ASSET_TYPES:
-                effective = selected if selection_was_explicit else candidates
-                if len(effective) != 1:
-                    raise ValueError(f"Select exactly one {asset_type} asset before import")
-                selected_by_type[asset_type] = effective
-            else:
-                # An explicit empty list means "do not import optional assets". This
-                # distinction matters for teams that intentionally exclude project-local
-                # simulation or mechanical files from the managed library.
-                selected_by_type[asset_type] = selected if selection_was_explicit else candidates
-        by_type = selected_by_type
-        for required_type in PLACE_REQUIRED_ASSET_TYPES:
-            if not by_type.get(required_type) and required_type not in linked_assets:
-                raise ValueError(
-                    "A symbol and footprint are required before accepting a project import"
-                )
-        # "<asset_type>_not_resolved" means the extractor could not find that asset in
-        # the project. Linking an existing catalog asset is exactly the remedy, so a
-        # supplied link clears the finding it answers.
-        resolved_by_link = {f"{asset_type}_not_resolved" for asset_type in linked_assets}
-        blocking = [
-            finding
-            for finding in proposal["findings"]
-            if finding.get("severity") == "error"
-            and not str(finding.get("code") or "").startswith("missing_metadata_")
-            and not str(finding.get("code") or "").startswith("conflicting_")
-            and str(finding.get("code") or "") not in resolved_by_link
-        ]
-        if blocking:
-            raise ValueError("Resolve blocking import findings before accepting this proposal")
-        self._validate_project_import_asset_paths(proposal, by_type)
+        requested_links = self._project_import_assets.normalize_import_asset_links(asset_links or {})
+        linked_assets: dict[str, dict[str, Any]] = {}
+        if requested_links:
+            with self._connect() as conn:
+                linked_assets = self._project_import_assets.resolve_import_asset_links(conn, requested_links)
+        by_type = self._project_import_assets.select_import_assets(
+            candidates_by_type,
+            asset_selections=asset_selections,
+            linked_assets=linked_assets,
+            findings=proposal["findings"],
+        )
+        self._project_import_assets.validate_project_import_asset_paths(
+            self._store_root,
+            proposal,
+            by_type,
+        )
 
         now = _utc_now_iso()
         with self._connect() as conn:
-            claimed = conn.execute(
-                """
-                UPDATE project_component_import_proposals
-                SET status = 'accepting', updated_at = %s
-                WHERE id = %s AND status = 'candidate'
-                """,
-                (now, proposal_id),
+            self._project_import_acceptance.claim_proposal(
+                conn,
+                proposal_id,
+                now=now,
             )
-            if claimed.rowcount == 0:
-                raise ValueError("Project import proposal has already been resolved")
             self._lock_component_identity(conn, metadata["manufacturer"], metadata["mpn"])
-            existing = conn.execute(
-                """
-                SELECT c.id
-                FROM components c
-                JOIN component_revisions revision ON revision.id = c.current_revision_id
-                WHERE c.is_active = 1 AND lower(revision.manufacturer) = lower(%s) AND lower(revision.mpn) = lower(%s)
-                ORDER BY c.created_at
-                LIMIT 1
-                """,
-                (metadata["manufacturer"], metadata["mpn"]),
-            ).fetchone()
-            component_id = str(existing["id"]) if existing else str(uuid.uuid4())
-            provenance = list(proposal["provenance"])
-            provenance_source = str(provenance[0].get("source") or "project") if provenance else "project"
-            import_source = "folder_snapshot" if provenance_source == "folder_snapshot" else "project"
-            external_id = (
-                str(provenance[0].get("snapshotId") or provenance[0].get("projectId") or "")
-                if provenance
-                else ""
+            existing = self._project_import_acceptance.find_existing_component(
+                conn,
+                metadata["manufacturer"],
+                metadata["mpn"],
             )
+            component_id = str(existing["id"]) if existing else str(uuid.uuid4())
+            import_payload = self._project_import_acceptance.build_import_payload(proposal)
+            provenance = import_payload["provenance"]
+            import_source = import_payload["import_source"]
+            external_id = import_payload["external_id"]
             current_revision = (
                 self._revision_row(conn, str(self._component_row(conn, component_id)["current_revision_id"]))
                 if existing
@@ -1885,7 +1463,12 @@ class ComponentCatalogDomainService:
             )
             no_content_change = bool(
                 current_revision
-                and self._revision_matches_import(conn, current_revision, metadata, by_type)
+                and self._project_import_assets.revision_matches_import(
+                    conn,
+                    current_revision,
+                    metadata,
+                    by_type,
+                )
             )
             if no_content_change and current_revision:
                 revision_id = str(current_revision["id"])
@@ -1957,20 +1540,18 @@ class ComponentCatalogDomainService:
                         "provenance": provenance,
                     },
                 )
-            self._record_component_usage(
+            self._project_import_matching.record_component_usage(
                 conn,
                 component_id=component_id,
                 provenance=provenance,
                 observed_at=now,
                 source="project_import",
             )
-            conn.execute(
-                """
-                UPDATE project_component_import_proposals
-                SET status = 'accepted', accepted_component_id = %s, updated_at = %s
-                WHERE id = %s AND status = 'accepting'
-                """,
-                (component_id, now, proposal_id),
+            self._project_import_acceptance.mark_proposal_accepted(
+                conn,
+                proposal_id,
+                component_id,
+                now=now,
             )
             conn.commit()
         return {
@@ -1981,16 +1562,11 @@ class ComponentCatalogDomainService:
     def reject_project_import_proposal(self, proposal_id: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            result = conn.execute(
-                """
-                UPDATE project_component_import_proposals
-                SET status = 'rejected', updated_at = %s
-                WHERE id = %s AND status = 'candidate'
-                """,
-                (_utc_now_iso(), proposal_id),
+            self._project_import_sessions.reject_proposal(
+                conn,
+                proposal_id,
+                now=_utc_now_iso(),
             )
-            if result.rowcount == 0:
-                raise ValueError("Project import proposal was not found or has already been resolved")
             conn.commit()
         return self.get_project_import_proposal(proposal_id) or {}
 
@@ -2052,32 +1628,14 @@ class ComponentCatalogDomainService:
         """Remove regenerable staged copies after every proposal is resolved."""
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT session.id
-                FROM project_component_import_sessions session
-                WHERE session.updated_at < %s
-                  AND NOT EXISTS (
-                    SELECT 1 FROM project_component_import_proposals proposal
-                    WHERE proposal.session_id = session.id
-                      AND proposal.status IN ('candidate', 'accepting')
-                  )
-                """,
-                (older_than,),
-            ).fetchall()
-        removed: list[str] = []
-        imports_root = (self._store_root / "imports").resolve()
-        for row in rows:
-            session_id = str(row["id"])
-            path = (imports_root / session_id).resolve()
-            try:
-                path.relative_to(imports_root)
-            except ValueError:
-                continue
-            if path.is_dir():
-                shutil.rmtree(path)
-                removed.append(session_id)
-        return {"removed": len(removed), "session_ids": removed}
+            session_ids = self._project_import_sessions.list_resolved_session_ids(
+                conn,
+                older_than=older_than,
+            )
+        return self._project_import_sessions.remove_staging_directories(
+            store_root=self._store_root,
+            session_ids=session_ids,
+        )
 
     def list_components(
         self,

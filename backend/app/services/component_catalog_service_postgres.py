@@ -9,6 +9,7 @@ from app.services.catalog.component_history import CatalogComponentHistoryReads
 from app.services.catalog.component_read_models import CatalogComponentReadModels
 from app.services.catalog.component_queries import CatalogComponentQueries
 from app.services.catalog.locking import CatalogLockOperations, PostgresCatalogLocks
+from app.services.catalog.project_import_assets import CatalogProjectImportAssets
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import CatalogRevisionKernel
 from app.services.catalog.postgres_runtime import (
@@ -53,6 +54,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
+    _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
 
     def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
         self._postgres_runtime = PostgresCatalogRuntime(database_url=database_url)
@@ -63,6 +65,7 @@ class ComponentCatalogPostgresService(ComponentCatalogDomainService):
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
         self._component_queries = CatalogComponentQueries(self._component_read_models)
+        self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
 
     def _database_path(self, database_url: str | None) -> Path:
         # Retained only for the legacy service's diagnostic property. PostgreSQL does
