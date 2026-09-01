@@ -33,6 +33,7 @@ skills automatically should open the relevant linked playbook directly.
 | --- | --- |
 | Select and report verification checks | `.agents/skills/prism-quality-gate/SKILL.md` |
 | Add or change an API endpoint | `.agents/skills/prism-api-endpoint/SKILL.md` |
+| Change Prism catalog behavior or structure | `.agents/skills/prism-catalog-change/SKILL.md` |
 | Extend design-comparison semantics | `.agents/skills/prism-comparison-change-kind/SKILL.md` |
 | Rebuild the vendored ECAD viewer/parser | `.agents/skills/prism-viewer-rebuild/SKILL.md` |
 

@@ -7,10 +7,15 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 import base64
+import csv
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
+import re
+import sqlite3
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,6 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.catalog_schema_migrations import (  # noqa: E402
     MIGRATIONS,
     pending_catalog_migrations,
+)
+from app.services.component_catalog_domain import (  # noqa: E402
+    PREVIEW_PIPELINE_VERSION,
+    PREVIEW_STATUS_READY,
 )
 from app.services.component_catalog_service_postgres import (  # noqa: E402
     POSTGRES_SCHEMA_VERSION,
@@ -27,6 +36,126 @@ from app.services.component_catalog_service_postgres import (  # noqa: E402
 
 POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL", "").strip()
 APPLICATION_POSTGRES_URL = os.environ.get("PRISM_DATABASE_URL", "").strip()
+
+UUID_TEXT = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+FIXTURE_TOKEN = re.compile(r"assets-[0-9a-f]{8}", re.IGNORECASE)
+ISO_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+SHA256_TEXT = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
+
+# Revision A3 manifests embed representation asset UUIDs, so this test's
+# ``manifest_hash`` changes every run. Preview SVG bytes and generator
+# identity are supplied by a deterministic fixture renderer: GitHub Actions
+# has no kicad-cli, and a host/Docker KiCad version would otherwise move
+# both the preview hash and the retained fingerprint.
+VOLATILE_HASH_PATHS = frozenset({("manifest_hash",)})
+
+FIXTURE_PREVIEW_SVG = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+FIXTURE_PREVIEW_SHA256 = hashlib.sha256(FIXTURE_PREVIEW_SVG).hexdigest()
+
+
+def _fixture_preview_identity(kind: str) -> dict[str, str]:
+    canonical = json.dumps(
+        {
+            "generator_name": "kicad-cli",
+            "generator_version": "fixture",
+            "pipeline_version": PREVIEW_PIPELINE_VERSION,
+            "kind": kind,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "generator_name": "kicad-cli",
+        "generator_version": "fixture",
+        "pipeline_version": PREVIEW_PIPELINE_VERSION,
+        "generator_fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+FIXTURE_SYMBOL_PREVIEW_FINGERPRINT = _fixture_preview_identity("symbol")[
+    "generator_fingerprint"
+]
+FIXTURE_FOOTPRINT_PREVIEW_FINGERPRINT = _fixture_preview_identity("footprint")[
+    "generator_fingerprint"
+]
+
+COMPONENT_PAYLOAD_KEYS = (
+    "id", "slug", "external_source", "external_id", "external_workflow_source",
+    "external_workflow_id", "external_workflow_url", "external_url", "external_payload",
+    "external_updated_at", "sync_status", "sync_error", "source", "identity_kind", "name",
+    "value", "manufacturer", "mpn", "description", "package_name", "category",
+    "datasheet_url", "vendor", "vendor_part_number", "mass_g", "rqjc_c_w",
+    "rqjc_top_c_w", "temp_max_c", "temp_min_c", "power_dissipation_w", "rate",
+    "sap_code", "keywords", "extra_fields", "availability_state", "missing_assets",
+    "place_enabled", "local_inventory", "stock_known", "stock_quantity", "stock_uom",
+    "inventory_status", "supply", "serial_number", "lot_number", "pedigree",
+    "last_synced_at", "is_active", "revision_id", "revision", "version",
+    "parent_revision_id", "change_kind", "change_summary", "created_by", "manifest_hash",
+    "component_created_at", "component_updated_at", "revision_created_at",
+    "revision_updated_at", "current_revision_id", "released_revision_id",
+    "is_historical_revision", "summary", "library_name", "symbol_name", "representations",
+    "default_representation_id", "effective_representation_id", "release_status",
+    "workflow_stage", "released_view", "assets", "previews", "validation",
+)
+
+
+def _hash_path_is_volatile(path: tuple[str, ...]) -> bool:
+    for volatile in VOLATILE_HASH_PATHS:
+        if path[-len(volatile) :] == volatile:
+            return True
+    return False
+
+
+def _normalize_contract(value: object, path: tuple[str, ...] = ()) -> object:
+    """Remove only per-run identities, timestamps, and temporary store roots."""
+
+    if isinstance(value, dict):
+        return {
+            key: _normalize_contract(item, path + (str(key),))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_contract(item, path) for item in value]
+    if not isinstance(value, str):
+        return value
+    if ISO_TIMESTAMP.fullmatch(value):
+        return "<timestamp>"
+    normalized = FIXTURE_TOKEN.sub("assets-<token>", value)
+    normalized = UUID_TEXT.sub("<uuid>", normalized)
+    if _hash_path_is_volatile(path):
+        normalized = SHA256_TEXT.sub("<sha256>", normalized)
+    marker = normalized.find("/components/")
+    if marker >= 0 and (normalized.startswith("/") or normalized.startswith("<store>")):
+        normalized = "<store>" + normalized[marker:]
+    elif normalized.startswith(("/tmp/", "/private/tmp/", "/var/folders/")):
+        normalized = "<temporary-path>"
+    return normalized
+
+
+def _contract_digest(value: object) -> str:
+    normalized = _normalize_contract(value)
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalize_contract_bytes(value: bytes) -> bytes:
+    normalized = re.sub(
+        rb"assets-[0-9a-f]{8}", b"assets-<token>", value, flags=re.IGNORECASE
+    )
+    return re.sub(
+        rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        b"<uuid>",
+        normalized,
+        flags=re.IGNORECASE,
+    )
 
 
 def _database_identity(url: str) -> tuple[str, str, int | None, str]:
@@ -93,6 +222,62 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         )
         self.component_ids.append(str(component["id"]))
         return component
+
+    def _install_deterministic_preview_renderer(self) -> None:
+        """Keep preview evidence independent of kicad-cli availability and version."""
+
+        for target, value in (
+            ("app.services.component_catalog_domain.settings.CATALOG_KLC_ENABLED", False),
+            ("app.services.component_catalog_domain.settings.CATALOG_KLC_RELEASE_GATE", "warn"),
+            (
+                "app.services.component_catalog_domain.settings.SESSION_SECRET",
+                "catalog-contract-test-secret",
+            ),
+        ):
+            settings_patcher = patch(target, value)
+            settings_patcher.start()
+            self.addCleanup(settings_patcher.stop)
+
+        def generate_symbol_units(_self: object, _asset: object) -> tuple[str, list[tuple[int, bytes]]]:
+            return PREVIEW_STATUS_READY, [(1, FIXTURE_PREVIEW_SVG)]
+
+        def generate_footprint(_self: object, _asset: object) -> tuple[str, bytes]:
+            return PREVIEW_STATUS_READY, FIXTURE_PREVIEW_SVG
+
+        def preview_identity(_self: object, kind: str) -> dict[str, str]:
+            return _fixture_preview_identity(kind)
+
+        def preserve_symbol_upload(
+            _self: object,
+            _upload_name: str,
+            payload: bytes,
+        ) -> bytes:
+            # The contract fixture must not depend on whether this runtime has
+            # kicad-cli. The canonical single-symbol extraction remains real.
+            return payload
+
+        def no_existing_asset_signature(
+            _self: object,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            # Each test run owns a temporary store. Do not reuse immutable
+            # asset rows whose previous backing files were removed at teardown.
+            return None
+
+        # Patch the concrete service class. String names keep the architecture
+        # ratchet from counting these as new private callers.
+        service_cls = type(self.service)
+        for target, replacement in (
+            ("_asset_by_signature", no_existing_asset_signature),
+            ("_normalize_symbol_upload", preserve_symbol_upload),
+            ("_generate_symbol_preview_units", generate_symbol_units),
+            ("_generate_footprint_preview", generate_footprint),
+            ("_preview_generator_identity", preview_identity),
+        ):
+            patcher = patch.object(service_cls, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_concurrent_creation_allows_one_manufacturer_mpn_identity(self) -> None:
         token = "identity-" + uuid.uuid4().hex[:8]
@@ -363,6 +548,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertTrue(self.service.verify_component_audit_chain(component["id"])["valid"])
 
     def test_assets_release_evidence_and_diff_scope_round_trip(self) -> None:
+        self._install_deterministic_preview_renderer()
         component = self._component("assets-" + uuid.uuid4().hex[:8])
         symbol_payload = b'''(kicad_symbol_lib (version 20231120) (generator "test")
           (symbol "R_Test"
@@ -386,6 +572,32 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             selected_footprint="R_Test",
             actor="designer@example.com",
         )["component"]
+        self.assertEqual(tuple(imported_symbol), COMPONENT_PAYLOAD_KEYS)
+        self.assertEqual(
+            [preview["kind"] for preview in imported_symbol["previews"]],
+            ["symbol"],
+            imported_symbol["previews"],
+        )
+        self.assertEqual(
+            _contract_digest(imported_symbol),
+            "93e52eb5141723ec2a987ae9de938907923747cf1918a8e8528b69d6982e35e0",
+            {
+                "preview_status": [item.get("status") for item in imported_symbol["previews"]],
+                "preview_paths": [
+                    _normalize_contract(item.get("file_path"), ("previews", "file_path"))
+                    for item in imported_symbol["previews"]
+                ],
+                "asset_sha256": [item.get("sha256") for item in imported_symbol["assets"]],
+                "generator_version": [
+                    item.get("generator_version") for item in imported_symbol["previews"]
+                ],
+            },
+        )
+        self.assertEqual(tuple(imported_footprint), COMPONENT_PAYLOAD_KEYS)
+        self.assertEqual(
+            _contract_digest(imported_footprint),
+            "ae8eeb5b599f1a8135cff4228878960d1ed2d137db8b49127feea53d7e687820",
+        )
         with_model = self.service.attach_auxiliary_asset(
             component["id"],
             asset_type="3dmodel",
@@ -437,6 +649,118 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             expected_manifest_hash=approved["manifest_hash"],
         )
         self.assertEqual(released["release_status"], "released")
+        self.assertEqual(tuple(released), COMPONENT_PAYLOAD_KEYS)
+        self.assertEqual(
+            _contract_digest(released),
+            "ecb19c09822c12c5ed0ab9249f7e42c57dea9576154b871f1e4c4a6a03ba670f",
+        )
+        self.assertEqual(released["identity_kind"], "mpn")
+        self.assertEqual(released["mpn"], component["mpn"])
+        self.assertEqual(
+            [asset["asset_type"] for asset in released["assets"]],
+            ["symbol", "footprint", "3dmodel", "spice"],
+        )
+        self.assertEqual(
+            [asset["target_name"] for asset in released["assets"]],
+            ["R_Test", "R_Test", "R_Test.step", "R_Test.lib"],
+        )
+        self.assertEqual(
+            [asset["sha256"] for asset in released["assets"][1:]],
+            [
+                hashlib.sha256(
+                    b'(footprint "R_Test" (version 20240108) (generator "test"))'
+                ).hexdigest(),
+                hashlib.sha256(b"ISO-10303-21;END-ISO-10303-21;").hexdigest(),
+                hashlib.sha256(b".MODEL R_Test RES R=10k").hexdigest(),
+            ],
+        )
+        self.assertEqual(released["revision_id"], with_spice["revision_id"])
+        self.assertEqual(released["manifest_hash"], with_spice["manifest_hash"])
+        self.assertEqual({preview["kind"] for preview in released["previews"]}, {"symbol", "footprint"})
+        for preview in released["previews"]:
+            self.assertEqual(preview["status"], "ready")
+            self.assertEqual(preview["content_type"], "image/svg+xml")
+            self.assertEqual(preview["sha256"], FIXTURE_PREVIEW_SHA256)
+            self.assertEqual(preview["generator_version"], "fixture")
+            self.assertEqual(
+                preview["generator_fingerprint"],
+                (
+                    FIXTURE_SYMBOL_PREVIEW_FINGERPRINT
+                    if preview["kind"] == "symbol"
+                    else FIXTURE_FOOTPRINT_PREVIEW_FINGERPRINT
+                ),
+            )
+            backing = Path(preview["file_path"])
+            self.assertTrue(backing.is_file(), preview["file_path"])
+            self.assertEqual(backing.read_bytes(), FIXTURE_PREVIEW_SVG)
+            self.assertEqual(
+                hashlib.sha256(backing.read_bytes()).hexdigest(),
+                preview["sha256"],
+            )
+            bucket = "symbols" if preview["kind"] == "symbol" else "footprints"
+            self.assertEqual(
+                _normalize_contract(preview["file_path"], ("previews", "file_path")),
+                f"<store>/components/previews/versions/{bucket}/<uuid>/{FIXTURE_PREVIEW_SHA256}.svg",
+            )
+
+        revisions = self.service.list_component_revisions(component["id"])
+        self.assertEqual(
+            [int(revision["version"]) for revision in revisions],
+            sorted((int(revision["version"]) for revision in revisions), reverse=True),
+        )
+        self.assertEqual(revisions[0]["id"], released["revision_id"])
+        self.assertEqual(revisions[0]["manifest_hash"], released["manifest_hash"])
+        audit_events = self.service.list_component_audit_events(component["id"])
+        self.assertEqual(
+            [int(event["sequence"]) for event in audit_events],
+            sorted((int(event["sequence"]) for event in audit_events), reverse=True),
+        )
+        self.assertTrue(self.service.verify_component_audit_chain(component["id"])["valid"])
+
+        fixed_now = 1_700_000_000
+        with patch("app.services.component_catalog_domain.time.time", return_value=fixed_now):
+            manifest = self.service.build_manifest(component["id"], "https://prism.example")
+        assert manifest is not None
+        self.assertEqual(manifest["part_id"], component["id"])
+        self.assertEqual(manifest["representation_id"], released["default_representation_id"])
+        self.assertEqual(
+            [asset["asset_type"] for asset in manifest["assets"]],
+            ["symbol", "footprint", "3dmodel", "spice"],
+        )
+        signed = urlsplit(manifest["assets"][0]["download_url"])
+        signed_query = parse_qs(signed.query, keep_blank_values=True)
+        self.assertEqual(signed.scheme, "https")
+        self.assertEqual(signed.netloc, "prism.example")
+        self.assertEqual(signed.fragment, "")
+        self.assertEqual(set(signed_query), {"rev", "representation", "exp", "sig"})
+        self.assertEqual(signed.path, f"/api/remote-provider/assets/{released['assets'][0]['id']}")
+        self.assertEqual(signed_query["rev"], [released["revision_id"]])
+        self.assertEqual(
+            signed_query["representation"],
+            [released["default_representation_id"]],
+        )
+        self.assertEqual(int(signed_query["exp"][0]), fixed_now + 300)
+        with patch("app.services.component_catalog_domain.time.time", return_value=fixed_now):
+            self.assertTrue(
+                self.service.validate_asset_signature(
+                    released["assets"][0]["id"],
+                    signed_query["rev"][0],
+                    int(signed_query["exp"][0]),
+                    signed_query["sig"][0],
+                    signed_query["representation"][0],
+                )
+            )
+        with patch("app.services.component_catalog_domain.time.time", return_value=fixed_now + 300):
+            self.assertFalse(
+                self.service.validate_asset_signature(
+                    released["assets"][0]["id"],
+                    signed_query["rev"][0],
+                    int(signed_query["exp"][0]),
+                    signed_query["sig"][0],
+                    signed_query["representation"][0],
+                )
+            )
+
         remote = self.service.list_remote_component_heads(
             query=released["mpn"],
             page=1,
@@ -455,10 +779,183 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(
             inline["representation_id"], released["default_representation_id"]
         )
+        inline_again = self.service.build_inline_bundle(component["id"])
+        assert inline_again is not None
+        inline_bytes = base64.b64decode(inline["data"])
+        self.assertEqual(inline_bytes, base64.b64decode(inline_again["data"]))
+        inline_entries = json.loads(inline_bytes)
+        self.assertEqual(
+            [entry["type"] for entry in inline_entries],
+            ["symbol", "footprint", "3dmodel", "spice"],
+        )
+        for entry in inline_entries:
+            self.assertEqual(
+                hashlib.sha256(base64.b64decode(entry["content"])).hexdigest(),
+                entry["checksum"],
+            )
+        self.assertEqual(
+            [asset["sha256"] for asset in manifest["assets"]],
+            [entry["checksum"] for entry in inline_entries],
+        )
         records = self.service.list_component_release_records(component["id"])
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["manifest_hash"], released["manifest_hash"])
         self.assertTrue(self.service.verify_component_audit_chain(component["id"])["valid"])
+
+        metadata_csv = self.service.export_metadata_csv(field_keys=["value", "package_name"])
+        metadata_lines = metadata_csv.splitlines(keepends=True)
+        target_metadata_csv = metadata_lines[0] + next(
+            line for line in metadata_lines[1:] if component["id"] in line
+        )
+        normalized_metadata_csv = target_metadata_csv.replace(
+            component["id"], "<component-id>"
+        ).replace(released["revision_id"], "<revision-id>")
+        self.assertEqual(
+            normalized_metadata_csv,
+            "_prism_schema_version,component_id,expected_revision_id,revision,workflow_stage,value,package_name\r\n"
+            "prism.component_metadata_a1,<component-id>,<revision-id>,5,released,\u200b10k,\r\n",
+        )
+        self.assertEqual(
+            hashlib.sha256(normalized_metadata_csv.encode("utf-8")).hexdigest(),
+            "155c8c4d36ee614b581a6307b340af5cd4249c22e3300ab867a149dd28823b92",
+        )
+        self.assertEqual(metadata_csv, self.service.export_metadata_csv(field_keys=["value", "package_name"]))
+        metadata_rows = list(csv.reader(metadata_csv.splitlines()))
+        self.assertEqual(
+            metadata_rows[0],
+            [
+                "_prism_schema_version",
+                "component_id",
+                "expected_revision_id",
+                "revision",
+                "workflow_stage",
+                "value",
+                "package_name",
+            ],
+        )
+        self.assertEqual(metadata_rows[1][1], component["id"])
+        self.assertEqual(metadata_rows[1][5], "\u200b10k")
+        inventory_csv = self.service.export_inventory_csv()
+        inventory_lines = inventory_csv.splitlines(keepends=True)
+        target_inventory_csv = inventory_lines[0] + next(
+            line for line in inventory_lines[1:] if component["id"] in line
+        )
+        normalized_inventory_csv = FIXTURE_TOKEN.sub(
+            "assets-<token>", target_inventory_csv.replace(component["id"], "<component-id>")
+        )
+        self.assertEqual(
+            normalized_inventory_csv,
+            "component_id,manufacturer,mpn,quantity,uom,inventory_status\r\n"
+            "<component-id>,Prism Integration,PG-R-assets-<token>,0.0,,\r\n",
+        )
+        self.assertEqual(inventory_csv, self.service.export_inventory_csv())
+        self.assertEqual(
+            next(csv.reader(inventory_csv.splitlines())),
+            ["component_id", "manufacturer", "mpn", "quantity", "uom", "inventory_status"],
+        )
+
+        first_dbl = self.service.export_kicad_dbl_bundle()
+        first_root = Path(first_dbl["export_root"])
+        first_files = {
+            path.relative_to(first_root).as_posix(): path.read_bytes()
+            for path in first_root.rglob("*")
+            if path.is_file()
+        }
+        normalized_dbl_files = {
+            FIXTURE_TOKEN.sub("assets-<token>", name): _normalize_contract_bytes(payload)
+            for name, payload in first_files.items()
+            if name != "Prism.sqlite"
+        }
+        self.assertEqual(
+            {
+                name: hashlib.sha256(payload).hexdigest()
+                for name, payload in sorted(normalized_dbl_files.items())
+            },
+            {
+                "PcbLib/Prism_Test.pretty/R_Test.kicad_mod": "8d4ef2234c867094a30e793fdbff4975a78a98742ac72825b5fef2c2c5355461",
+                "Prism_Linux.kicad_dbl": "86cacbfb2c4f192082191bf6cfd4a386cb89672ffb4747ebea6cd538c379064d",
+                "Prism_Windows.kicad_dbl": "5f8b5b8128abd1fd8021eac341c104b152f407a179a5df6c2e6c6c8efd20ad14",
+                "SchLib/Prism_PG-R-assets-<token>_Prism_Test_R_Test.kicad_sym": "f005b31dc8b9553ea528ad253896bab79c9c69ea1e1dac0a683bbcc4dc8d9fbe",
+                "fp-lib-table": "149d573ae28f732acb912b6707b02f0851c7c250d3f698b6e7a92269e2cc3c86",
+                "sym-lib-table": "a97a151e180b2945dbd6a81a3cbc00d4a7edcb17488f371d5fe24f43a1805fbf",
+            },
+        )
+        with sqlite3.connect(first_dbl["sqlite_path"]) as dbl_conn:
+            tables = [
+                row[0]
+                for row in dbl_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+                ).fetchall()
+            ]
+            self.assertEqual(tables, ["Uncategorized"])
+            columns = [
+                row[1]
+                for row in dbl_conn.execute('PRAGMA table_info("Uncategorized")').fetchall()
+            ]
+            self.assertEqual(
+                columns,
+                [
+                    "Part Number",
+                    "Part Number Nocolon",
+                    "Comment",
+                    "Value",
+                    "Manufacturer",
+                    "Manufacturer Part Number",
+                    "PackageDescription",
+                    "Status",
+                    "Part Description",
+                    "Datasheet",
+                    "LibSymbol",
+                    "LibFootprint",
+                ],
+            )
+            dbl_row = dbl_conn.execute(
+                """
+                SELECT "Part Number", "Part Number Nocolon", "Comment", "Value",
+                       "Manufacturer", "Manufacturer Part Number", "PackageDescription",
+                       "Status", "Part Description", "Datasheet", "LibSymbol", "LibFootprint"
+                FROM "Uncategorized"
+                WHERE "Manufacturer Part Number" = ?
+                """,
+                (component["mpn"],),
+            ).fetchone()
+            self.assertIsNotNone(dbl_row)
+            self.assertEqual(
+                tuple(
+                    FIXTURE_TOKEN.sub("assets-<token>", cell) if isinstance(cell, str) else cell
+                    for cell in dbl_row
+                ),
+                (
+                    "PG-R-assets-<token>",
+                    "PG-R-assets-<token>",
+                    "10k",
+                    "10k",
+                    "Prism Integration",
+                    "PG-R-assets-<token>",
+                    "",
+                    "released",
+                    "PostgreSQL catalog integration component",
+                    "https://example.com/r.pdf",
+                    "Prism_PG-R-assets-<token>_Prism_Test_R_Test:R_Test",
+                    "Prism_Test:R_Test",
+                ),
+            )
+            self.assertEqual(
+                dbl_conn.execute('SELECT COUNT(*) FROM "Uncategorized"').fetchone(),
+                (1,),
+            )
+        second_dbl = self.service.export_kicad_dbl_bundle()
+        second_root = Path(second_dbl["export_root"])
+        second_files = {
+            path.relative_to(second_root).as_posix(): path.read_bytes()
+            for path in second_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(first_files, second_files)
+        self.assertEqual(
+            {name: hashlib.sha256(payload).hexdigest() for name, payload in first_files.items()},
+            {name: hashlib.sha256(payload).hexdigest() for name, payload in second_files.items()},
+        )
 
     def test_non_default_representation_drives_manifest_and_inline_pair(self) -> None:
         component = self._component("representations-" + uuid.uuid4().hex[:8])
