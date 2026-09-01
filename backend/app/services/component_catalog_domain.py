@@ -12,7 +12,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import uuid
 import zipfile
@@ -2664,9 +2663,6 @@ class ComponentCatalogDomainService:
                 updated += 1
             conn.commit()
         return {"updated": updated, "not_found": not_found, "errors": errors}
-
-    def _browse_cache_lock_for(self, asset_type: str) -> threading.Lock:
-        return self._runtime_for_compat().browse_cache_lock_for(asset_type)
 
     def _invalidate_browse_cache(self) -> None:
         """Drop the stored-file listings after the store on disk changes.
