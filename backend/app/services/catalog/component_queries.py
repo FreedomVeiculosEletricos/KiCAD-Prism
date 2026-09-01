@@ -423,5 +423,82 @@ class CatalogComponentQueries:
         ).fetchall()
         return [{"name": str(row["name"] or ""), "count": int(row["count"])} for row in rows]
 
+    @staticmethod
+    def workflow_summary(conn: Any) -> dict[str, Any]:
+        """Count active components per workflow stage, in canonical stage order."""
+
+        rows = conn.execute(
+            """
+            SELECT cr.release_status AS workflow_stage, COUNT(1) AS count
+            FROM components c
+            JOIN component_revisions cr ON cr.id = c.current_revision_id
+            WHERE c.is_active = 1
+            GROUP BY cr.release_status
+            """
+        ).fetchall()
+        counts = {stage: 0 for stage in WORKFLOW_STAGES}
+        for row in rows:
+            stage = normalize_workflow_stage(str(row["workflow_stage"]))
+            if stage in counts:
+                counts[stage] += int(row["count"])
+        return {"stages": [{"workflow_stage": stage, "count": counts[stage]} for stage in WORKFLOW_STAGES]}
+
+    @staticmethod
+    def release_queue_summary(conn: Any) -> dict[str, int]:
+        """Return queue-wide counters without materializing component payloads.
+
+        The release workspace is server paginated, so its header metrics must be
+        computed independently from the visible page. A blocker is either missing
+        required CAD or a failed validation run for the exact current revision.
+        """
+
+        row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN cr.release_status = 'qa_review' THEN 1 ELSE 0 END) AS qa_review,
+                SUM(CASE WHEN cr.release_status = 'done' THEN 1 ELSE 0 END) AS done,
+                SUM(
+                    CASE WHEN
+                        NOT EXISTS (
+                            SELECT 1 FROM revision_assets ra_symbol
+                            WHERE ra_symbol.revision_id = cr.id
+                              AND ra_symbol.asset_type = 'symbol'
+                        )
+                        OR NOT EXISTS (
+                            SELECT 1 FROM revision_assets ra_footprint
+                            WHERE ra_footprint.revision_id = cr.id
+                              AND ra_footprint.asset_type = 'footprint'
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM revision_assets ra_validation
+                            JOIN assets validation_asset
+                              ON validation_asset.id = ra_validation.asset_id
+                            WHERE ra_validation.revision_id = cr.id
+                              AND validation_asset.asset_type IN ('symbol', 'footprint')
+                              AND COALESCE((
+                                  SELECT validation_run.status
+                                  FROM asset_validation_runs validation_run
+                                  WHERE validation_run.revision_id = cr.id
+                                    AND validation_run.asset_id = validation_asset.id
+                                  ORDER BY validation_run.finished_at DESC,
+                                           validation_run.created_at DESC
+                                  LIMIT 1
+                              ), 'not_run') = 'failed'
+                        )
+                    THEN 1 ELSE 0 END
+                ) AS blocked
+            FROM components c
+            JOIN component_revisions cr ON cr.id = c.current_revision_id
+            WHERE c.is_active = 1
+              AND cr.release_status IN ('qa_review', 'done')
+            """
+        ).fetchone()
+        return {
+            "qa_review": int(row["qa_review"] or 0),
+            "done": int(row["done"] or 0),
+            "blocked": int(row["blocked"] or 0),
+        }
+
 
 __all__ = ["CatalogComponentListPlan", "CatalogComponentQueries"]

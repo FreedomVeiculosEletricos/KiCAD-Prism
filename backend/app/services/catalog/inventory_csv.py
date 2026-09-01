@@ -11,6 +11,7 @@ from app.services.catalog.metadata_normalization import (
     IDENTITY_KIND_MPN,
     normalize_identity_value,
 )
+from app.services.catalog.normalization import utc_now_iso
 
 
 INVENTORY_CSV_HEADERS = (
@@ -173,6 +174,34 @@ class CatalogInventoryCsv:
                 now,
             ),
         )
+
+    @classmethod
+    def import_file(cls, conn: Any, file_content: str) -> dict[str, Any]:
+        """Upsert every resolvable row; per-row problems are reported, not raised."""
+        reader = cls.parse(file_content)
+        updated = 0
+        not_found = 0
+        errors: list[str] = []
+        for index, row in enumerate(reader, start=2):
+            try:
+                identity = cls.prepare_identity(row, index)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            component = cls.find_component(conn, identity)
+            if not component:
+                not_found += 1
+                errors.append(f"Row {index}: component identity was not found")
+                continue
+            try:
+                cls.validate_component(component, identity, index)
+                prepared = cls.prepare_upsert(row, index)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            cls.upsert(conn, component["id"], index, prepared, utc_now_iso())
+            updated += 1
+        return {"updated": updated, "not_found": not_found, "errors": errors}
 
 
 __all__ = [
