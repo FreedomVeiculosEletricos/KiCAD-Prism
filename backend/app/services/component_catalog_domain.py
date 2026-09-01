@@ -85,6 +85,7 @@ from app.services.catalog.project_import_sessions import CatalogProjectImportSes
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
 from app.services.catalog.project_import_assets import CatalogProjectImportAssets
 from app.services.catalog.project_import_acceptance import CatalogProjectImportAcceptance
+from app.services.catalog.preview_store import CatalogPreviewStore
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
@@ -375,6 +376,7 @@ class ComponentCatalogDomainService:
     _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
     _asset_files: CatalogAssetFiles = CatalogAssetFiles()
     _asset_registry: CatalogAssetRegistry = CatalogAssetRegistry()
+    _preview_store: CatalogPreviewStore = CatalogPreviewStore()
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -402,6 +404,7 @@ class ComponentCatalogDomainService:
         self._asset_browser = CatalogAssetBrowser()
         self._asset_files = CatalogAssetFiles()
         self._asset_registry = CatalogAssetRegistry()
+        self._preview_store = CatalogPreviewStore()
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
@@ -2889,53 +2892,15 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any]:
         identity = self._preview_generator_identity(kind)
         sha256 = _sha256_bytes(payload)
-        existing = conn.execute(
-            """
-            SELECT * FROM asset_preview_versions
-            WHERE asset_id = %s AND kind = %s AND sha256 = %s AND generator_fingerprint = %s
-            """,
-            (str(asset["id"]), kind, sha256, identity["generator_fingerprint"]),
-        ).fetchone()
-        if existing:
-            path = Path(str(existing["file_path"])).resolve()
-            if not path.is_file() or _sha256_file(path) != sha256:
-                raise ValueError(f"Immutable preview backing file is missing or corrupt: {path}")
-            return dict(existing)
         destination = self._preview_version_path(str(asset["id"]), kind, sha256).resolve()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            if destination.read_bytes() != payload:
-                raise ValueError(f"Immutable preview hash collision at {destination}")
-        else:
-            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-            temporary.write_bytes(payload)
-            os.replace(temporary, destination)
-        now = _utc_now_iso()
-        preview_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO asset_preview_versions (
-                id, asset_id, kind, status, content_type, file_path, sha256, size_bytes,
-                generator_name, generator_version, pipeline_version, generator_fingerprint,
-                generation_error, created_at
-            ) VALUES (%s, %s, %s, 'ready', 'image/svg+xml', %s, %s, %s, %s, %s, %s, %s, '', %s)
-            """,
-            (
-                preview_id,
-                str(asset["id"]),
-                kind,
-                str(destination),
-                sha256,
-                len(payload),
-                identity["generator_name"],
-                identity["generator_version"],
-                identity["pipeline_version"],
-                identity["generator_fingerprint"],
-                now,
-            ),
+        return self._preview_store.store_preview_version(
+            conn,
+            asset=asset,
+            kind=kind,
+            payload=payload,
+            generator_identity=identity,
+            destination=destination,
         )
-        row = conn.execute("SELECT * FROM asset_preview_versions WHERE id = %s", (preview_id,)).fetchone()
-        return dict(row)
 
     def _ensure_asset_previews(self, conn: Any, asset: dict[str, Any]) -> list[dict[str, Any]]:
         compatibility_override = self.__dict__.get("_ensure_asset_preview")
@@ -2982,23 +2947,11 @@ class ComponentCatalogDomainService:
 
     def _has_ready_preview(self, conn: Any, asset_id: str, kind: str) -> bool:
         generator_fingerprint = self._preview_generator_identity(kind)["generator_fingerprint"]
-        row = conn.execute(
-            """
-            SELECT file_path, sha256
-            FROM asset_preview_versions
-            WHERE asset_id = %s AND kind = %s AND status = %s AND generator_fingerprint = %s
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (asset_id, kind, PREVIEW_STATUS_READY, generator_fingerprint),
-        ).fetchone()
-        if not row:
-            return False
-        file_path = str(row["file_path"] or "")
-        return bool(
-            file_path
-            and Path(file_path).is_file()
-            and _sha256_file(Path(file_path)) == str(row["sha256"])
+        return self._preview_store.has_ready_preview(
+            conn,
+            asset_id,
+            kind,
+            generator_fingerprint,
         )
 
     def _refresh_revision_preview_outputs_in_conn(
