@@ -1,0 +1,75 @@
+name: Sync with upstream dev
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    if: github.repository_owner == 'FreedomVeiculosEletricos'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/nix-flake
+          fetch-depth: 0
+
+      - name: Rebase onto upstream dev
+        env:
+          UPSTREAM_URL: https://github.com/krishna-swaroop/KiCAD-Prism.git
+          UPSTREAM_BRANCH: dev
+          BRANCH: feat/nix-flake
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '.gitignore merge=union\n' > "$RUNNER_TEMP/attributes"
+          git config core.attributesFile "$RUNNER_TEMP/attributes"
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+          theirs="$(git rev-parse FETCH_HEAD)"
+          before="$(git rev-parse HEAD)"
+
+          if git merge-base --is-ancestor "$theirs" "$before"; then
+            echo "Already on top of upstream \`$UPSTREAM_BRANCH\` (\`${theirs:0:7}\`), nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          incoming="$(git rev-list --count "$before..$theirs")"
+
+          if ! git rebase "$theirs"; then
+            conflicted="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            git rebase --abort
+            {
+              echo "### Rebase conflict"
+              echo "\`$BRANCH\` was left untouched at \`${before:0:7}\`."
+              echo "Conflicting paths: \`$conflicted\`"
+              echo ""
+              echo "Resolve locally:"
+              echo '```'
+              echo "git fetch upstream $UPSTREAM_BRANCH"
+              echo "git rebase upstream/$UPSTREAM_BRANCH"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          after="$(git rev-parse HEAD)"
+          git push --force-with-lease="refs/heads/$BRANCH:$before" origin "HEAD:refs/heads/$BRANCH"
+          {
+            echo "### Rebased onto upstream \`$UPSTREAM_BRANCH\`"
+            echo "- picked up $incoming upstream commit(s), now based on \`${theirs:0:7}\`"
+            echo "- \`$BRANCH\`: \`${before:0:7}\` -> \`${after:0:7}\` (force-pushed)"
+            echo ""
+            echo "Local worktrees must run \`git pull --rebase\` before further work."
+          } >> "$GITHUB_STEP_SUMMARY"
