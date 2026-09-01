@@ -7,14 +7,12 @@ import json
 import logging
 import re
 import shutil
-import subprocess
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
-from xml.etree import ElementTree
 
 from app.core.config import settings
 from app.services.catalog.component_history import CatalogComponentHistoryReads
@@ -27,6 +25,13 @@ from app.services.catalog.component_read_models import (
     supply_source_payload as _supply_source_payload,
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
+from app.services.catalog.health import CatalogHealth
+from app.services.catalog.klc_validation import (
+    VALIDATION_SEVERITY_ERROR,
+    VALIDATION_SEVERITY_INFO,
+    VALIDATION_SEVERITY_WARNING,
+    CatalogKlcValidation,
+)
 from app.services.catalog.asset_browser import CatalogAssetBrowser
 from app.services.catalog.asset_files import (
     CatalogAssetFiles,
@@ -102,6 +107,7 @@ from app.services.catalog.preview_renderer import (
     PREVIEW_STATUS_READY,
 )
 from app.services.catalog.preview_store import CatalogPreviewStore
+from app.services.catalog.release_workflow import CatalogReleaseWorkflow
 from app.services.catalog.representations import CatalogRepresentations
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
 from app.services.catalog.revision_finalization import CatalogRevisionFinalizer
@@ -135,9 +141,6 @@ VALIDATION_STATUS_WARNING = "warning"
 VALIDATION_STATUS_FAILED = "failed"
 VALIDATION_STATUS_SKIPPED = "skipped"
 VALIDATION_STATUS_NOT_RUN = "not_run"
-VALIDATION_SEVERITY_ERROR = "error"
-VALIDATION_SEVERITY_WARNING = "warning"
-VALIDATION_SEVERITY_INFO = "info"
 KLC_RELEASE_GATE_VALUES = {"off", "warn", "block"}
 
 SYMBOL_METADATA_FIELD_ORDER: tuple[str, ...] = (
@@ -377,6 +380,11 @@ class ComponentCatalogDomainService:
     _representations: CatalogRepresentations = CatalogRepresentations(
         _revision_kernel, _revision_finalizer
     )
+    _klc_validation: CatalogKlcValidation = CatalogKlcValidation(_revision_kernel, _component_read_models)
+    _release_workflow: CatalogReleaseWorkflow = CatalogReleaseWorkflow(
+        _catalog_locks, _revision_kernel, _component_read_models, _revision_finalizer, _klc_validation
+    )
+    _catalog_health: CatalogHealth = CatalogHealth(_component_queries, _klc_validation)
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -446,6 +454,15 @@ class ComponentCatalogDomainService:
             self._asset_registry,
         )
         self._representations = CatalogRepresentations(self._revision_kernel, self._revision_finalizer)
+        self._klc_validation = CatalogKlcValidation(self._revision_kernel, self._component_read_models)
+        self._release_workflow = CatalogReleaseWorkflow(
+            self._catalog_locks,
+            self._revision_kernel,
+            self._component_read_models,
+            self._revision_finalizer,
+            self._klc_validation,
+        )
+        self._catalog_health = CatalogHealth(self._component_queries, self._klc_validation)
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -2843,197 +2860,28 @@ class ComponentCatalogDomainService:
         return {"component": self.get_component(component_id)}
 
     def _klc_release_gate(self) -> str:
-        gate = settings.CATALOG_KLC_RELEASE_GATE.strip().lower()
-        return gate if gate in KLC_RELEASE_GATE_VALUES else "warn"
+        return self._klc_validation.release_gate()
 
     def _klc_utils_root(self) -> Path:
-        return Path(settings.CATALOG_KLC_UTILS_PATH).expanduser().resolve()
+        return self._klc_validation.utils_root()
 
     def _klc_checker_path(self, asset_type: str) -> Path | None:
-        script = "check_symbol.py" if asset_type == "symbol" else "check_footprint.py" if asset_type == "footprint" else ""
-        if not script:
-            return None
-        path = self._klc_utils_root() / "klc-check" / script
-        return path if path.is_file() else None
+        return self._klc_validation.checker_path(asset_type)
 
     def _klc_tool_version(self) -> str:
-        root = self._klc_utils_root()
-        if not root.exists():
-            return ""
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        return ""
+        return self._klc_validation.tool_version()
 
     def _klc_rule_args(self, asset_type: str) -> list[str]:
-        if asset_type == "symbol":
-            rules = settings.CATALOG_KLC_SYMBOL_RULES.strip()
-            excludes = settings.CATALOG_KLC_SYMBOL_EXCLUDE_RULES.strip()
-        else:
-            rules = settings.CATALOG_KLC_FOOTPRINT_RULES.strip()
-            excludes = settings.CATALOG_KLC_FOOTPRINT_EXCLUDE_RULES.strip()
-        args: list[str] = []
-        if rules:
-            args.extend(["--rule", rules])
-        if excludes:
-            args.extend(["--exclude", excludes])
-        return args
+        return self._klc_validation.rule_args(asset_type)
 
     def _parse_klc_junit(self, junit_path: Path) -> list[dict[str, Any]]:
-        if not junit_path.is_file():
-            return []
-        root = ElementTree.parse(junit_path).getroot()
-        findings: list[dict[str, Any]] = []
-        for testcase in root.iter("testcase"):
-            object_name = str(testcase.attrib.get("name", "")).removesuffix(" - Errors").removesuffix(" - Warnings")
-            testcase_type = str(testcase.attrib.get("type", ""))
-            for failure in testcase.findall("failure"):
-                raw_type = str(failure.attrib.get("type", testcase_type)).upper()
-                if raw_type == "WARNING" or testcase_type == "Warnings":
-                    severity = VALIDATION_SEVERITY_WARNING
-                elif raw_type == "INFO" or testcase_type == "Info":
-                    severity = VALIDATION_SEVERITY_INFO
-                else:
-                    severity = VALIDATION_SEVERITY_ERROR
-                message = str(failure.attrib.get("message") or "").strip()
-                rule_code = message.split(":", 1)[0].strip() if ":" in message else ""
-                text = (failure.text or "").strip()
-                lines = [line.strip() for line in text.splitlines() if line.strip()]
-                rule_url = next((line for line in lines if line.startswith("http://") or line.startswith("https://")), "")
-                details = [line for line in lines if line != message and line != rule_url]
-                findings.append(
-                    {
-                        "severity": severity,
-                        "rule_code": rule_code,
-                        "rule_url": rule_url,
-                        "message": message or text or "KLC finding",
-                        "details": details,
-                        "object_name": object_name,
-                    }
-                )
-        return findings
+        return self._klc_validation.parse_klc_junit(junit_path)
 
-    def _write_validation_report_json(
-        self,
-        path: Path,
-        *,
-        run_id: str,
-        asset: dict[str, Any],
-        status: str,
-        exit_code: int | None,
-        findings: list[dict[str, Any]],
-        stdout: str,
-        stderr: str,
-        tool_version: str,
-        created_at: str,
-        finished_at: str,
-    ) -> None:
-        payload = {
-            "run_id": run_id,
-            "asset_id": str(asset["id"]),
-            "asset_type": str(asset["asset_type"]),
-            "asset_name": str(asset["name"]),
-            "target_library": str(asset["target_library"]),
-            "target_name": str(asset["target_name"]),
-            "status": status,
-            "exit_code": exit_code,
-            "error_count": sum(1 for finding in findings if finding["severity"] == VALIDATION_SEVERITY_ERROR),
-            "warning_count": sum(1 for finding in findings if finding["severity"] == VALIDATION_SEVERITY_WARNING),
-            "tool_version": tool_version,
-            "created_at": created_at,
-            "finished_at": finished_at,
-            "stdout": stdout,
-            "stderr": stderr,
-            "findings": findings,
-        }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    def _write_validation_report_json(self, path: Path, **report: Any) -> None:
+        self._klc_validation.write_validation_report_json(path, **report)
 
-    def _store_validation_run(
-        self,
-        conn: Any,
-        *,
-        run_id: str,
-        component_id: str,
-        revision_id: str,
-        asset: dict[str, Any],
-        status: str,
-        exit_code: int | None,
-        findings: list[dict[str, Any]],
-        report_dir: Path,
-        stdout_path: Path,
-        stderr_path: Path,
-        junit_path: Path,
-        json_path: Path,
-        raw_output: str,
-        tool_version: str,
-        created_at: str,
-        finished_at: str,
-    ) -> dict[str, Any]:
-        error_count = sum(1 for finding in findings if finding["severity"] == VALIDATION_SEVERITY_ERROR)
-        warning_count = sum(1 for finding in findings if finding["severity"] == VALIDATION_SEVERITY_WARNING)
-        conn.execute("DELETE FROM asset_validation_findings WHERE run_id = %s", (run_id,))
-        conn.execute(
-            """
-            INSERT INTO asset_validation_runs (
-                id, component_id, revision_id, asset_id, asset_type, checker_type, status,
-                error_count, warning_count, exit_code, tool_version, report_dir, stdout_path,
-                stderr_path, junit_path, json_path, raw_output, created_at, finished_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                run_id,
-                component_id,
-                revision_id,
-                asset["id"],
-                asset["asset_type"],
-                f"klc_{asset['asset_type']}",
-                status,
-                error_count,
-                warning_count,
-                exit_code,
-                tool_version,
-                str(report_dir),
-                str(stdout_path),
-                str(stderr_path),
-                str(junit_path),
-                str(json_path),
-                raw_output[-20000:],
-                created_at,
-                finished_at,
-            ),
-        )
-        for finding in findings:
-            conn.execute(
-                """
-                INSERT INTO asset_validation_findings (
-                    id, run_id, severity, rule_code, rule_url, message, details_json, object_name, created_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    run_id,
-                    finding["severity"],
-                    finding.get("rule_code", ""),
-                    finding.get("rule_url", ""),
-                    finding["message"],
-                    json.dumps(finding.get("details", [])),
-                    finding.get("object_name", ""),
-                    finished_at,
-                ),
-            )
-        row = conn.execute("SELECT * FROM asset_validation_runs WHERE id = %s", (run_id,)).fetchone()
-        return self._validation_run_payload(dict(row), include_findings=True, conn=conn) if row else {}
+    def _store_validation_run(self, conn: Any, **run: Any) -> dict[str, Any]:
+        return self._klc_validation.store_validation_run(conn, **run)
 
     def _run_klc_for_asset(
         self,
@@ -3043,138 +2891,20 @@ class ComponentCatalogDomainService:
         revision_id: str,
         asset: dict[str, Any],
     ) -> dict[str, Any]:
-        asset_type = str(asset["asset_type"])
-        if asset_type not in {"symbol", "footprint"}:
-            raise ValueError("KLC validation only supports symbol and footprint assets")
-        run_id = str(uuid.uuid4())
-        created_at = _utc_now_iso()
-        report_dir = self.validation_root / run_id
-        report_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = report_dir / "stdout.txt"
-        stderr_path = report_dir / "stderr.txt"
-        junit_path = report_dir / "report.junit.xml"
-        json_path = report_dir / "report.json"
-        checker = self._klc_checker_path(asset_type)
-        tool_version = self._klc_tool_version()
-        findings: list[dict[str, Any]] = []
-        stdout = ""
-        stderr = ""
-        exit_code: int | None = None
-
-        if checker is None:
-            status = VALIDATION_STATUS_SKIPPED
-            stderr = f"KLC checker unavailable under {self._klc_utils_root()}"
-        else:
-            cmd = ["python3", str(checker), str(asset["canonical_path"]), "-vv", "--nocolor", "--junit", str(junit_path)]
-            cmd.extend(self._klc_rule_args(asset_type))
-            if asset_type == "symbol" and settings.CATALOG_KLC_FOOTPRINT_LIB_DIR.strip():
-                cmd.extend(["--footprints", settings.CATALOG_KLC_FOOTPRINT_LIB_DIR.strip()])
-            try:
-                result = subprocess.run(
-                    cmd,
-                    cwd=str(checker.parent),
-                    capture_output=True,
-                    text=True,
-                    timeout=settings.CATALOG_KLC_TIMEOUT_SECONDS,
-                    check=False,
-                )
-                stdout = result.stdout or ""
-                stderr = result.stderr or ""
-                exit_code = result.returncode
-                try:
-                    findings = self._parse_klc_junit(junit_path)
-                except ElementTree.ParseError as exc:
-                    findings = [
-                        {
-                            "severity": VALIDATION_SEVERITY_ERROR,
-                            "rule_code": "",
-                            "rule_url": "",
-                            "message": f"Could not parse KLC JUnit report: {exc}",
-                            "details": [],
-                            "object_name": str(asset["target_name"] or asset["name"]),
-                        }
-                    ]
-                if any(finding["severity"] == VALIDATION_SEVERITY_ERROR for finding in findings) or result.returncode not in {0, 2, 3}:
-                    status = VALIDATION_STATUS_FAILED
-                elif any(finding["severity"] == VALIDATION_SEVERITY_WARNING for finding in findings) or result.returncode == 2:
-                    status = VALIDATION_STATUS_WARNING
-                else:
-                    status = VALIDATION_STATUS_PASSED
-            except subprocess.TimeoutExpired as exc:
-                status = VALIDATION_STATUS_FAILED
-                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-                stderr = f"KLC validation timed out after {settings.CATALOG_KLC_TIMEOUT_SECONDS}s"
-                exit_code = None
-            except OSError as exc:
-                status = VALIDATION_STATUS_FAILED
-                stderr = str(exc)
-                exit_code = None
-
-        finished_at = _utc_now_iso()
-        stdout_path.write_text(stdout, encoding="utf-8")
-        stderr_path.write_text(stderr, encoding="utf-8")
-        if not junit_path.exists():
-            junit_path.write_text("<testsuites />\n", encoding="utf-8")
-        self._write_validation_report_json(
-            json_path,
-            run_id=run_id,
-            asset=asset,
-            status=status,
-            exit_code=exit_code,
-            findings=findings,
-            stdout=stdout,
-            stderr=stderr,
-            tool_version=tool_version,
-            created_at=created_at,
-            finished_at=finished_at,
-        )
-        return self._store_validation_run(
+        return self._klc_validation.run_klc_for_asset(
             conn,
-            run_id=run_id,
+            self._runtime_for_compat(),
             component_id=component_id,
             revision_id=revision_id,
             asset=asset,
-            status=status,
-            exit_code=exit_code,
-            findings=findings,
-            report_dir=report_dir,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            junit_path=junit_path,
-            json_path=json_path,
-            raw_output=f"{stdout}\n{stderr}",
-            tool_version=tool_version,
-            created_at=created_at,
-            finished_at=finished_at,
         )
 
     def validate_component_klc(self, component_id: str) -> dict[str, Any]:
         self.initialize()
-        if not settings.CATALOG_KLC_ENABLED:
-            raise ValueError("KLC validation is disabled")
         with self._connect() as conn:
-            component = self._component_row(conn, component_id)
-            if not component:
-                raise ValueError("Component not found")
-            revision = self._revision_row(conn, str(component["current_revision_id"]))
-            if not revision:
-                raise ValueError("Component revision not found")
-            assets = [
-                asset
-                for asset in self._load_assets_for_revision(conn, str(revision["id"]))
-                if str(asset["asset_type"]) in {"symbol", "footprint"}
-            ]
-            if not assets:
-                raise ValueError("No symbol or footprint assets are attached")
-            runs = [
-                self._run_klc_for_asset(
-                    conn,
-                    component_id=component_id,
-                    revision_id=str(revision["id"]),
-                    asset=asset,
-                )
-                for asset in assets
-            ]
+            component, revision, runs = self._klc_validation.validate_component(
+                conn, self._runtime_for_compat(), component_id
+            )
             conn.commit()
             component_payload = self._component_payload(conn, component, revision)
         return {"component": component_payload, "runs": runs}
@@ -3182,120 +2912,22 @@ class ComponentCatalogDomainService:
     def get_component_validation(self, component_id: str) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            component = self._component_row(conn, component_id)
-            if not component:
-                raise ValueError("Component not found")
-            revision = self._revision_row(conn, str(component["current_revision_id"]))
-            if not revision:
-                raise ValueError("Component revision not found")
-            assets = self._load_assets_for_revision(conn, str(revision["id"]))
-            summary = self._component_validation_summary(conn, str(revision["id"]), assets)
-            run_ids = [
-                str(asset["latest_run"]["id"])
-                for asset in summary["assets"]
-                if asset.get("latest_run")
-            ]
-            inherited_by_run = {
-                str(asset["latest_run"]["id"]): dict(asset["latest_run"])
-                for asset in summary["assets"]
-                if asset.get("latest_run") and asset["latest_run"].get("inherited")
-            }
-            runs = []
-            if run_ids:
-                placeholders = ",".join("%s" for _ in run_ids)
-                rows = conn.execute(
-                    f"SELECT * FROM asset_validation_runs WHERE id IN ({placeholders})",
-                    tuple(run_ids),
-                ).fetchall()
-                for row in rows:
-                    payload = self._validation_run_payload(dict(row), include_findings=True, conn=conn)
-                    inherited = inherited_by_run.get(payload["id"])
-                    if inherited:
-                        payload["inherited"] = True
-                        payload["inherited_from_revision_id"] = inherited.get("inherited_from_revision_id", "")
-                    runs.append(payload)
-        return {"summary": summary, "runs": runs}
+            return self._klc_validation.component_validation(conn, component_id)
 
     def get_validation_run(self, run_id: str) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM asset_validation_runs WHERE id = %s", (run_id,)).fetchone()
-            if not row:
-                return None
-            return self._validation_run_payload(dict(row), include_findings=True, conn=conn)
+            return self._klc_validation.validation_run(conn, run_id)
 
     def validation_report_path(self, run_id: str, report_name: str) -> Path | None:
-        allowed = {
-            "report.json": "json_path",
-            "report.junit.xml": "junit_path",
-            "stdout": "stdout_path",
-            "stderr": "stderr_path",
-        }
-        column = allowed.get(report_name)
-        if not column:
-            return None
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM asset_validation_runs WHERE id = %s", (run_id,)).fetchone()
-            if not row:
-                return None
-            path = Path(str(row[column])).resolve()
-        try:
-            path.relative_to(self.validation_root)
-        except ValueError:
-            return None
-        return path if path.is_file() else None
+            return self._klc_validation.report_path(conn, self._runtime_for_compat(), run_id, report_name)
 
     def catalog_health(self) -> dict[str, Any]:
         self.initialize()
-        validation_counts = {status: 0 for status in (VALIDATION_STATUS_PASSED, VALIDATION_STATUS_WARNING, VALIDATION_STATUS_FAILED, VALIDATION_STATUS_SKIPPED, VALIDATION_STATUS_NOT_RUN)}
-        place_ready = 0
-        released = 0
-        missing_files = 0
-        total_components = 0
-        page = 1
-        page_size = 10000
-        while True:
-            # Lightweight payloads avoid hydrating preview graphs for every component.
-            result = self.list_components(include_inactive=False, page=page, page_size=page_size, lightweight=True)
-            components = result["items"]
-            total_components = int(result["total"])
-            for component in components:
-                validation_counts[component["validation"]["status"]] = validation_counts.get(component["validation"]["status"], 0) + 1
-                if component["availability_state"] == STATE_PLACE_READY:
-                    place_ready += 1
-                else:
-                    missing_files += 1
-                if component["release_status"] == "released":
-                    released += 1
-            if page >= int(result["pages"]):
-                break
-            page += 1
         with self._connect() as conn:
-            preview_failed_row = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM revision_preview_outputs rpo
-                JOIN components c ON c.current_revision_id = rpo.revision_id
-                JOIN asset_preview_versions apv ON apv.id = rpo.preview_id
-                WHERE c.is_active = 1 AND apv.status = %s
-                """,
-                (PREVIEW_STATUS_FAILED,),
-            ).fetchone()
-            preview_failed = int(preview_failed_row["count"] if preview_failed_row else 0)
-        checker_available = bool(self._klc_checker_path("symbol") and self._klc_checker_path("footprint"))
-        return {
-            "enabled": bool(settings.CATALOG_KLC_ENABLED),
-            "checker_available": checker_available,
-            "checker_path": str(self._klc_utils_root()),
-            "release_gate": self._klc_release_gate(),
-            "total_components": total_components,
-            "released": released,
-            "place_ready": place_ready,
-            "missing_files": missing_files,
-            "preview_failed": preview_failed,
-            "validation": validation_counts,
-        }
+            return self._catalog_health.report(conn)
 
     def regenerate_component_previews(self, component_id: str, *, actor: str = "") -> dict[str, Any]:
         self.initialize()
@@ -3320,225 +2952,31 @@ class ComponentCatalogDomainService:
         expected_revision_id: str = "",
         expected_manifest_hash: str = "",
     ) -> dict[str, Any]:
-        release_status = _normalize_workflow_stage(release_status)
-        if release_status not in WORKFLOW_STAGES:
-            raise ValueError("Unsupported release status")
         self.initialize()
         with self._connect() as conn:
-            self._lock_component_for_mutation(conn, component_id)
-            component = self._component_row(conn, component_id)
-            if not component:
-                raise ValueError("Component not found")
-            revision = self._revision_row(conn, str(component["current_revision_id"]))
-            if not revision:
-                raise ValueError("Component revision not found")
-            if expected_revision_id and str(revision["id"]) != expected_revision_id:
-                raise ValueError("Component revision conflict: refresh the component before changing workflow")
-            if expected_manifest_hash and str(revision.get("manifest_hash") or "") != expected_manifest_hash:
-                raise ValueError("Component manifest conflict: refresh the component before changing workflow")
-            current_status = _normalize_workflow_stage(str(revision["release_status"]))
-            if current_status == "released" and release_status == "open":
-                revision = self._clone_revision(
-                    conn,
-                    component_id,
-                    actor=actor,
-                    change_kind="new_draft",
-                    change_summary="Create draft from released revision",
-                )
-                self._finalize_revision(
-                    conn,
-                    component_id=component_id,
-                    revision_id=str(revision["id"]),
-                    event_type="revision.created",
-                    actor=actor,
-                    details={
-                        "change_kind": "new_draft",
-                        "change_summary": "Create draft from released revision",
-                    },
-                )
-                revision = self._revision_row(conn, str(revision["id"])) or revision
-                current_status = _normalize_workflow_stage(str(revision["release_status"]))
-
-            allowed = {
-                "open": {"in_progress", "archived"},
-                "in_progress": {"qa_review", "open", "archived"},
-                "qa_review": {"done", "in_progress", "archived"},
-                "done": {"released", "qa_review", "archived"},
-                "released": {"archived", "open"},
-                "archived": {"open"},
-            }
-            if release_status != current_status and release_status not in allowed.get(current_status, set()):
-                raise ValueError(f"Cannot transition revision from {current_status} to {release_status}")
-            if actor and current_status == "qa_review" and release_status == "in_progress" and not review_note.strip():
-                raise ValueError("A review note is required when requesting changes")
-            if (
-                actor
-                and release_status == "done"
-                and str(revision.get("created_by") or "").casefold() == actor.casefold()
-                and not self_approval_override_reason.strip()
-            ):
-                raise ValueError("Two-person approval required: revision authors cannot approve their own revision")
-            if (
-                release_status in {"done", "released"}
-                and str(component.get("identity_kind") or IDENTITY_KIND_MPN) != IDENTITY_KIND_MPN
-            ):
-                raise ValueError("Provisional components require a manufacturer part number before approval or release")
-
-            assets = self._load_assets_for_revision(conn, revision["id"])
-            validation = self._component_validation_summary(conn, str(revision["id"]), assets)
-            policy_snapshot = {
-                "two_person_approval": True,
-                "klc_release_gate": self._klc_release_gate(),
-            }
-            default_representation = conn.execute(
-                """
-                SELECT symbol_asset_id, footprint_asset_id
-                FROM revision_representations
-                WHERE revision_id = %s AND is_default = 1
-                LIMIT 1
-                """,
-                (revision["id"],),
-            ).fetchone()
-            if release_status == "released" and (
-                not default_representation
-                or not default_representation["symbol_asset_id"]
-                or not default_representation["footprint_asset_id"]
-            ):
-                raise ValueError("Cannot release component without one complete default representation")
-            if release_status == "released" and self._klc_release_gate() == "block":
-                if validation["status"] in {VALIDATION_STATUS_FAILED, VALIDATION_STATUS_SKIPPED, VALIDATION_STATUS_NOT_RUN}:
-                    raise ValueError(
-                        "Cannot release component until required symbol and footprint assets pass KLC validation"
-                    )
-
-            approval_decision = None
-            if release_status == "released":
-                approval_decision = conn.execute(
-                    """
-                    SELECT *
-                    FROM component_review_decisions
-                    WHERE component_id = %s AND revision_id = %s AND manifest_hash = %s
-                      AND decision IN ('approved', 'emergency_override')
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT 1
-                    """,
-                    (component_id, str(revision["id"]), str(revision.get("manifest_hash") or "")),
-                ).fetchone()
-                if actor and not approval_decision:
-                    raise ValueError("Cannot release component without approval evidence for this exact revision")
-
-            now = _utc_now_iso()
-            conn.execute(
-                "UPDATE component_revisions SET release_status = %s, updated_at = %s WHERE id = %s",
-                (release_status, now, revision["id"]),
+            self._release_workflow.set_release_status(
+                conn,
+                self._runtime_for_compat(),
+                component_id,
+                release_status,
+                actor=actor,
+                self_approval_override_reason=self_approval_override_reason,
+                review_note=review_note,
+                actor_role=actor_role,
+                expected_revision_id=expected_revision_id,
+                expected_manifest_hash=expected_manifest_hash,
             )
-            if release_status == "released":
-                conn.execute(
-                    "UPDATE components SET released_revision_id = %s, updated_at = %s WHERE id = %s",
-                    (revision["id"], now, component_id),
-                )
-            elif release_status == "archived":
-                if str(component.get("released_revision_id") or "") == str(revision["id"]):
-                    conn.execute(
-                        "UPDATE components SET released_revision_id = '', updated_at = %s WHERE id = %s",
-                        (now, component_id),
-                    )
-                else:
-                    conn.execute("UPDATE components SET updated_at = %s WHERE id = %s", (now, component_id))
-            else:
-                conn.execute("UPDATE components SET updated_at = %s WHERE id = %s", (now, component_id))
-            if release_status != current_status:
-                decision = ""
-                if current_status == "qa_review" and release_status == "done":
-                    decision = "emergency_override" if self_approval_override_reason.strip() else "approved"
-                elif current_status == "qa_review" and release_status == "in_progress":
-                    decision = "changes_requested"
-                elif current_status == "done" and release_status == "released":
-                    decision = "released"
-                elif release_status == "archived":
-                    decision = "archived"
-                if decision:
-                    conn.execute(
-                        """
-                        INSERT INTO component_review_decisions (
-                            id, component_id, revision_id, reviewer, reviewer_role, decision, note,
-                            manifest_hash, validation_json, policy_json, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            component_id,
-                            str(revision["id"]),
-                            actor,
-                            actor_role,
-                            decision,
-                            self_approval_override_reason.strip() or review_note.strip(),
-                            str(revision.get("manifest_hash") or ""),
-                            json.dumps(validation, sort_keys=True, separators=(",", ":")),
-                            json.dumps(policy_snapshot, sort_keys=True, separators=(",", ":")),
-                            now,
-                        ),
-                    )
-                if release_status == "released":
-                    conn.execute(
-                        """
-                        INSERT INTO component_release_records (
-                            id, component_id, revision_id, release_label, manifest_hash, released_by,
-                            approval_decision_id, validation_json, policy_json, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT(component_id, revision_id, manifest_hash) DO NOTHING
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            component_id,
-                            str(revision["id"]),
-                            f"r{int(revision['version'])}",
-                            str(revision.get("manifest_hash") or ""),
-                            actor,
-                            str(approval_decision["id"]) if approval_decision else "",
-                            json.dumps(validation, sort_keys=True, separators=(",", ":")),
-                            json.dumps(policy_snapshot, sort_keys=True, separators=(",", ":")),
-                            now,
-                        ),
-                    )
-                self._append_audit_event(
-                    conn,
-                    component_id=component_id,
-                    revision_id=str(revision["id"]),
-                    event_type="workflow.transitioned",
-                    actor=actor,
-                    details={
-                        "from": current_status,
-                        "to": release_status,
-                        "self_approval_override_reason": self_approval_override_reason.strip(),
-                        "review_note": review_note.strip(),
-                    },
-                )
             conn.commit()
         return self.get_component(component_id) or {}
 
     def deactivate_component(self, component_id: str, *, actor: str = "", reason: str = "") -> bool:
         self.initialize()
         with self._connect() as conn:
-            component = self._component_row(conn, component_id)
-            if not component:
-                return False
-            if not bool(component["is_active"]):
-                return True
-            result = conn.execute(
-                "UPDATE components SET is_active = 0, updated_at = %s WHERE id = %s",
-                (_utc_now_iso(), component_id),
-            )
-            self._append_audit_event(
-                conn,
-                component_id=component_id,
-                revision_id=str(component.get("current_revision_id") or ""),
-                event_type="component.retired",
-                actor=actor,
-                details={"reason": reason.strip() or "Removed from the active component catalog"},
+            deactivated = self._release_workflow.deactivate_component(
+                conn, component_id, actor=actor, reason=reason
             )
             conn.commit()
-            return result.rowcount > 0
+            return deactivated
 
     def delete_component(self, component_id: str, *, actor: str = "", reason: str = "") -> bool:
         # Component identity, revisions, releases, usage, and audit evidence are never
