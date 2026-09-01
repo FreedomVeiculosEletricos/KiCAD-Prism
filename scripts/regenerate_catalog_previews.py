@@ -383,7 +383,7 @@ def _relink_components(
     commit_batch: int,
     limit: int,
 ) -> None:
-    from app.services.component_catalog_domain import _utc_now_iso  # noqa: PLC0415
+    from app.services.catalog.normalization import utc_now_iso  # noqa: PLC0415
 
     component_ids = _load_target_components(conn, limit=limit)
     stats.components_seen = len(component_ids)
@@ -396,7 +396,7 @@ def _relink_components(
             if not component:
                 continue
             revision_id = str(component["current_revision_id"])
-            changed = _relink_revision_preview_outputs(service, conn, revision_id, now=_utc_now_iso())
+            changed = _relink_revision_preview_outputs(service, conn, revision_id, now=utc_now_iso())
             if changed:
                 stats.components_relinked += 1
             pending += 1

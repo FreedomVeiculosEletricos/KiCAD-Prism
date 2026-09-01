@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any
+
+
+def slugify(value: str, default: str = "component") -> str:
+    return (
+        re.sub(r"[^a-zA-Z0-9._-]+", "-", (value or "").strip().lower()).strip("._-")
+        or default
+    )
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def json_loads(value: Any, default: Any) -> Any:
@@ -61,6 +73,8 @@ def preview_unit_label(kind: str) -> str:
 
 
 __all__ = [
+    "slugify",
+    "utc_now_iso",
     "json_loads",
     "canonical_json",
     "sha256_text",

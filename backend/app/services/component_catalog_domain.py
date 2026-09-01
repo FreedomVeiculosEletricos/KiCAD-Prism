@@ -73,6 +73,8 @@ from app.services.catalog.normalization import (
     preview_unit_label as _preview_unit_label,
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_file,
+    slugify as _slugify,
+    utc_now_iso as _utc_now_iso,
 )
 from app.services.catalog.project_import_sessions import CatalogProjectImportSessions
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
@@ -175,15 +177,6 @@ class CatalogPreview:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _utc_now_iso() -> str:
-    return _utc_now().isoformat()
-
-
-def _slugify(value: str, default: str = "component") -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", (value or "").strip().lower()).strip("._-")
-    return cleaned or default
 
 
 def _sanitize_name(value: str, default: str) -> str:

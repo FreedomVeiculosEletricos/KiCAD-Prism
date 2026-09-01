@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.config import settings
+from app.services.catalog.metadata_normalization import IDENTITY_KIND_MPN
 from app.services.catalog.normalization import (
     json_loads,
     preview_base_kind,
@@ -15,7 +16,6 @@ from app.services.catalog.revision_kernel import CatalogRevisionKernel, normaliz
 
 
 PREVIEW_STATUS_READY = "ready"
-IDENTITY_KIND_MPN = "mpn"
 PLACE_REQUIRED_ASSET_TYPES = ("symbol", "footprint")
 
 STATE_METADATA_ONLY = "metadata_only"

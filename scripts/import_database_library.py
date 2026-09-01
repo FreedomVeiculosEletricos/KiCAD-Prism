@@ -36,21 +36,20 @@ MAX_REPORTED_ERRORS = 100
 
 def _load_catalog_runtime() -> None:
     global ComponentCatalogService
-    global _discover_footprint_name_in_text
-    global _sanitize_name
-    global _utc_now_iso
-
-    global _slugify
+    global _discover_footprint_name_in_text, _sanitize_name
+    global _utc_now_iso, _slugify
 
     try:
         from app.services.component_catalog_domain import (  # noqa: PLC0415
             _discover_footprint_name_in_text as loaded_discover_footprint_name,
             _sanitize_name as loaded_sanitize_name,
-            _slugify as loaded_slugify,
-            _utc_now_iso as loaded_utc_now_iso,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
+        )
+        from app.services.catalog.normalization import (  # noqa: PLC0415
+            slugify as loaded_slugify,
+            utc_now_iso as loaded_utc_now_iso,
         )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
