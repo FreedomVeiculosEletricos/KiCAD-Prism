@@ -95,14 +95,14 @@ def _load_catalog_runtime() -> None:
     global _utc_now_iso
 
     try:
-        from app.services.component_catalog_domain import (  # noqa: PLC0415
-            _discover_footprint_name_in_text as loaded_discover_footprint_name,
-            _sanitize_name as loaded_sanitize_name,
+        from app.services.catalog.asset_files import (  # noqa: PLC0415
+            discover_footprint_name_in_text as loaded_discover_footprint_name,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
         )
         from app.services.catalog.normalization import (  # noqa: PLC0415
+            sanitize_name as loaded_sanitize_name,
             slugify as loaded_slugify,
             utc_now_iso as loaded_utc_now_iso,
         )
@@ -402,7 +402,8 @@ def _register_asset(
     runtime_store_root: Path | None,
 ) -> dict[str, Any]:
     local_path = canonical_path.resolve()
-    asset = service._register_asset(  # type: ignore[attr-defined]
+    asset = service.asset_registry.register_asset(
+        service.runtime,
         conn,
         asset_type=asset_type,
         canonical_path=local_path,
@@ -636,7 +637,7 @@ def _import_plans(
             footprint_key = (plan.target_library, plan.target_name)
             cached = footprint_assets.get(footprint_key)
             if cached is None:
-                destination = service._footprint_destination(*footprint_key)  # type: ignore[attr-defined]
+                destination = service.asset_files.footprint_destination(service.runtime, *footprint_key)
                 local_footprint = _write_or_copy(destination, plan.source_path, overwrite=overwrite_assets)
                 footprint_asset = _register_asset(
                     service,
@@ -657,8 +658,8 @@ def _import_plans(
             if plan.model_path is not None:
                 model_asset = model_assets.get(plan.model_path)
                 if model_asset is None:
-                    destination = service._aux_destination(  # type: ignore[attr-defined]
-                        "3dmodel", plan.target_library, plan.model_path.name
+                    destination = service.asset_files.aux_destination(
+                        service.runtime, "3dmodel", plan.target_library, plan.model_path.name
                     )
                     canonical = _write_or_copy(destination, plan.model_path, overwrite=overwrite_assets)
                     model_asset = _register_asset(
@@ -709,7 +710,8 @@ def _import_plans(
             if generate_previews:
                 preview_asset = dict(footprint_asset)
                 preview_asset["canonical_path"] = str(local_footprint)
-                preview = service._ensure_asset_preview(conn, preview_asset)  # type: ignore[attr-defined]
+                previews = service.previews.ensure_asset_previews(conn, service.runtime, preview_asset)
+                preview = previews[0] if previews else {}
                 if preview and str(preview.get("status") or "") == "ready" and preview.get("id"):
                     _bind_preview(conn, revision_id, str(footprint_asset["id"]), preview, now)
                     stats.previews_generated += 1
@@ -721,12 +723,12 @@ def _import_plans(
                         f"{(preview or {}).get('generation_error') or 'no preview produced'}",
                     )
 
-            manifest_hash = service._revision_manifest_hash(conn, revision_id)  # type: ignore[attr-defined]
+            manifest_hash = service.revisions.revision_manifest_hash(conn, revision_id)
             conn.execute(
                 "UPDATE component_revisions SET manifest_hash = %s, updated_at = %s WHERE id = %s",
                 (manifest_hash, now, revision_id),
             )
-            service._append_audit_event(  # type: ignore[attr-defined]
+            service.revisions.append_audit_event(
                 conn,
                 component_id=component_id,
                 revision_id=revision_id,
@@ -840,7 +842,7 @@ def main() -> int:
                     stats.models_unresolved += 1
         else:
             service.initialize()
-            conn_context = service._connect()  # type: ignore[attr-defined]
+            conn_context = service.connection()
             conn = conn_context.__enter__()
             _begin_import_transaction(conn)
             _import_plans(

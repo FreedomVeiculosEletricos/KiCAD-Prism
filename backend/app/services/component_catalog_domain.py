@@ -3,21 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import io
 import json
 import logging
-import mimetypes
-import os
 import re
 import shutil
 import subprocess
-import tempfile
-import threading
 import time
 import uuid
-import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -34,6 +27,23 @@ from app.services.catalog.component_read_models import (
     supply_source_payload as _supply_source_payload,
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
+from app.services.catalog.asset_browser import CatalogAssetBrowser
+from app.services.catalog.asset_files import (
+    CatalogAssetFiles,
+    content_type_for_asset as _content_type_for_asset,
+    discover_footprint_name_in_text as _discover_footprint_name_in_text,
+    discover_symbol_names_in_text as _discover_symbol_names_in_text,
+)
+from app.services.catalog.asset_imports import CatalogAssetImports
+from app.services.catalog.asset_links import CatalogAssetLinks
+from app.services.catalog.asset_registry import CatalogAssetRegistry
+from app.services.catalog.asset_types import (
+    PLACE_REQUIRED_ASSET_TYPES,
+    PREVIEW_KIND_FOOTPRINT,
+    PREVIEW_KIND_SYMBOL,
+    SUPPORTED_ASSET_TYPES,
+)
+from app.services.catalog.kicad_cli import KicadCliRunner
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
 from app.services.catalog.metadata_batch_application import CatalogMetadataBatchApplication
 from app.services.catalog.metadata_batches import CatalogMetadataBatches
@@ -73,6 +83,7 @@ from app.services.catalog.normalization import (
     preview_unit_label as _preview_unit_label,
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_file,
+    sanitize_name as _sanitize_name,
     slugify as _slugify,
     utc_now_iso as _utc_now_iso,
 )
@@ -80,7 +91,20 @@ from app.services.catalog.project_import_sessions import CatalogProjectImportSes
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
 from app.services.catalog.project_import_assets import CatalogProjectImportAssets
 from app.services.catalog.project_import_acceptance import CatalogProjectImportAcceptance
+from app.services.catalog.preview_pipeline import (
+    CatalogPreview,
+    CatalogPreviewPipeline,
+    PREVIEW_PIPELINE_VERSION,
+)
+from app.services.catalog.preview_renderer import (
+    CatalogPreviewRenderer,
+    PREVIEW_STATUS_FAILED,
+    PREVIEW_STATUS_READY,
+)
+from app.services.catalog.preview_store import CatalogPreviewStore
+from app.services.catalog.representations import CatalogRepresentations
 from app.services.catalog.revision_comparison import CatalogRevisionComparison
+from app.services.catalog.revision_finalization import CatalogRevisionFinalizer
 from app.services.catalog.revision_kernel import (
     CatalogRevisionKernel,
     LEGACY_WORKFLOW_STAGE_MAP,
@@ -98,16 +122,8 @@ from app.services.catalog.runtime import (
 
 logger = logging.getLogger(__name__)
 
-PREVIEW_KIND_SYMBOL = "symbol"
-PREVIEW_KIND_FOOTPRINT = "footprint"
-PREVIEW_STATUS_READY = "ready"
-PREVIEW_STATUS_FAILED = "failed"
-PREVIEW_PIPELINE_VERSION = "prism-preview-a2-multi-unit"
-
 SOURCE_MANUAL = "manual"
 SOURCE_EXTERNAL = "external"
-SUPPORTED_ASSET_TYPES = ("symbol", "footprint", "3dmodel", "spice")
-PLACE_REQUIRED_ASSET_TYPES = ("symbol", "footprint")
 RELEASE_STATES = WORKFLOW_STAGES
 
 STATE_METADATA_ONLY = "metadata_only"
@@ -160,29 +176,8 @@ DBL_COMMON_COLUMNS: tuple[str, ...] = (
 _TOP_LEVEL_PROPERTY_RE = re.compile(r'^([ \t]+)\(property "([^"]+)" ')
 
 
-@dataclass
-class CatalogPreview:
-    preview_id: str
-    component_id: str
-    kind: str
-    status: str
-    content_type: str
-    file_path: str
-    generation_error: str
-
-    @property
-    def id(self) -> str:
-        return self.preview_id
-
-
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _sanitize_name(value: str, default: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in (value or "").strip())
-    cleaned = cleaned.strip("._-")
-    return cleaned or default
 
 
 def _remote_library_nickname(library_name: str) -> str:
@@ -326,32 +321,6 @@ def _rewrite_footprint_payload(
     return text.encode("utf-8")
 
 
-def _discover_symbol_names_in_text(text: str) -> list[str]:
-    matches = re.findall(r'\(symbol\s+"([^"]+)"', text)
-    filtered = [name for name in matches if not re.search(r"_\d+_\d+$", name)]
-    return dedupe(filtered or matches)
-
-
-def _discover_footprint_name_in_text(text: str) -> str:
-    match = re.search(r'\(footprint\s+"([^"]+)"', text)
-    return match.group(1) if match else ""
-
-
-def _content_type_for_asset(asset_type: str, file_path: Path) -> str:
-    if asset_type == "symbol":
-        return "application/x-kicad-symbol"
-    if asset_type == "footprint":
-        return "application/x-kicad-footprint"
-    if asset_type == "3dmodel":
-        return "model/step"
-    if asset_type == "spice":
-        if file_path.suffix.lower() in {".lib", ".mod", ".mdl"}:
-            return "application/x-spice"
-        return "application/octet-stream"
-    guessed, _ = mimetypes.guess_type(file_path.name)
-    return guessed or "application/octet-stream"
-
-
 def _release_allows_remote(release_status: str) -> bool:
     return release_status == "released"
 
@@ -388,6 +357,26 @@ class ComponentCatalogDomainService:
     _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
     _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
     _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
+    _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
+    _asset_files: CatalogAssetFiles = CatalogAssetFiles()
+    _asset_registry: CatalogAssetRegistry = CatalogAssetRegistry()
+    _preview_renderer: CatalogPreviewRenderer = CatalogPreviewRenderer()
+    _preview_store: CatalogPreviewStore = CatalogPreviewStore()
+    _preview_pipeline: CatalogPreviewPipeline = CatalogPreviewPipeline(
+        _catalog_locks, _revision_kernel, _component_read_models, _preview_renderer, _preview_store
+    )
+    _revision_finalizer: CatalogRevisionFinalizer = CatalogRevisionFinalizer(
+        _revision_kernel, _preview_pipeline
+    )
+    _asset_links: CatalogAssetLinks = CatalogAssetLinks(
+        _revision_kernel, _preview_pipeline, _revision_finalizer
+    )
+    _asset_imports: CatalogAssetImports = CatalogAssetImports(
+        _revision_kernel, _asset_links, _revision_finalizer, _asset_files, _asset_registry
+    )
+    _representations: CatalogRepresentations = CatalogRepresentations(
+        _revision_kernel, _revision_finalizer
+    )
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -412,6 +401,12 @@ class ComponentCatalogDomainService:
         self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
         self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
         self._component_queries = CatalogComponentQueries(self._component_read_models)
+        self._asset_browser = CatalogAssetBrowser()
+        self._asset_files = CatalogAssetFiles()
+        self._asset_registry = CatalogAssetRegistry()
+        self._preview_renderer = CatalogPreviewRenderer()
+        self._preview_store = CatalogPreviewStore()
+        self._compose_revision_writers()
         self._project_import_sessions = CatalogProjectImportSessions()
         self._project_import_matching = CatalogProjectImportMatching()
         self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
@@ -424,6 +419,33 @@ class ComponentCatalogDomainService:
         self._metadata_batches = CatalogMetadataBatches()
         self._metadata_batch_staging = CatalogMetadataBatchStaging()
         self._metadata_batch_application = CatalogMetadataBatchApplication()
+
+    def _compose_revision_writers(self) -> None:
+        """Wire the collaborators that write revisions on top of this instance's kernel.
+
+        The PostgreSQL subclass swaps in transactional locks and a fresh kernel
+        after ``super().__init__``; it calls this again so every writer shares
+        that kernel instead of the no-op base wiring.
+        """
+        self._preview_pipeline = CatalogPreviewPipeline(
+            self._catalog_locks,
+            self._revision_kernel,
+            self._component_read_models,
+            self._preview_renderer,
+            self._preview_store,
+        )
+        self._revision_finalizer = CatalogRevisionFinalizer(self._revision_kernel, self._preview_pipeline)
+        self._asset_links = CatalogAssetLinks(
+            self._revision_kernel, self._preview_pipeline, self._revision_finalizer
+        )
+        self._asset_imports = CatalogAssetImports(
+            self._revision_kernel,
+            self._asset_links,
+            self._revision_finalizer,
+            self._asset_files,
+            self._asset_registry,
+        )
+        self._representations = CatalogRepresentations(self._revision_kernel, self._revision_finalizer)
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -476,104 +498,64 @@ class ComponentCatalogDomainService:
         self._runtime_for_compat().close()
 
     def _ensure_storage_dirs(self) -> None:
-        for path in (
-            self._store_root / "symbols",
-            self._store_root / "footprints",
-            self._store_root / "3dmodels",
-            self._store_root / "spice",
-            self._store_root / "previews" / "symbols",
-            self._store_root / "previews" / "footprints",
-            self._store_root / "revisions",
-            self.export_root,
-            self.validation_root,
-        ):
-            path.mkdir(parents=True, exist_ok=True)
+        self._runtime_for_compat().ensure_storage_dirs()
 
     @contextmanager
     def _connect(self) -> Iterator[Any]:
         raise NotImplementedError("Catalog persistence must provide a PostgreSQL connection")
         yield  # pragma: no cover
 
+    @contextmanager
+    def connection(self) -> Iterator[Any]:
+        """Supported connection scope for maintenance scripts and repository callers.
+
+        The caller owns the transaction: commit or roll back before leaving the
+        block.  Package collaborators accept this connection alongside
+        ``runtime`` so scripts do not need the service's private helpers.
+        """
+        with self._connect() as conn:
+            yield conn
+
+    @property
+    def runtime(self) -> CatalogRuntime:
+        """Paths and process-local caches shared with the catalog package."""
+        return self._runtime_for_compat()
+
+    @property
+    def revisions(self) -> CatalogRevisionKernel:
+        return self._revision_kernel
+
+    @property
+    def asset_files(self) -> CatalogAssetFiles:
+        return self._asset_files
+
+    @property
+    def asset_registry(self) -> CatalogAssetRegistry:
+        return self._asset_registry
+
+    @property
+    def previews(self) -> CatalogPreviewPipeline:
+        return self._preview_pipeline
 
     def _resolve_kicad_cli(self) -> str | None:
-        runtime = self._catalog_runtime
-        if runtime.kicad_cli and Path(runtime.kicad_cli).exists():
-            return runtime.kicad_cli
-        candidates = (
-            shutil.which("kicad-cli"),
-            "/usr/bin/kicad-cli",
-            "/usr/local/bin/kicad-cli",
-            "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",
-            os.path.expanduser("~/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
-        )
-        for candidate in candidates:
-            if candidate and Path(candidate).exists():
-                runtime.kicad_cli = str(candidate)
-                return runtime.kicad_cli
-        return None
+        return KicadCliRunner.resolve(self._runtime_for_compat())
 
     def _run_kicad_cli(self, args: list[str]) -> tuple[bool, str]:
-        cli = self._resolve_kicad_cli()
-        if not cli:
-            return False, "kicad-cli is not available in the backend runtime"
-        try:
-            result = subprocess.run([cli, *args], capture_output=True, text=True, timeout=60, check=False)
-        except subprocess.TimeoutExpired:
-            return False, "kicad-cli timed out after 60 seconds"
-        if result.returncode != 0:
-            return False, (result.stderr or result.stdout or f"kicad-cli exited with code {result.returncode}").strip()
-        return True, ""
+        return KicadCliRunner.run(self._runtime_for_compat(), args)
 
     def _preview_output_path(self, asset_id: str, kind: str) -> Path:
-        bucket = "symbols" if kind == PREVIEW_KIND_SYMBOL else "footprints"
-        return self._store_root / "previews" / bucket / f"{asset_id}.svg"
+        return self._preview_pipeline.preview_output_path(self._runtime_for_compat(), asset_id, kind)
 
     def _preview_version_path(self, asset_id: str, kind: str, sha256: str) -> Path:
-        bucket = "symbols" if _preview_base_kind(kind) == PREVIEW_KIND_SYMBOL else "footprints"
-        return self._store_root / "previews" / "versions" / bucket / asset_id / f"{sha256}.svg"
+        return self._preview_pipeline.preview_version_path(
+            self._runtime_for_compat(), asset_id, kind, sha256
+        )
 
     def _preview_generator_identity(self, kind: str) -> dict[str, str]:
-        cli = self._resolve_kicad_cli()
-        if not cli:
-            version = "unavailable"
-        elif self._catalog_runtime.kicad_cli_version is not None:
-            version = self._catalog_runtime.kicad_cli_version
-        else:
-            try:
-                result = subprocess.run(
-                    [cli, "--version"], capture_output=True, text=True, timeout=10, check=False
-                )
-                version = (result.stdout or result.stderr or "unknown").strip() or "unknown"
-            except (OSError, subprocess.TimeoutExpired):
-                version = "unknown"
-            self._catalog_runtime.kicad_cli_version = version
-        canonical = json.dumps(
-            {
-                "generator_name": "kicad-cli",
-                "generator_version": version,
-                "pipeline_version": PREVIEW_PIPELINE_VERSION,
-                "kind": kind,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return {
-            "generator_name": "kicad-cli",
-            "generator_version": version,
-            "pipeline_version": PREVIEW_PIPELINE_VERSION,
-            "generator_fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        }
+        return self._preview_pipeline.generator_identity(self._runtime_for_compat(), kind)
 
     def _asset_root(self, asset_type: str) -> Path:
-        mapping = {
-            "symbol": self._store_root / "symbols",
-            "footprint": self._store_root / "footprints",
-            "3dmodel": self._store_root / "3dmodels",
-            "spice": self._store_root / "spice",
-        }
-        if asset_type not in mapping:
-            raise ValueError("Unsupported asset type")
-        return mapping[asset_type]
+        return self._asset_files.asset_root(self._runtime_for_compat(), asset_type)
 
     def _unique_slug(self, conn: Any, base: str) -> str:
         self._catalog_locks.lock_slug_allocation(conn, base)
@@ -685,19 +667,14 @@ class ComponentCatalogDomainService:
         actor: str = "",
         details: dict[str, Any] | None = None,
     ) -> None:
-        self._refresh_revision_preview_outputs_in_conn(conn, revision_id)
-        manifest_hash = self._revision_manifest_hash(conn, revision_id)
-        conn.execute(
-            "UPDATE component_revisions SET manifest_hash = %s, updated_at = %s WHERE id = %s",
-            (manifest_hash, _utc_now_iso(), revision_id),
-        )
-        self._append_audit_event(
+        self._revision_finalizer.finalize_revision(
             conn,
+            self._runtime_for_compat(),
             component_id=component_id,
             revision_id=revision_id,
             event_type=event_type,
             actor=actor,
-            details={**(details or {}), "manifest_hash": manifest_hash},
+            details=details,
         )
 
     def _clone_revision(
@@ -860,23 +837,7 @@ class ComponentCatalogDomainService:
     def catalog_preview_path(self, preview_id: str) -> tuple[Path, str] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT file_path, content_type FROM asset_preview_versions WHERE id = %s AND status = %s",
-                (preview_id, PREVIEW_STATUS_READY),
-            ).fetchone()
-            if not row:
-                row = conn.execute(
-                    "SELECT file_path, content_type FROM asset_previews WHERE id = %s AND status = %s",
-                    (preview_id, PREVIEW_STATUS_READY),
-                ).fetchone()
-        if not row:
-            return None
-        path = Path(str(row["file_path"] or "")).resolve()
-        try:
-            path.relative_to((self._store_root / "previews").resolve())
-        except ValueError:
-            return None
-        return (path, str(row["content_type"] or "image/svg+xml")) if path.is_file() else None
+            return self._preview_pipeline.preview_path(conn, self._runtime_for_compat(), preview_id)
 
     def catalog_asset_source(self, asset_id: str) -> tuple[Path, str, str] | None:
         """One asset's stored bytes, as written -- not the placement rewrite.
@@ -886,33 +847,10 @@ class ComponentCatalogDomainService:
         carries rewritten 3D-model paths. Those rewrites exist for placement.
         A renderer wants the file as the library holds it, so this resolves the
         canonical path instead of materialising a payload.
-
-        Returns ``(path, content_type, filename)``, or ``None`` when the asset
-        is unknown or its file is missing.
         """
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT canonical_path, asset_type FROM assets WHERE id = %s",
-                (asset_id,),
-            ).fetchone()
-        if not row:
-            return None
-        path = Path(str(row["canonical_path"] or "")).resolve()
-        # Every asset root is a child of the store root. Confining the resolved
-        # path keeps a stored value that escaped the store -- or a row written
-        # by an older import -- from turning this into an arbitrary file read.
-        try:
-            path.relative_to(self._store_root.resolve())
-        except ValueError:
-            return None
-        if not path.is_file():
-            return None
-        return (
-            path,
-            _content_type_for_asset(str(row["asset_type"] or ""), path),
-            path.name,
-        )
+            return self._asset_imports.asset_source(conn, self._runtime_for_compat(), asset_id)
 
     def create_project_import_session(
         self,
@@ -1678,22 +1616,7 @@ class ComponentCatalogDomainService:
     def _representation_asset_id(
         self, conn: Any, revision_id: str, asset_id: str, expected_type: str
     ) -> str | None:
-        value = str(asset_id or "").strip()
-        if not value:
-            return None
-        row = conn.execute(
-            """
-            SELECT asset.id
-            FROM revision_assets link
-            JOIN assets asset ON asset.id = link.asset_id
-            WHERE link.revision_id = %s AND asset.id = %s
-              AND link.asset_type = %s AND asset.asset_type = %s
-            """,
-            (revision_id, value, expected_type, expected_type),
-        ).fetchone()
-        if not row:
-            raise ValueError(f"{expected_type} asset is not attached to this revision")
-        return value
+        return self._representations.representation_asset_id(conn, revision_id, asset_id, expected_type)
 
     def create_representation(
         self,
@@ -1712,62 +1635,20 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            revision = self._clone_revision(
+            self._representations.create_representation(
                 conn,
+                self._runtime_for_compat(),
                 component_id,
-                actor=actor,
-                change_kind="representation",
-                change_summary=change_summary,
+                label=label,
+                symbol_asset_id=symbol_asset_id,
+                footprint_asset_id=footprint_asset_id,
+                display_order=display_order,
+                make_default=make_default,
+                source_internal_part_number=source_internal_part_number,
+                provenance=provenance,
                 expected_revision_id=expected_revision_id,
-            )
-            revision_id = str(revision["id"])
-            symbol_id = self._representation_asset_id(conn, revision_id, symbol_asset_id, "symbol")
-            footprint_id = self._representation_asset_id(conn, revision_id, footprint_asset_id, "footprint")
-            existing_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS total FROM revision_representations WHERE revision_id = %s",
-                    (revision_id,),
-                ).fetchone()["total"]
-            )
-            duplicate = conn.execute(
-                """
-                SELECT 1 FROM revision_representations
-                WHERE revision_id = %s
-                  AND symbol_asset_id IS NOT DISTINCT FROM %s
-                  AND footprint_asset_id IS NOT DISTINCT FROM %s
-                """,
-                (revision_id, symbol_id, footprint_id),
-            ).fetchone()
-            if duplicate:
-                raise ValueError("This symbol-footprint pair already has a representation")
-            is_default = bool(make_default or existing_count == 0)
-            if is_default:
-                conn.execute(
-                    "UPDATE revision_representations SET is_default = 0, updated_at = %s WHERE revision_id = %s",
-                    (_utc_now_iso(), revision_id),
-                )
-            now = _utc_now_iso()
-            conn.execute(
-                """
-                INSERT INTO revision_representations (
-                    id, revision_id, label, symbol_asset_id, footprint_asset_id, is_default,
-                    display_order, source_internal_part_number, provenance_json, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    str(uuid.uuid4()), revision_id, label.strip() or "Representation",
-                    symbol_id, footprint_id, 1 if is_default else 0, int(display_order),
-                    source_internal_part_number.strip(),
-                    json.dumps(provenance or {}, sort_keys=True, separators=(",", ":")), now, now,
-                ),
-            )
-            self._finalize_revision(
-                conn,
-                component_id=component_id,
-                revision_id=revision_id,
-                event_type="revision.created",
                 actor=actor,
-                details={"change_kind": "representation", "change_summary": change_summary},
+                change_summary=change_summary,
             )
             conn.commit()
         return self.get_component(component_id) or {}
@@ -1775,16 +1656,7 @@ class ComponentCatalogDomainService:
     def _current_representation_row(
         self, conn: Any, component_id: str, representation_id: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        _, revision = self._active_revision_row(conn, component_id, released=False)
-        if not revision:
-            raise ValueError("Component not found")
-        row = conn.execute(
-            "SELECT * FROM revision_representations WHERE id = %s AND revision_id = %s",
-            (representation_id, revision["id"]),
-        ).fetchone()
-        if not row:
-            raise ValueError("Representation was not found on the current revision")
-        return revision, dict(row)
+        return self._representations.current_representation_row(conn, component_id, representation_id)
 
     def update_representation(
         self,
@@ -1798,58 +1670,15 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            current, original = self._current_representation_row(conn, component_id, representation_id)
-            if str(current["id"]) != expected_revision_id:
-                raise ValueError("Component revision conflict: refresh the component before saving")
-            revision = self._clone_revision(
-                conn, component_id, actor=actor, change_kind="representation",
-                change_summary=change_summary, expected_revision_id=expected_revision_id,
-            )
-            revision_id = str(revision["id"])
-            cloned = conn.execute(
-                """
-                SELECT * FROM revision_representations
-                WHERE revision_id = %s
-                  AND symbol_asset_id IS NOT DISTINCT FROM %s
-                  AND footprint_asset_id IS NOT DISTINCT FROM %s
-                ORDER BY display_order, id LIMIT 1
-                """,
-                (revision_id, original["symbol_asset_id"], original["footprint_asset_id"]),
-            ).fetchone()
-            if not cloned:
-                raise ValueError("Cloned representation could not be resolved")
-            symbol_id = self._representation_asset_id(
-                conn, revision_id, str(updates.get("symbol_asset_id", cloned["symbol_asset_id"]) or ""), "symbol"
-            )
-            footprint_id = self._representation_asset_id(
-                conn, revision_id, str(updates.get("footprint_asset_id", cloned["footprint_asset_id"]) or ""), "footprint"
-            )
-            make_default = bool(updates.get("is_default", cloned["is_default"]))
-            if bool(cloned["is_default"]) and "is_default" in updates and not make_default:
-                raise ValueError("The default representation cannot be unset; make another representation default")
-            now = _utc_now_iso()
-            if make_default:
-                conn.execute(
-                    "UPDATE revision_representations SET is_default = 0, updated_at = %s WHERE revision_id = %s",
-                    (now, revision_id),
-                )
-            conn.execute(
-                """
-                UPDATE revision_representations
-                SET label = %s, symbol_asset_id = %s, footprint_asset_id = %s,
-                    is_default = %s, display_order = %s, updated_at = %s
-                WHERE id = %s
-                """,
-                (
-                    str(updates.get("label", cloned["label"]) or "Representation").strip(),
-                    symbol_id, footprint_id, 1 if make_default else 0,
-                    int(updates.get("display_order", cloned["display_order"])), now, cloned["id"],
-                ),
-            )
-            self._finalize_revision(
-                conn, component_id=component_id, revision_id=revision_id,
-                event_type="revision.created", actor=actor,
-                details={"change_kind": "representation", "change_summary": change_summary},
+            self._representations.update_representation(
+                conn,
+                self._runtime_for_compat(),
+                component_id,
+                representation_id,
+                updates=updates,
+                expected_revision_id=expected_revision_id,
+                actor=actor,
+                change_summary=change_summary,
             )
             conn.commit()
         return self.get_component(component_id) or {}
@@ -1864,41 +1693,13 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            current, original = self._current_representation_row(conn, component_id, representation_id)
-            if str(current["id"]) != expected_revision_id:
-                raise ValueError("Component revision conflict: refresh the component before saving")
-            revision = self._clone_revision(
-                conn, component_id, actor=actor, change_kind="representation",
-                change_summary="Delete component representation", expected_revision_id=expected_revision_id,
-            )
-            revision_id = str(revision["id"])
-            cloned = conn.execute(
-                """
-                SELECT id, is_default FROM revision_representations
-                WHERE revision_id = %s
-                  AND symbol_asset_id IS NOT DISTINCT FROM %s
-                  AND footprint_asset_id IS NOT DISTINCT FROM %s
-                ORDER BY display_order, id LIMIT 1
-                """,
-                (revision_id, original["symbol_asset_id"], original["footprint_asset_id"]),
-            ).fetchone()
-            if cloned:
-                was_default = bool(cloned["is_default"])
-                conn.execute("DELETE FROM revision_representations WHERE id = %s", (cloned["id"],))
-                if was_default:
-                    replacement = conn.execute(
-                        "SELECT id FROM revision_representations WHERE revision_id = %s ORDER BY display_order, id LIMIT 1",
-                        (revision_id,),
-                    ).fetchone()
-                    if replacement:
-                        conn.execute(
-                            "UPDATE revision_representations SET is_default = 1, updated_at = %s WHERE id = %s",
-                            (_utc_now_iso(), replacement["id"]),
-                        )
-            self._finalize_revision(
-                conn, component_id=component_id, revision_id=revision_id,
-                event_type="revision.created", actor=actor,
-                details={"change_kind": "representation", "change_summary": "Delete component representation"},
+            self._representations.delete_representation(
+                conn,
+                self._runtime_for_compat(),
+                component_id,
+                representation_id,
+                expected_revision_id=expected_revision_id,
+                actor=actor,
             )
             conn.commit()
         return self.get_component(component_id) or {}
@@ -2655,9 +2456,6 @@ class ComponentCatalogDomainService:
             conn.commit()
         return {"updated": updated, "not_found": not_found, "errors": errors}
 
-    def _browse_cache_lock_for(self, asset_type: str) -> threading.Lock:
-        return self._runtime_for_compat().browse_cache_lock_for(asset_type)
-
     def _invalidate_browse_cache(self) -> None:
         """Drop the stored-file listings after the store on disk changes.
 
@@ -2686,34 +2484,14 @@ class ComponentCatalogDomainService:
         """
         self.initialize()
         root = self._asset_root(asset_type)
-        now = time.monotonic()
-        with self._browse_cache_lock_for(asset_type):
-            with self._catalog_runtime.browse_cache_lock:
-                cached = self._browse_cache.get(asset_type)
-                generation = self._catalog_runtime.browse_cache_generation
-            if cached is None or now - cached[0] > _ASSET_BROWSE_CACHE_TTL_SECONDS:
-                if asset_type == "symbol":
-                    paths = root.rglob("*.kicad_sym")
-                elif asset_type == "footprint":
-                    paths = root.rglob("*.kicad_mod")
-                elif asset_type == "3dmodel":
-                    paths = [*root.rglob("*.step"), *root.rglob("*.stp")]
-                else:
-                    paths = root.rglob("*")
-                files = sorted(path.relative_to(root).as_posix() for path in paths if path.is_file())
-                with self._catalog_runtime.browse_cache_lock:
-                    # A write that landed while this walk was running already
-                    # cleared the cache. Storing the result now would reinstate a
-                    # listing taken before that write and hide it for a full TTL,
-                    # so leave the cache empty and let the next browse rebuild it.
-                    if self._catalog_runtime.browse_cache_generation == generation:
-                        self._browse_cache[asset_type] = (now, files)
-                all_files = files
-            else:
-                all_files = cached[1]
-        needle = q.strip().lower()
-        matches = [path for path in all_files if needle in path.lower()] if needle else list(all_files)
-        return {"files": matches[: max(1, limit)], "total": len(matches)}
+        return self._asset_browser.browse(
+            runtime=self._catalog_runtime,
+            root=root,
+            asset_type=asset_type,
+            q=q,
+            limit=limit,
+            now=time.monotonic(),
+        )
 
     def _attach_asset_revision(
         self,
@@ -2726,190 +2504,50 @@ class ComponentCatalogDomainService:
         change_summary: str,
         counterpart_asset_id: str = "",
     ) -> dict[str, Any]:
-        _, current = self._active_revision_row(conn, component_id, released=False)
-        if not current:
-            raise ValueError("Component not found")
-        existing = conn.execute(
-            "SELECT asset_id, required FROM revision_assets WHERE revision_id = %s AND asset_type = %s AND asset_id = %s",
-            (current["id"], asset["asset_type"], asset["id"]),
-        ).fetchone()
-        preview_changed = False
-        if str(asset["asset_type"]) in PLACE_REQUIRED_ASSET_TYPES:
-            kind = PREVIEW_KIND_SYMBOL if str(asset["asset_type"]) == "symbol" else PREVIEW_KIND_FOOTPRINT
-            current_previews = conn.execute(
-                "SELECT kind, preview_id FROM revision_preview_outputs WHERE revision_id = %s AND asset_id = %s AND (kind = %s OR kind LIKE %s)",
-                (str(current["id"]), str(asset["id"]), kind, f"{kind}:unit%"),
-            ).fetchall()
-            latest_preview_rows = conn.execute(
-                """
-                SELECT id, kind FROM asset_preview_versions
-                WHERE asset_id = %s AND (kind = %s OR kind LIKE %s) AND status = 'ready'
-                ORDER BY kind, created_at DESC, id DESC
-                """,
-                (str(asset["id"]), kind, f"{kind}:unit%"),
-            ).fetchall()
-            current_by_kind = {str(row["kind"]): str(row["preview_id"]) for row in current_previews}
-            latest_by_kind: dict[str, str] = {}
-            for row in latest_preview_rows:
-                latest_by_kind.setdefault(str(row["kind"]), str(row["id"]))
-            preview_changed = bool(latest_by_kind and latest_by_kind != current_by_kind)
-        if existing and bool(existing["required"]) == required and not counterpart_asset_id:
-            if preview_changed:
-                self._refresh_revision_preview_outputs_in_conn(conn, str(current["id"]))
-            return current
-        revision = self._clone_revision(
+        return self._asset_links.attach_asset_revision(
             conn,
-            component_id,
-            actor=actor,
-            change_kind="asset",
-            change_summary=change_summary,
-        )
-        self._link_asset_to_revision(
-            conn,
-            revision["id"],
-            asset,
+            self._runtime_for_compat(),
+            component_id=component_id,
+            asset=asset,
             required=required,
+            actor=actor,
+            change_summary=change_summary,
             counterpart_asset_id=counterpart_asset_id,
         )
-        effective_change_kind = "asset"
-        self._finalize_revision(
-            conn,
-            component_id=component_id,
-            revision_id=str(revision["id"]),
-            event_type="revision.created",
-            actor=actor,
-            details={
-                "change_kind": effective_change_kind,
-                "change_summary": change_summary,
-                "asset_type": str(asset["asset_type"]),
-                "asset_sha256": str(asset["sha256"]),
-            },
-        )
-        return revision
 
     def _extract_top_level_symbol_blocks(self, text: str) -> list[tuple[str, str]]:
-        blocks: list[tuple[str, str]] = []
-        depth = 0
-        start: int | None = None
-        name = ""
-        in_string = False
-        escape = False
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                i += 1
-                continue
-            if ch == '"':
-                in_string = True
-                i += 1
-                continue
-            if ch == "(":
-                if depth == 1 and text.startswith("(symbol", i):
-                    start = i
-                    j = i + len("(symbol")
-                    while j < len(text) and text[j].isspace():
-                        j += 1
-                    if j < len(text) and text[j] == '"':
-                        j += 1
-                        k = j
-                        escaped = False
-                        chars: list[str] = []
-                        while k < len(text):
-                            current = text[k]
-                            if escaped:
-                                chars.append(current)
-                                escaped = False
-                            elif current == "\\":
-                                escaped = True
-                            elif current == '"':
-                                break
-                            else:
-                                chars.append(current)
-                            k += 1
-                        name = "".join(chars)
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if start is not None and depth == 1:
-                    blocks.append((name, text[start : i + 1]))
-                    start = None
-                    name = ""
-            i += 1
-        return blocks
+        return self._asset_files.extract_top_level_symbol_blocks(text)
 
     def _symbol_header(self, text: str) -> tuple[str, str]:
-        version_match = re.search(r"\(version\s+([^)]+)\)", text)
-        version = version_match.group(1) if version_match else "20211014"
-        generator_match = re.search(r"\(generator\s+([^)]+)\)", text)
-        generator = generator_match.group(1) if generator_match else '"KiCAD Prism"'
-        return version, generator
+        return self._asset_files.symbol_header(text)
 
     def _single_symbol_payload(self, text: str, selected_symbol: str) -> bytes:
-        blocks = self._extract_top_level_symbol_blocks(text)
-        blocks_dict = dict(blocks)
-        base_block = blocks_dict.get(selected_symbol)
-        if not base_block:
-            raise ValueError("Selected symbol was not found in the library")
-
-        escaped_name = re.escape(selected_symbol)
-        unit_pattern = re.compile(rf"^{escaped_name}_\d+_\d+$")
-        unit_blocks = [b for n, b in blocks if unit_pattern.match(n)]
-        all_blocks_text = "\n  ".join([base_block] + unit_blocks)
-        version, generator = self._symbol_header(text)
-        return f"(kicad_symbol_lib (version {version}) (generator {generator})\n  {all_blocks_text}\n)\n".encode("utf-8")
+        return self._asset_files.single_symbol_payload(text, selected_symbol)
 
     def _write_canonical_file(self, destination: Path, payload: bytes) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            existing = destination.read_bytes()
-            if existing == payload:
-                return destination
-            digest = hashlib.sha256(payload).hexdigest()
-            try:
-                relative = destination.resolve().relative_to(self._store_root)
-            except ValueError:
-                relative = Path(destination.name)
-            immutable_destination = self._store_root / "revisions" / digest / relative
-            immutable_destination.parent.mkdir(parents=True, exist_ok=True)
-            if immutable_destination.exists():
-                if immutable_destination.read_bytes() != payload:
-                    raise ValueError(f"Immutable asset hash collision at {immutable_destination}")
-                return immutable_destination
-            immutable_destination.write_bytes(payload)
-            self._invalidate_browse_cache()
-            return immutable_destination
-        destination.write_bytes(payload)
-        self._invalidate_browse_cache()
-        return destination
+        return self._asset_files.write_canonical_file(
+            self._runtime_for_compat(), destination, payload
+        )
 
     def _symbol_destination(self, target_library: str, target_name: str) -> Path:
-        safe_library = _sanitize_name(target_library, "Prism_Symbols")
-        safe_name = _sanitize_name(target_name, "symbol")
-        return self._store_root / "symbols" / safe_library / f"{safe_name}.kicad_sym"
+        return self._asset_files.symbol_destination(
+            self._runtime_for_compat(), target_library, target_name
+        )
 
     def _footprint_destination(self, target_library: str, target_name: str) -> Path:
-        safe_library = _sanitize_name(target_library, "Prism_Footprints")
-        safe_name = _sanitize_name(target_name, "footprint")
-        return self._store_root / "footprints" / f"{safe_library}.pretty" / f"{safe_name}.kicad_mod"
+        return self._asset_files.footprint_destination(
+            self._runtime_for_compat(), target_library, target_name
+        )
 
     def _aux_destination(self, asset_type: str, target_library: str, upload_name: str) -> Path:
-        safe_library = _sanitize_name(target_library, "Prism_Assets")
-        safe_name = _sanitize_name(Path(upload_name).name, f"{asset_type}.bin")
-        return self._asset_root(asset_type) / safe_library / safe_name
+        return self._asset_files.aux_destination(
+            self._runtime_for_compat(), asset_type, target_library, upload_name
+        )
 
     def _asset_by_key(self, conn: Any, asset_type: str, canonical_path: str, target_name: str) -> dict[str, Any] | None:
-        row = conn.execute(
-            "SELECT * FROM assets WHERE asset_type = %s AND canonical_path = %s AND target_name = %s",
-            (asset_type, canonical_path, target_name),
-        ).fetchone()
-        return dict(row) if row else None
+        return self._asset_registry.asset_by_key(
+            conn, asset_type, canonical_path, target_name
+        )
 
     def _asset_by_signature(
         self,
@@ -2919,15 +2557,9 @@ class ComponentCatalogDomainService:
         target_library: str,
         target_name: str,
     ) -> dict[str, Any] | None:
-        row = conn.execute(
-            """
-            SELECT * FROM assets
-            WHERE asset_type = %s AND sha256 = %s AND target_library = %s AND target_name = %s
-            LIMIT 1
-            """,
-            (asset_type, sha256, target_library, target_name),
-        ).fetchone()
-        return dict(row) if row else None
+        return self._asset_registry.asset_by_signature(
+            conn, asset_type, sha256, target_library, target_name
+        )
 
     def _register_asset(
         self,
@@ -2939,158 +2571,28 @@ class ComponentCatalogDomainService:
         target_name: str,
         source_group: str = "",
     ) -> dict[str, Any]:
-        canonical_path = canonical_path.resolve()
-        payload = canonical_path.read_bytes()
-        sha256 = hashlib.sha256(payload).hexdigest()
-        existing = self._asset_by_key(conn, asset_type, str(canonical_path), target_name)
-        if existing:
-            if str(existing.get("sha256") or "") == sha256:
-                return existing
-            # A path already referenced by an immutable asset was edited in place.
-            # Preserve its historical database identity and ingest the observed bytes
-            # at a content-addressed path for the new revision.
-            try:
-                relative = canonical_path.relative_to(self._store_root)
-            except ValueError:
-                relative = Path(canonical_path.name)
-            immutable_path = self._store_root / "revisions" / sha256 / relative
-            immutable_path.parent.mkdir(parents=True, exist_ok=True)
-            if immutable_path.exists():
-                if immutable_path.read_bytes() != payload:
-                    raise ValueError(f"Immutable asset hash collision at {immutable_path}")
-            else:
-                immutable_path.write_bytes(payload)
-            canonical_path = immutable_path.resolve()
-            existing = self._asset_by_key(conn, asset_type, str(canonical_path), target_name)
-            if existing:
-                if str(existing.get("sha256") or "") != sha256:
-                    raise ValueError("Immutable asset identity does not match its content hash")
-                return existing
-        same_content = self._asset_by_signature(conn, asset_type, sha256, target_library, target_name)
-        if same_content:
-            existing_path = Path(str(same_content["canonical_path"]))
-            if not existing_path.is_file() or _sha256_file(existing_path) != sha256:
-                # Re-uploading identical content repairs a missing/corrupt backing file
-                # without changing immutable asset identity or revision manifests.
-                conn.execute(
-                    """
-                    UPDATE assets
-                    SET name = %s, canonical_path = %s, size_bytes = %s, content_type = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        canonical_path.name,
-                        str(canonical_path),
-                        canonical_path.stat().st_size,
-                        _content_type_for_asset(asset_type, canonical_path),
-                        _utc_now_iso(),
-                        same_content["id"],
-                    ),
-                )
-                same_content = dict(same_content)
-                same_content.update(
-                    {
-                        "name": canonical_path.name,
-                        "canonical_path": str(canonical_path),
-                        "size_bytes": canonical_path.stat().st_size,
-                        "content_type": _content_type_for_asset(asset_type, canonical_path),
-                    }
-                )
-            return same_content
-        now = _utc_now_iso()
-        asset_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO assets (
-                id, asset_type, name, canonical_path, target_library, target_name, source_group,
-                sha256, size_bytes, content_type, created_at, updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                asset_id,
-                asset_type,
-                canonical_path.name,
-                str(canonical_path),
-                target_library,
-                target_name,
-                source_group,
-                sha256,
-                canonical_path.stat().st_size,
-                _content_type_for_asset(asset_type, canonical_path),
-                now,
-                now,
-            ),
+        return self._asset_registry.register_asset(
+            self._runtime_for_compat(),
+            conn,
+            asset_type=asset_type,
+            canonical_path=canonical_path,
+            target_library=target_library,
+            target_name=target_name,
+            source_group=source_group,
         )
-        row = conn.execute("SELECT * FROM assets WHERE id = %s", (asset_id,)).fetchone()
-        return dict(row)
 
     def _generate_symbol_preview(self, asset: dict[str, Any]) -> tuple[str, bytes | str]:
         """Compatibility single-unit renderer used by existing test/custom adapters."""
-        with tempfile.TemporaryDirectory(prefix="prism_symsvg_") as tmp_dir:
-            success, error = self._run_kicad_cli(
-                ["sym", "export", "svg", str(asset["canonical_path"]), "--output", tmp_dir, "--symbol", str(asset["target_name"])]
-            )
-            if not success:
-                return PREVIEW_STATUS_FAILED, error
-            expected = Path(tmp_dir) / f"{asset['target_name']}_unit1.svg"
-            if not expected.is_file():
-                candidates = sorted(Path(tmp_dir).glob("*.svg"))
-                if not candidates:
-                    return PREVIEW_STATUS_FAILED, "symbol preview export did not produce an SVG"
-                expected = candidates[0]
-            return PREVIEW_STATUS_READY, expected.read_bytes()
+        return self._preview_renderer.generate_symbol_preview(asset, self._run_kicad_cli)
 
     def _generate_symbol_preview_units(
         self,
         asset: dict[str, Any],
     ) -> tuple[str, list[tuple[int, bytes]] | str]:
-        # Preserve custom render adapters that implemented the original single-preview hook.
-        if type(self)._generate_symbol_preview is not ComponentCatalogDomainService._generate_symbol_preview:
-            status, result = self._generate_symbol_preview(asset)
-            if status != PREVIEW_STATUS_READY or not isinstance(result, bytes):
-                return status, str(result)
-            return PREVIEW_STATUS_READY, [(1, result)]
-
-        with tempfile.TemporaryDirectory(prefix="prism_symsvg_units_") as tmp_dir:
-            success, error = self._run_kicad_cli(
-                ["sym", "export", "svg", str(asset["canonical_path"]), "--output", tmp_dir, "--symbol", str(asset["target_name"])]
-            )
-            if not success:
-                return PREVIEW_STATUS_FAILED, error
-            candidates = sorted(Path(tmp_dir).glob("*.svg"))
-            if not candidates:
-                return PREVIEW_STATUS_FAILED, "symbol preview export did not produce an SVG"
-            units: dict[int, bytes] = {}
-            for index, candidate in enumerate(candidates, start=1):
-                match = re.search(r"_unit(\d+)(?:[^0-9].*)?\.svg$", candidate.name, flags=re.IGNORECASE)
-                unit = int(match.group(1)) if match else index
-                units.setdefault(unit, candidate.read_bytes())
-            return PREVIEW_STATUS_READY, sorted(units.items())
+        return self._preview_renderer.generate_symbol_preview_units(asset, self._run_kicad_cli)
 
     def _generate_footprint_preview(self, asset: dict[str, Any]) -> tuple[str, bytes | str]:
-        with tempfile.TemporaryDirectory(prefix="prism_fpsvg_") as tmp_dir:
-            footprint_source = Path(str(asset["canonical_path"]))
-            target_name = str(asset["target_name"])
-            isolated_library = Path(tmp_dir) / "isolated.pretty"
-            isolated_library.mkdir(parents=True, exist_ok=True)
-            isolated_footprint = isolated_library / f"{_sanitize_name(target_name, footprint_source.stem)}.kicad_mod"
-            shutil.copy2(footprint_source, isolated_footprint)
-            success, error = self._run_kicad_cli(
-                [
-                    "fp", "export", "svg", "--output", tmp_dir,
-                    "--footprint", isolated_footprint.stem, str(isolated_library),
-                ]
-            )
-            if not success:
-                return PREVIEW_STATUS_FAILED, error
-            expected = Path(tmp_dir) / f"{target_name}.svg"
-            if not expected.is_file():
-                candidates = sorted(Path(tmp_dir).glob("*.svg"))
-                if not candidates:
-                    return PREVIEW_STATUS_FAILED, "footprint preview export did not produce an SVG"
-                expected = candidates[0]
-            return PREVIEW_STATUS_READY, expected.read_bytes()
+        return self._preview_renderer.generate_footprint_preview(asset, self._run_kicad_cli)
 
     def _store_preview_version(
         self,
@@ -3100,93 +2602,12 @@ class ComponentCatalogDomainService:
         kind: str,
         payload: bytes,
     ) -> dict[str, Any]:
-        identity = self._preview_generator_identity(kind)
-        sha256 = _sha256_bytes(payload)
-        existing = conn.execute(
-            """
-            SELECT * FROM asset_preview_versions
-            WHERE asset_id = %s AND kind = %s AND sha256 = %s AND generator_fingerprint = %s
-            """,
-            (str(asset["id"]), kind, sha256, identity["generator_fingerprint"]),
-        ).fetchone()
-        if existing:
-            path = Path(str(existing["file_path"])).resolve()
-            if not path.is_file() or _sha256_file(path) != sha256:
-                raise ValueError(f"Immutable preview backing file is missing or corrupt: {path}")
-            return dict(existing)
-        destination = self._preview_version_path(str(asset["id"]), kind, sha256).resolve()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            if destination.read_bytes() != payload:
-                raise ValueError(f"Immutable preview hash collision at {destination}")
-        else:
-            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-            temporary.write_bytes(payload)
-            os.replace(temporary, destination)
-        now = _utc_now_iso()
-        preview_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO asset_preview_versions (
-                id, asset_id, kind, status, content_type, file_path, sha256, size_bytes,
-                generator_name, generator_version, pipeline_version, generator_fingerprint,
-                generation_error, created_at
-            ) VALUES (%s, %s, %s, 'ready', 'image/svg+xml', %s, %s, %s, %s, %s, %s, %s, '', %s)
-            """,
-            (
-                preview_id,
-                str(asset["id"]),
-                kind,
-                str(destination),
-                sha256,
-                len(payload),
-                identity["generator_name"],
-                identity["generator_version"],
-                identity["pipeline_version"],
-                identity["generator_fingerprint"],
-                now,
-            ),
+        return self._preview_pipeline.store_preview_version(
+            conn, self._runtime_for_compat(), asset=asset, kind=kind, payload=payload
         )
-        row = conn.execute("SELECT * FROM asset_preview_versions WHERE id = %s", (preview_id,)).fetchone()
-        return dict(row)
 
     def _ensure_asset_previews(self, conn: Any, asset: dict[str, Any]) -> list[dict[str, Any]]:
-        compatibility_override = self.__dict__.get("_ensure_asset_preview")
-        if callable(compatibility_override):
-            preview = compatibility_override(conn, asset)
-            return [preview] if preview else []
-        asset_type = str(asset["asset_type"])
-        if asset_type == "symbol":
-            status, result = self._generate_symbol_preview_units(asset)
-            if status != PREVIEW_STATUS_READY or not isinstance(result, list):
-                return [{
-                    "asset_id": str(asset["id"]),
-                    "kind": PREVIEW_KIND_SYMBOL,
-                    "status": PREVIEW_STATUS_FAILED,
-                    "generation_error": str(result),
-                }]
-            return [
-                self._store_preview_version(
-                    conn,
-                    asset=asset,
-                    kind=_preview_kind(PREVIEW_KIND_SYMBOL, unit),
-                    payload=payload,
-                )
-                for unit, payload in result
-            ]
-        elif asset_type == "footprint":
-            status, result = self._generate_footprint_preview(asset)
-            kind = PREVIEW_KIND_FOOTPRINT
-        else:
-            return []
-        if status != PREVIEW_STATUS_READY or not isinstance(result, bytes):
-            return [{
-                "asset_id": str(asset["id"]),
-                "kind": kind,
-                "status": PREVIEW_STATUS_FAILED,
-                "generation_error": str(result),
-            }]
-        return [self._store_preview_version(conn, asset=asset, kind=kind, payload=result)]
+        return self._preview_pipeline.ensure_asset_previews(conn, self._runtime_for_compat(), asset)
 
     def _ensure_asset_preview(self, conn: Any, asset: dict[str, Any]) -> dict[str, Any]:
         """Compatibility wrapper returning the first generated preview."""
@@ -3194,25 +2615,7 @@ class ComponentCatalogDomainService:
         return previews[0] if previews else {}
 
     def _has_ready_preview(self, conn: Any, asset_id: str, kind: str) -> bool:
-        generator_fingerprint = self._preview_generator_identity(kind)["generator_fingerprint"]
-        row = conn.execute(
-            """
-            SELECT file_path, sha256
-            FROM asset_preview_versions
-            WHERE asset_id = %s AND kind = %s AND status = %s AND generator_fingerprint = %s
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (asset_id, kind, PREVIEW_STATUS_READY, generator_fingerprint),
-        ).fetchone()
-        if not row:
-            return False
-        file_path = str(row["file_path"] or "")
-        return bool(
-            file_path
-            and Path(file_path).is_file()
-            and _sha256_file(Path(file_path)) == str(row["sha256"])
-        )
+        return self._preview_pipeline.has_ready_preview(conn, self._runtime_for_compat(), asset_id, kind)
 
     def _refresh_revision_preview_outputs_in_conn(
         self,
@@ -3221,76 +2624,9 @@ class ComponentCatalogDomainService:
         *,
         only_missing: bool = False,
     ) -> dict[str, Any]:
-        assets = [
-            asset
-            for asset in self._load_assets_for_revision(conn, revision_id)
-            if str(asset["asset_type"]) in PLACE_REQUIRED_ASSET_TYPES
-        ]
-        changed_assets: set[str] = set()
-        failures: list[dict[str, str]] = []
-        skipped = 0
-        existing_previews = self._load_previews_for_revision(conn, revision_id)
-        existing_by_asset: dict[str, list[dict[str, Any]]] = {}
-        for preview in existing_previews:
-            existing_by_asset.setdefault(str(preview["asset_id"]), []).append(preview)
-        for asset in assets:
-            kind = PREVIEW_KIND_SYMBOL if str(asset["asset_type"]) == "symbol" else PREVIEW_KIND_FOOTPRINT
-            existing_rows = [
-                preview
-                for preview in existing_by_asset.get(str(asset["id"]), [])
-                if str(preview["kind"]) == kind or str(preview["kind"]).startswith(f"{kind}:unit")
-            ]
-            existing_by_kind = {str(row["kind"]): row for row in existing_rows}
-            if only_missing and existing_by_kind and all(
-                self._has_ready_preview(conn, str(asset["id"]), preview_kind)
-                for preview_kind in existing_by_kind
-            ):
-                skipped += 1
-                continue
-            try:
-                previews = self._ensure_asset_previews(conn, asset)
-            except Exception as exc:
-                logger.warning("preview regeneration failed for asset %s: %s", asset["id"], exc)
-                failures.append({"asset_id": str(asset["id"]), "kind": kind, "error": str(exc)})
-                continue
-            ready_previews = [preview for preview in previews if str(preview.get("status")) == PREVIEW_STATUS_READY]
-            failed_previews = [preview for preview in previews if str(preview.get("status")) != PREVIEW_STATUS_READY]
-            for preview in failed_previews:
-                failures.append({
-                    "asset_id": str(asset["id"]),
-                    "kind": str(preview.get("kind") or kind),
-                    "error": str(preview.get("generation_error") or "Preview generation failed"),
-                })
-            generated_kinds = {str(preview["kind"]) for preview in ready_previews}
-            preview_set_changed = bool(ready_previews) and (generated_kinds != set(existing_by_kind) or any(
-                str(existing_by_kind.get(str(preview["kind"]), {}).get("id") or "") != str(preview["id"])
-                for preview in ready_previews
-            ))
-            if preview_set_changed:
-                changed_assets.add(str(asset["id"]))
-                conn.execute(
-                    "DELETE FROM revision_preview_outputs WHERE revision_id = %s AND asset_id = %s AND (kind = %s OR kind LIKE %s)",
-                    (revision_id, str(asset["id"]), kind, f"{kind}:unit%"),
-                )
-                now = _utc_now_iso()
-                for preview in ready_previews:
-                    conn.execute(
-                        """
-                        INSERT INTO revision_preview_outputs (revision_id, asset_id, kind, preview_id, generated_at)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (revision_id, asset_id, kind)
-                        DO UPDATE SET preview_id = excluded.preview_id, generated_at = excluded.generated_at
-                        """,
-                        (revision_id, str(asset["id"]), str(preview["kind"]), str(preview["id"]), now),
-                    )
-            else:
-                skipped += 1
-        return {
-            "revision_id": revision_id,
-            "changed": len(changed_assets),
-            "skipped": skipped,
-            "failures": failures,
-        }
+        return self._preview_pipeline.refresh_revision_preview_outputs(
+            conn, self._runtime_for_compat(), revision_id, only_missing=only_missing
+        )
 
     def _regenerate_component_previews_in_conn(
         self,
@@ -3301,79 +2637,19 @@ class ComponentCatalogDomainService:
         only_missing: bool = False,
     ) -> dict[str, Any]:
         _ = actor
-        self._lock_component_for_mutation(conn, component_id)
-        component = self._component_row(conn, component_id)
-        if not component:
-            raise ValueError("Component not found")
-        revision_id = str(component["current_revision_id"])
-        if not self._revision_row(conn, revision_id):
-            raise ValueError("Component revision not found")
-        if not any(
-            str(asset["asset_type"]) in PLACE_REQUIRED_ASSET_TYPES
-            for asset in self._load_assets_for_revision(conn, revision_id)
-        ):
-            raise ValueError("No symbol or footprint assets are attached")
-        return self._refresh_revision_preview_outputs_in_conn(conn, revision_id, only_missing=only_missing)
+        return self._preview_pipeline.regenerate_component_previews(
+            conn, self._runtime_for_compat(), component_id, only_missing=only_missing
+        )
 
     def generate_missing_component_previews(
         self,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         self.initialize()
-        counts: dict[str, Any] = {
-            "scanned_assets": 0,
-            "generated": 0,
-            "skipped_ready": 0,
-            "failed": 0,
-            "errors": [],
-        }
         with self._connect() as conn:
-            component_rows = conn.execute(
-                """
-                SELECT c.id, COUNT(a.id) AS asset_count
-                FROM components c
-                JOIN component_revisions cr ON cr.id = c.current_revision_id
-                JOIN revision_assets ra ON ra.revision_id = cr.id
-                JOIN assets a ON a.id = ra.asset_id
-                WHERE c.is_active = 1 AND a.asset_type IN ('symbol', 'footprint')
-                GROUP BY c.id, c.updated_at
-                ORDER BY c.updated_at DESC, c.id
-                """
-            ).fetchall()
-            counts["total_assets"] = sum(int(row["asset_count"]) for row in component_rows)
-            if progress_callback:
-                progress_callback(counts.copy())
-            for row in component_rows:
-                component_id = str(row["id"])
-                asset_count = int(row["asset_count"])
-                counts["scanned_assets"] += asset_count
-                try:
-                    result = self._regenerate_component_previews_in_conn(
-                        conn,
-                        component_id,
-                        actor="preview-generator",
-                        only_missing=True,
-                    )
-                    counts["generated"] += int(result["changed"])
-                    counts["skipped_ready"] += int(result["skipped"])
-                    counts["failed"] += len(result["failures"])
-                    counts["errors"].extend(
-                        {"component_id": component_id, **failure}
-                        for failure in result["failures"]
-                    )
-                    conn.commit()
-                except Exception as exc:
-                    conn.rollback()
-                    counts["failed"] += asset_count
-                    counts["errors"].append(
-                        {
-                            "component_id": component_id,
-                            "error": str(exc),
-                        }
-                    )
-                if progress_callback:
-                    progress_callback(counts.copy())
-        return counts
+            return self._preview_pipeline.generate_missing_component_previews(
+                conn, self._runtime_for_compat(), progress_callback
+            )
 
     def _link_asset_to_revision(
         self,
@@ -3384,123 +2660,9 @@ class ComponentCatalogDomainService:
         required: bool,
         counterpart_asset_id: str = "",
     ) -> None:
-        now = _utc_now_iso()
-        if str(asset["asset_type"]) in PLACE_REQUIRED_ASSET_TYPES:
-            kind = PREVIEW_KIND_SYMBOL if str(asset["asset_type"]) == "symbol" else PREVIEW_KIND_FOOTPRINT
-        conn.execute(
-            """
-            INSERT INTO revision_assets (revision_id, asset_type, asset_id, required, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (revision_id, asset_id)
-            DO UPDATE SET required = excluded.required, updated_at = excluded.updated_at
-            """,
-            (revision_id, asset["asset_type"], asset["id"], 1 if required else 0, now, now),
+        self._asset_links.link_asset_to_revision(
+            conn, revision_id, asset, required=required, counterpart_asset_id=counterpart_asset_id
         )
-        if str(asset["asset_type"]) in PLACE_REQUIRED_ASSET_TYPES:
-            preview_rows = conn.execute(
-                """
-                SELECT id, kind FROM asset_preview_versions
-                WHERE asset_id = %s AND (kind = %s OR kind LIKE %s) AND status = 'ready'
-                ORDER BY created_at DESC, id DESC
-                """,
-                (str(asset["id"]), kind, f"{kind}:unit%"),
-            ).fetchall()
-            latest_by_kind: dict[str, dict[str, Any]] = {}
-            for preview in preview_rows:
-                latest_by_kind.setdefault(str(preview["kind"]), dict(preview))
-            for preview_kind, preview in latest_by_kind.items():
-                conn.execute(
-                    """
-                    INSERT INTO revision_preview_outputs (revision_id, asset_id, kind, preview_id, generated_at)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (revision_id, asset_id, kind)
-                    DO UPDATE SET preview_id = excluded.preview_id, generated_at = excluded.generated_at
-                    """,
-                    (revision_id, str(asset["id"]), preview_kind, str(preview["id"]), now),
-                )
-            default_representation = conn.execute(
-                "SELECT id, symbol_asset_id, footprint_asset_id FROM revision_representations "
-                "WHERE revision_id = %s AND is_default = 1 LIMIT 1",
-                (revision_id,),
-            ).fetchone()
-            if counterpart_asset_id:
-                expected_type = "footprint" if str(asset["asset_type"]) == "symbol" else "symbol"
-                counterpart = conn.execute(
-                    """
-                    SELECT linked.id
-                    FROM revision_assets link
-                    JOIN assets linked ON linked.id = link.asset_id
-                    WHERE link.revision_id = %s AND linked.id = %s
-                      AND link.asset_type = %s AND linked.asset_type = %s
-                    """,
-                    (revision_id, counterpart_asset_id, expected_type, expected_type),
-                ).fetchone()
-                if not counterpart:
-                    raise ValueError("Selected counterpart asset is not attached to this revision")
-            if default_representation:
-                missing_symbol = not default_representation["symbol_asset_id"]
-                missing_footprint = not default_representation["footprint_asset_id"]
-                fills_default = (
-                    str(asset["asset_type"]) == "symbol" and missing_symbol
-                ) or (
-                    str(asset["asset_type"]) == "footprint" and missing_footprint
-                )
-                default_counterpart_id = (
-                    str(default_representation["footprint_asset_id"] or "")
-                    if str(asset["asset_type"]) == "symbol"
-                    else str(default_representation["symbol_asset_id"] or "")
-                )
-                if fills_default and (
-                    not counterpart_asset_id or counterpart_asset_id == default_counterpart_id
-                ):
-                    column = (
-                        "symbol_asset_id"
-                        if str(asset["asset_type"]) == "symbol"
-                        else "footprint_asset_id"
-                    )
-                    conn.execute(
-                        f"UPDATE revision_representations SET {column} = %s, updated_at = %s WHERE id = %s",
-                        (str(asset["id"]), now, str(default_representation["id"])),
-                    )
-                    return
-            symbol_id = (
-                str(asset["id"])
-                if str(asset["asset_type"]) == "symbol"
-                else counterpart_asset_id or str(default_representation["symbol_asset_id"] or "") if default_representation else counterpart_asset_id
-            )
-            footprint_id = (
-                str(asset["id"])
-                if str(asset["asset_type"]) == "footprint"
-                else counterpart_asset_id or str(default_representation["footprint_asset_id"] or "") if default_representation else counterpart_asset_id
-            )
-            duplicate = conn.execute(
-                """
-                SELECT 1 FROM revision_representations
-                WHERE revision_id = %s
-                  AND symbol_asset_id IS NOT DISTINCT FROM %s
-                  AND footprint_asset_id IS NOT DISTINCT FROM %s
-                """,
-                (revision_id, symbol_id or None, footprint_id or None),
-            ).fetchone()
-            if not duplicate:
-                count = int(
-                    conn.execute(
-                        "SELECT COUNT(*) AS total FROM revision_representations WHERE revision_id = %s",
-                        (revision_id,),
-                    ).fetchone()["total"]
-                )
-                conn.execute(
-                    """
-                    INSERT INTO revision_representations (
-                        id, revision_id, label, symbol_asset_id, footprint_asset_id, is_default,
-                        display_order, source_internal_part_number, provenance_json, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, '', '{}', %s, %s)
-                    """,
-                    (
-                        str(uuid.uuid4()), revision_id, str(asset.get("target_name") or asset.get("name") or "Representation"),
-                        symbol_id or None, footprint_id or None, 1 if count == 0 else 0, count, now, now,
-                    ),
-                )
 
     def _resolve_existing_asset(
         self,
@@ -3511,54 +2673,14 @@ class ComponentCatalogDomainService:
         target_library: str,
         target_name: str,
     ) -> dict[str, Any]:
-        root = self._asset_root(asset_type)
-        path = (root / file_path).resolve()
-        if not path.is_file():
-            raise ValueError(f"Asset file not found: {path}")
-        try:
-            path.relative_to(self._store_root)
-        except ValueError as exc:
-            raise ValueError("Linked asset must already live inside the Prism canonical store") from exc
-
-        if asset_type == "symbol":
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            discovered = _discover_symbol_names_in_text(text)
-            if not target_name:
-                if len(discovered) != 1:
-                    raise ValueError("Symbol file contains multiple symbols; target_name is required")
-                target_name = discovered[0]
-            if not target_library:
-                target_library = path.parent.name
-            if len(discovered) != 1 or discovered[0] != target_name:
-                payload = self._single_symbol_payload(text, target_name)
-                canonical = self._write_canonical_file(self._symbol_destination(target_library, target_name), payload)
-            else:
-                canonical = path
-        elif asset_type == "footprint":
-            if path.suffix.lower() != ".kicad_mod":
-                raise ValueError("Footprint links must point to a .kicad_mod file")
-            target_name = target_name or _discover_footprint_name_in_text(path.read_text(encoding="utf-8", errors="ignore")) or path.stem
-            target_library = target_library or path.parent.name.removesuffix(".pretty")
-            canonical = path
-        elif asset_type == "3dmodel":
-            target_name = target_name or path.name
-            target_library = target_library or path.parent.name
-            canonical = path
-        elif asset_type == "spice":
-            target_name = target_name or path.name
-            target_library = target_library or path.parent.name
-            canonical = path
-        else:
-            raise ValueError("Unsupported asset type")
-
-        asset = self._register_asset(
+        return self._asset_imports.resolve_existing_asset(
             conn,
+            self._runtime_for_compat(),
             asset_type=asset_type,
-            canonical_path=canonical,
+            file_path=file_path,
             target_library=target_library,
             target_name=target_name,
         )
-        return asset
 
     def link_library_asset(
         self,
@@ -3575,37 +2697,24 @@ class ComponentCatalogDomainService:
             raise ValueError("Unsupported asset type")
         self.initialize()
         with self._connect() as conn:
-            asset = self._resolve_existing_asset(
+            self._asset_imports.link_library_asset(
                 conn,
-                asset_type=asset_type,
-                file_path=file_path_rel,
-                target_library=target_library,
-                target_name=target_name,
-            )
-            self._attach_asset_revision(
-                conn,
-                component_id=component_id,
-                asset=asset,
-                required=asset_type in PLACE_REQUIRED_ASSET_TYPES,
-                actor=actor,
-                change_summary=f"Link {asset_type} asset",
+                self._runtime_for_compat(),
+                component_id,
+                asset_type,
+                file_path_rel,
+                target_library,
+                target_name,
                 counterpart_asset_id=counterpart_asset_id,
+                actor=actor,
             )
             conn.commit()
         return {"component": self.get_component(component_id)}
 
     def _normalize_symbol_upload(self, upload_name: str, payload: bytes) -> bytes:
-        with tempfile.TemporaryDirectory(prefix="prism_sym_import_") as tmp_dir:
-            input_path = Path(tmp_dir) / _sanitize_name(upload_name or "uploaded", "uploaded.kicad_sym")
-            output_path = Path(tmp_dir) / "normalized.kicad_sym"
-            input_path.write_bytes(payload)
-            success, error = self._run_kicad_cli(["sym", "upgrade", "--force", "--output", str(output_path), str(input_path)])
-            if not success:
-                logger.warning("Falling back to uploaded symbol payload without kicad-cli normalization: %s", error)
-                return payload
-            if not output_path.is_file():
-                raise ValueError("kicad-cli sym upgrade did not produce a normalized symbol library")
-            return output_path.read_bytes()
+        return self._asset_imports.normalize_symbol_upload(
+            self._runtime_for_compat(), upload_name, payload
+        )
 
     def import_symbol_library(
         self,
@@ -3619,59 +2728,26 @@ class ComponentCatalogDomainService:
         actor: str = "",
     ) -> dict[str, Any]:
         self.initialize()
-        normalized = self._normalize_symbol_upload(upload_name, payload)
-        text = normalized.decode("utf-8", errors="ignore")
-        discovered = _discover_symbol_names_in_text(text)
-        if not discovered:
-            raise ValueError("No symbols were found in the uploaded library")
-        if not selected_symbol and len(discovered) > 1:
-            return {"mode": "selection_required", "discovered_symbols": discovered}
-        chosen = selected_symbol or discovered[0]
-        canonical_payload = self._single_symbol_payload(text, chosen)
-        canonical_path = self._write_canonical_file(self._symbol_destination(target_library or "Prism_Symbols", chosen), canonical_payload)
-
         with self._connect() as conn:
-            asset = self._register_asset(
+            result = self._asset_imports.import_symbol_library(
                 conn,
-                asset_type="symbol",
-                canonical_path=canonical_path,
-                target_library=target_library or "Prism_Symbols",
-                target_name=chosen,
-            )
-            self._attach_asset_revision(
-                conn,
-                component_id=component_id,
-                asset=asset,
-                required=True,
-                actor=actor,
-                change_summary=f"Import symbol {chosen}",
+                self._runtime_for_compat(),
+                component_id,
+                upload_name=upload_name,
+                payload=payload,
+                target_library=target_library,
+                selected_symbol=selected_symbol,
                 counterpart_asset_id=counterpart_asset_id,
+                actor=actor,
             )
-            conn.commit()
-        return {
-            "mode": "imported",
-            "discovered_symbols": discovered,
-            "selected_symbol": chosen,
-            "component": self.get_component(component_id),
-        }
+            if result["mode"] == "imported":
+                conn.commit()
+        if result["mode"] == "imported":
+            result["component"] = self.get_component(component_id)
+        return result
 
     def _extract_footprints_from_upload(self, upload_name: str, payload: bytes) -> dict[str, bytes]:
-        suffix = Path(upload_name).suffix.lower()
-        if suffix == ".kicad_mod":
-            text = payload.decode("utf-8", errors="ignore")
-            name = _discover_footprint_name_in_text(text) or Path(upload_name).stem
-            return {name: payload}
-        if suffix == ".zip":
-            discovered: dict[str, bytes] = {}
-            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                for name in archive.namelist():
-                    if not name.lower().endswith(".kicad_mod"):
-                        continue
-                    content = archive.read(name)
-                    footprint_name = _discover_footprint_name_in_text(content.decode("utf-8", errors="ignore")) or Path(name).stem
-                    discovered[footprint_name] = content
-            return discovered
-        raise ValueError("Footprint upload must be a .kicad_mod file or a zipped .pretty library")
+        return self._asset_imports.extract_footprints_from_upload(upload_name, payload)
 
     def import_footprint(
         self,
@@ -3685,41 +2761,23 @@ class ComponentCatalogDomainService:
         actor: str = "",
     ) -> dict[str, Any]:
         self.initialize()
-        discovered = self._extract_footprints_from_upload(upload_name, payload)
-        names = sorted(discovered)
-        if not names:
-            raise ValueError("No footprints were found in the uploaded payload")
-        if not selected_footprint and len(names) > 1:
-            return {"mode": "selection_required", "discovered_footprints": names}
-        chosen = selected_footprint or names[0]
-        canonical_path = self._write_canonical_file(
-            self._footprint_destination(target_library or "Prism_Footprints", chosen),
-            discovered[chosen],
-        )
         with self._connect() as conn:
-            asset = self._register_asset(
+            result = self._asset_imports.import_footprint(
                 conn,
-                asset_type="footprint",
-                canonical_path=canonical_path,
-                target_library=target_library or "Prism_Footprints",
-                target_name=chosen,
-            )
-            self._attach_asset_revision(
-                conn,
-                component_id=component_id,
-                asset=asset,
-                required=True,
-                actor=actor,
-                change_summary=f"Import footprint {chosen}",
+                self._runtime_for_compat(),
+                component_id,
+                upload_name=upload_name,
+                payload=payload,
+                target_library=target_library,
+                selected_footprint=selected_footprint,
                 counterpart_asset_id=counterpart_asset_id,
+                actor=actor,
             )
-            conn.commit()
-        return {
-            "mode": "imported",
-            "discovered_footprints": names,
-            "selected_footprint": chosen,
-            "component": self.get_component(component_id),
-        }
+            if result["mode"] == "imported":
+                conn.commit()
+        if result["mode"] == "imported":
+            result["component"] = self.get_component(component_id)
+        return result
 
     def attach_auxiliary_asset(
         self,
@@ -3734,25 +2792,16 @@ class ComponentCatalogDomainService:
         if asset_type not in {"3dmodel", "spice"}:
             raise ValueError("Unsupported auxiliary asset type")
         self.initialize()
-        destination = self._write_canonical_file(
-            self._aux_destination(asset_type, target_library or "Prism_Assets", upload_name),
-            payload,
-        )
         with self._connect() as conn:
-            asset = self._register_asset(
+            self._asset_imports.attach_auxiliary_asset(
                 conn,
+                self._runtime_for_compat(),
+                component_id,
                 asset_type=asset_type,
-                canonical_path=destination,
-                target_library=target_library or "Prism_Assets",
-                target_name=destination.name,
-            )
-            self._attach_asset_revision(
-                conn,
-                component_id=component_id,
-                asset=asset,
-                required=False,
+                upload_name=upload_name,
+                payload=payload,
+                target_library=target_library,
                 actor=actor,
-                change_summary=f"Import {asset_type} asset {destination.name}",
             )
             conn.commit()
         return {"component": self.get_component(component_id)}
@@ -3766,59 +2815,10 @@ class ComponentCatalogDomainService:
             )
         self.initialize()
         with self._connect() as conn:
-            _, current = self._active_revision_row(conn, component_id, released=False)
-            if not current:
-                raise ValueError("Component not found")
-            existing = conn.execute(
-                "SELECT 1 FROM revision_assets WHERE revision_id = %s AND asset_type = %s",
-                (current["id"], asset_type),
-            ).fetchone()
-            if not existing:
-                return {"component": self.get_component(component_id)}
-            revision = self._clone_revision(
-                conn,
-                component_id,
-                actor=actor,
-                change_kind="asset",
-                change_summary=f"Detach {asset_type} asset",
-            )
-            conn.execute(
-                """
-                DELETE FROM revision_previews
-                WHERE revision_id = %s AND asset_id IN (
-                    SELECT asset_id FROM revision_assets WHERE revision_id = %s AND asset_type = %s
-                )
-                """,
-                (revision["id"], revision["id"], asset_type),
-            )
-            conn.execute(
-                """
-                DELETE FROM revision_preview_outputs
-                WHERE revision_id = %s AND asset_id IN (
-                    SELECT asset_id FROM revision_assets WHERE revision_id = %s AND asset_type = %s
-                )
-                """,
-                (revision["id"], revision["id"], asset_type),
-            )
-            conn.execute(
-                """
-                DELETE FROM revision_validation_evidence_links
-                WHERE revision_id = %s AND asset_id IN (
-                    SELECT asset_id FROM revision_assets WHERE revision_id = %s AND asset_type = %s
-                )
-                """,
-                (revision["id"], revision["id"], asset_type),
-            )
-            conn.execute("DELETE FROM revision_assets WHERE revision_id = %s AND asset_type = %s", (revision["id"], asset_type))
-            self._finalize_revision(
-                conn,
-                component_id=component_id,
-                revision_id=str(revision["id"]),
-                event_type="revision.created",
-                actor=actor,
-                details={"change_kind": "asset", "change_summary": f"Detach {asset_type} asset"},
-            )
-            conn.commit()
+            if self._asset_imports.detach_asset(
+                conn, self._runtime_for_compat(), component_id, asset_type, actor=actor
+            ):
+                conn.commit()
         return {"component": self.get_component(component_id)}
 
     def detach_asset_by_id(
@@ -3831,45 +2831,13 @@ class ComponentCatalogDomainService:
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
-            _, current = self._active_revision_row(conn, component_id, released=False)
-            if not current:
-                raise ValueError("Component not found")
-            if str(current["id"]) != expected_revision_id:
-                raise ValueError("Component revision conflict: refresh the component before saving")
-            linked = conn.execute(
-                "SELECT asset_type FROM revision_assets WHERE revision_id = %s AND asset_id = %s",
-                (current["id"], asset_id),
-            ).fetchone()
-            if not linked:
-                raise ValueError("Asset is not attached to the current revision")
-            referenced = conn.execute(
-                """
-                SELECT 1 FROM revision_representations
-                WHERE revision_id = %s AND (symbol_asset_id = %s OR footprint_asset_id = %s)
-                LIMIT 1
-                """,
-                (current["id"], asset_id, asset_id),
-            ).fetchone()
-            if referenced:
-                raise ValueError("Asset is referenced by a representation; remove or reassign it first")
-            revision = self._clone_revision(
-                conn, component_id, actor=actor, change_kind="asset",
-                change_summary=f"Detach {linked['asset_type']} asset",
+            self._asset_imports.detach_asset_by_id(
+                conn,
+                self._runtime_for_compat(),
+                component_id,
+                asset_id,
                 expected_revision_id=expected_revision_id,
-            )
-            revision_id = str(revision["id"])
-            for table in (
-                "revision_previews", "revision_preview_outputs",
-                "revision_validation_evidence_links", "revision_assets",
-            ):
-                conn.execute(
-                    f"DELETE FROM {table} WHERE revision_id = %s AND asset_id = %s",
-                    (revision_id, asset_id),
-                )
-            self._finalize_revision(
-                conn, component_id=component_id, revision_id=revision_id,
-                event_type="revision.created", actor=actor,
-                details={"change_kind": "asset", "change_summary": "Detach asset", "asset_id": asset_id},
+                actor=actor,
             )
             conn.commit()
         return {"component": self.get_component(component_id)}
@@ -4740,42 +3708,7 @@ class ComponentCatalogDomainService:
     def get_preview(self, preview_id: str) -> CatalogPreview | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM asset_preview_versions WHERE id = %s", (preview_id,)).fetchone()
-            if not row:
-                row = conn.execute("SELECT * FROM asset_previews WHERE id = %s", (preview_id,)).fetchone()
-            if not row:
-                return None
-            component_row = conn.execute(
-                """
-                SELECT c.id AS component_id
-                FROM revision_preview_outputs rpo
-                JOIN components c ON c.current_revision_id = rpo.revision_id
-                WHERE rpo.preview_id = %s
-                LIMIT 1
-                """,
-                (preview_id,),
-            ).fetchone()
-            if not component_row:
-                component_row = conn.execute(
-                    """
-                    SELECT c.id AS component_id
-                    FROM revision_assets ra
-                    JOIN components c ON c.current_revision_id = ra.revision_id
-                    WHERE ra.asset_id = %s
-                    LIMIT 1
-                    """,
-                    (str(row["asset_id"]),),
-                ).fetchone()
-            component_id = str(component_row["component_id"]) if component_row else ""
-        return CatalogPreview(
-            preview_id=str(row["id"]),
-            component_id=component_id,
-            kind=str(row["kind"]),
-            status=str(row["status"]),
-            content_type=str(row["content_type"]),
-            file_path=str(row["file_path"]),
-            generation_error=str(row["generation_error"]),
-        )
+            return self._preview_pipeline.preview_record(conn, preview_id)
 
     def _sign(self, message: str) -> str:
         if not settings.SESSION_SECRET:
