@@ -237,10 +237,10 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         """Keep preview evidence independent of kicad-cli availability and version."""
 
         for target, value in (
-            ("app.services.component_catalog_domain.settings.CATALOG_KLC_ENABLED", False),
-            ("app.services.component_catalog_domain.settings.CATALOG_KLC_RELEASE_GATE", "warn"),
+            ("app.core.config.settings.CATALOG_KLC_ENABLED", False),
+            ("app.core.config.settings.CATALOG_KLC_RELEASE_GATE", "warn"),
             (
-                "app.services.component_catalog_domain.settings.SESSION_SECRET",
+                "app.core.config.settings.SESSION_SECRET",
                 "catalog-contract-test-secret",
             ),
         ):
@@ -725,7 +725,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertTrue(self.service.verify_component_audit_chain(component["id"])["valid"])
 
         fixed_now = 1_700_000_000
-        with patch("app.services.component_catalog_domain.time.time", return_value=fixed_now):
+        with patch("app.services.catalog.signed_urls.time.time", return_value=fixed_now):
             manifest = self.service.build_manifest(component["id"], "https://prism.example")
         assert manifest is not None
         self.assertEqual(manifest["part_id"], component["id"])
@@ -747,7 +747,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             [released["default_representation_id"]],
         )
         self.assertEqual(int(signed_query["exp"][0]), fixed_now + 300)
-        with patch("app.services.component_catalog_domain.time.time", return_value=fixed_now):
+        with patch("app.services.catalog.signed_urls.time.time", return_value=fixed_now):
             self.assertTrue(
                 self.service.validate_asset_signature(
                     released["assets"][0]["id"],
@@ -757,7 +757,7 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
                     signed_query["representation"][0],
                 )
             )
-        with patch("app.services.component_catalog_domain.time.time", return_value=fixed_now + 300):
+        with patch("app.services.catalog.signed_urls.time.time", return_value=fixed_now + 300):
             self.assertFalse(
                 self.service.validate_asset_signature(
                     released["assets"][0]["id"],

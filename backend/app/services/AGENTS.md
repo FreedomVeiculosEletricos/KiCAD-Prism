@@ -11,14 +11,15 @@ Three files, and the names do not tell you which to use:
 | --- | --- |
 | `component_catalog_service.py` | Compatibility import and runtime singleton. |
 | `component_catalog_service_postgres.py` | Concrete PostgreSQL connection, schema initialization, and database-specific overrides. |
-| `component_catalog_domain.py` | Inherited catalog API and behavior, including SQL through the connection abstraction and file-backed assets. |
+| `component_catalog_domain.py` | Compatibility facade: the historical callable surface, delegating to collaborators in `catalog/`. |
 
-`ComponentCatalogPostgresService` inherits the large
-`ComponentCatalogDomainService`; the latter is not storage-neutral despite its
-name. Navigate it with symbol search rather than loading the file wholesale.
-Useful search terms are `project_import`, `folder_import`, `metadata_batch`,
-`validation`, `_klc_`, `preview`, `asset`, `representation`, `release`, and
-`dbl`. Public reads generally begin with `list_`, `get_`, or `search_`.
+`ComponentCatalogPostgresService` inherits `ComponentCatalogDomainService`,
+composes the `catalog/` collaborators, and owns transactions. The behavior
+itself lives in `backend/app/services/catalog/`; read
+`backend/app/services/catalog/AGENTS.md` for the layer map. To find where a
+facade method lands, search the facade for the method name and follow the
+`self._<collaborator>.` call. Public reads generally begin with `list_`,
+`get_`, or `search_`.
 
 Do not extend the inheritance split casually. When adding a cohesive capability,
 first consider a narrow collaborator with a public API that both workers and

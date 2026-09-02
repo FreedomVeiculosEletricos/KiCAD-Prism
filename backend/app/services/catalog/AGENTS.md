@@ -1,35 +1,49 @@
-# Catalog decomposition
+# Catalog package
 
-This directory is the target package for the incremental catalog split. It is
-an empty package marker in PR 1: the running implementation remains the
-compatibility singleton in `backend/app/services/component_catalog_service.py`,
-backed by `backend/app/services/component_catalog_service_postgres.py` and
-`backend/app/services/component_catalog_domain.py`.
+This package holds the decomposed catalog implementation. The running service
+is still composed outside it: `backend/app/services/component_catalog_service.py`
+is the stable singleton root, `backend/app/services/component_catalog_service_postgres.py`
+owns the PostgreSQL connection and wires collaborators, and
+`backend/app/services/component_catalog_domain.py` is the compatibility facade
+that keeps the historical callable surface by explicit delegation. Callers
+outside `backend/app/services/` use the facade; new behavior lives here.
 
-## Future layering
+## Layers
 
-Later slices may add narrow, dependency-injected collaborators in four layers:
+Modules depend downward only. Nothing here may import the three legacy catalog
+modules, directly or relatively. No mixins, no `__getattr__` delegation, no
+collaborator that holds a reference back to the facade.
 
-- foundation: stable value shaping, hashing, signing, and shared primitives;
-- persistence: PostgreSQL reads/writes and transaction boundaries;
-- domain: component, revision, asset, import, validation, release, and export
-  operations;
-- compatibility facade: an explicit adapter for the existing public callable
-  surface, composed by the stable root outside this package.
+| Layer | Modules |
+| --- | --- |
+| Foundation (pure) | `normalization.py`, `metadata_normalization.py`, `metadata_schema.py`, `asset_types.py`, `runtime.py` (paths and process-local caches), `kicad_cli.py`, `signed_urls.py`, `placement_payloads.py`, `metadata_csv.py`, `inventory_csv.py` (parsing) |
+| Persistence (PostgreSQL) | `postgres_runtime.py`, `postgres_schema.py`, `postgres_projections.py`, `postgres_integrity.py`, `locking.py`, `revision_kernel.py`, `asset_registry.py`, `asset_files.py`, `preview_store.py`, `metadata_fields.py`, `metadata_grid.py`, `metadata_batches.py`, `project_import_matching.py`, `provider_tokens.py` |
+| Domain operations | components: `component_read_models.py`, `component_queries.py`, `component_history.py`, `revision_comparison.py`, `revision_finalization.py`, `representations.py` · assets: `asset_browser.py`, `asset_links.py`, `asset_imports.py`, `preview_renderer.py`, `preview_pipeline.py` · metadata: `metadata_batch_staging.py`, `metadata_batch_application.py` · imports: `project_import_sessions.py`, `project_import_assets.py`, `project_import_acceptance.py` · validation and release: `klc_validation.py`, `release_workflow.py`, `health.py` · provider: `placement.py`, `dbl_export.py` |
 
-The layer names describe the destination architecture, not files that exist
-yet. Keep each new collaborator pointed toward lower layers only. In
-particular, nothing in this package may import or depend back on the three
-legacy catalog modules, directly or through a relative import. Avoid mixins and
-dynamic `__getattr__` delegation; pass dependencies explicitly.
+Collaborators take `conn` (and `runtime` where files are touched) as explicit
+parameters and never commit; the facade owns transactions. The exception is
+batch preview generation, which commits per component for durability and says
+so at the call site.
+
+## Contracts that must not move
+
+- Revision manifest hashes, audit-chain hashes, and preview fingerprints
+  (`revision_kernel.py`, `preview_pipeline.py`).
+- Placement manifests, inline bundles, and signed-URL messages
+  (`placement.py`, `placement_payloads.py`, `signed_urls.py`); outputs are
+  byte-stable for identical inputs.
+- DBL bundle layout, column order, and file names (`dbl_export.py`).
+- Release gating is fail-closed and review/release records are append-only
+  (`release_workflow.py`).
+- Canonical asset paths under the store root (`asset_files.py`, `runtime.py`).
 
 ## Navigation
 
-Start from the public API routes in `backend/app/api/catalog_admin.py` and
-`backend/app/api/remote_provider.py`, then follow worker dispatch in
-`backend/app/services/catalog_worker_tasks.py`. The PostgreSQL behavior and
-characterization contracts are covered by
-`backend/tests/test_component_catalog_postgres_integration.py`; the private
-caller and module-size ratchets are checked by
-`backend/tests/test_catalog_architecture.py` and
-`scripts/check_catalog_architecture.py`.
+Start from `backend/app/api/catalog_admin.py` and
+`backend/app/api/remote_provider.py`, then follow the facade method into its
+collaborator. Worker dispatch is in `backend/app/services/catalog_worker_tasks.py`.
+Characterization coverage is `backend/tests/test_component_catalog_postgres_integration.py`;
+focused unit coverage sits in `backend/tests/test_catalog_*.py`. Private-caller
+and module-size ratchets are enforced by `scripts/check_catalog_architecture.py`
+and `backend/tests/test_catalog_architecture.py`; run the script with
+`--update-baseline` only to record reductions.

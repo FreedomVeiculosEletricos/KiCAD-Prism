@@ -1,12 +1,7 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import logging
-import re
-import shutil
 import time
 import uuid
 from contextlib import contextmanager
@@ -14,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from app.core.config import settings
 from app.services.catalog.component_history import CatalogComponentHistoryReads
 from app.services.catalog.component_read_models import (
     CatalogComponentReadModels,
@@ -25,6 +19,16 @@ from app.services.catalog.component_read_models import (
     supply_source_payload as _supply_source_payload,
 )
 from app.services.catalog.component_queries import CatalogComponentQueries
+from app.services.catalog.dbl_export import (
+    DBL_COMMON_COLUMNS,
+    CatalogDblExport,
+    dbl_row_for_component,
+    dbl_symbol_library_name as _dbl_symbol_library_name,
+    part_number_nocolon as _part_number_nocolon,
+    quote_identifier as _quote_identifier,
+    sexpr_string as _sexpr_string,
+    write_dbl_config,
+)
 from app.services.catalog.health import CatalogHealth
 from app.services.catalog.klc_validation import (
     VALIDATION_SEVERITY_ERROR,
@@ -95,7 +99,19 @@ from app.services.catalog.normalization import (
 from app.services.catalog.project_import_sessions import CatalogProjectImportSessions
 from app.services.catalog.project_import_matching import CatalogProjectImportMatching
 from app.services.catalog.project_import_assets import CatalogProjectImportAssets
+from app.services.catalog.provider_tokens import CatalogProviderTokens
 from app.services.catalog.project_import_acceptance import CatalogProjectImportAcceptance
+from app.services.catalog.placement import CatalogPlacement
+from app.services.catalog.placement_payloads import (
+    SYMBOL_METADATA_FIELD_ORDER,
+    extract_top_level_symbol_properties as _extract_top_level_symbol_properties,
+    materialize_asset,
+    remote_library_nickname as _remote_library_nickname,
+    rewrite_footprint_payload as _rewrite_footprint_payload,
+    rewrite_symbol_payload as _rewrite_symbol_payload,
+    symbol_metadata_fields as _symbol_metadata_fields,
+    symbol_property_block as _symbol_property_block,
+)
 from app.services.catalog.preview_pipeline import (
     CatalogPreview,
     CatalogPreviewPipeline,
@@ -121,6 +137,7 @@ from app.services.catalog.revision_kernel import (
     WORKFLOW_STAGES,
     normalize_workflow_stage,
 )
+from app.services.catalog.signed_urls import CatalogAssetUrlSigner
 from app.services.catalog.runtime import (
     CatalogRuntime, DBL_EXPORT_DIRNAME, DEFAULT_STORE_DIRNAME, KLC_VALIDATION_DIRNAME,
     _ASSET_BROWSE_CACHE_TTL_SECONDS,
@@ -143,185 +160,16 @@ VALIDATION_STATUS_SKIPPED = "skipped"
 VALIDATION_STATUS_NOT_RUN = "not_run"
 KLC_RELEASE_GATE_VALUES = {"off", "warn", "block"}
 
-SYMBOL_METADATA_FIELD_ORDER: tuple[str, ...] = (
-    "Value",
-    "Description",
-    "Datasheet",
-    "Manufacturer",
-    "Manufacturer Part Number",
-    "Vendor",
-    "Vendor Part Number",
-    "Mass (g)",
-    "RQjC (C/W)",
-    "RQjC_top (C/W)",
-    "Temp_max (C)",
-    "Temp_min (C)",
-    "Power Dissipation (W)",
-    "Rate",
-    "SAP Code",
-)
-
-DBL_COMMON_COLUMNS: tuple[str, ...] = (
-    "Part Number",
-    "Part Number Nocolon",
-    "Comment",
-    "Value",
-    "Manufacturer",
-    "Manufacturer Part Number",
-    "PackageDescription",
-    "Status",
-    "Part Description",
-    "Datasheet",
-    "LibSymbol",
-    "LibFootprint",
-)
-
-_TOP_LEVEL_PROPERTY_RE = re.compile(r'^([ \t]+)\(property "([^"]+)" ')
-
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _remote_library_nickname(library_name: str) -> str:
-    prefix = _sanitize_name(settings.REMOTE_PROVIDER_LIBRARY_PREFIX, "remote").lower()
-    library = _sanitize_name(library_name, "library").lower()
-    return f"{prefix}_{library}"
 
 
-def _escape_symbol_property_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _symbol_property_block(name: str, value: str, *, indent: str = "    ", hidden: bool = True) -> str:
-    hide = " hide" if hidden else ""
-    child_indent = f"{indent}  "
-    return (
-        f'{indent}(property "{name}" "{_escape_symbol_property_value(value)}" (at 0 0 0)\n'
-        f'{child_indent}(effects (font (size 1.27 1.27)){hide})\n'
-        f"{indent})\n"
-    )
 
-
-def _symbol_metadata_fields(component: dict[str, Any] | None) -> dict[str, str]:
-    if not component:
-        return {label: "" for label in SYMBOL_METADATA_FIELD_ORDER}
-    fields = {label: str(component.get(key) or "") for label, key in SYMBOL_METADATA_LABEL_TO_KEY.items()}
-    for key, value in sorted(dict(component.get("extra_fields") or {}).items()):
-        normalized_key = str(key).strip()
-        if normalized_key and normalized_key not in fields and normalized_key not in {"Reference", "Footprint"}:
-            fields[normalized_key] = str(value or "")
-    return fields
-
-
-def _extract_top_level_symbol_properties(header: str) -> tuple[str, list[tuple[str, str]], str, str]:
-    lines = header.splitlines(keepends=True)
-    prefix_parts: list[str] = []
-    property_blocks: list[tuple[str, str]] = []
-    trailing = ""
-    first_indent = ""
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        match = _TOP_LEVEL_PROPERTY_RE.match(line)
-        if not match:
-            if property_blocks:
-                trailing = "".join(lines[index:])
-                break
-            prefix_parts.append(line)
-            index += 1
-            continue
-
-        indent = match.group(1)
-        if not first_indent:
-            first_indent = indent
-        name = match.group(2)
-        depth = line.count("(") - line.count(")")
-        block_lines = [line]
-        index += 1
-
-        while depth > 0 and index < len(lines):
-            block_line = lines[index]
-            block_lines.append(block_line)
-            depth += block_line.count("(") - block_line.count(")")
-            index += 1
-
-        property_blocks.append((name, "".join(block_lines)))
-
-    return "".join(prefix_parts), property_blocks, trailing, first_indent or "    "
-
-
-def _rewrite_symbol_payload(payload: bytes, footprint_ref: str | None, component: dict[str, Any] | None = None) -> bytes:
-    text = payload.decode("utf-8")
-    first_symbol_index = text.find('(symbol "')
-    marker_index = text.find('(symbol "', first_symbol_index + 1) if first_symbol_index != -1 else -1
-    if marker_index <= 0:
-        header = text
-        suffix = ""
-    else:
-        header = text[:marker_index]
-        suffix = text[marker_index:]
-
-    prefix, extracted_blocks, trailing, indent = _extract_top_level_symbol_properties(header)
-    if not extracted_blocks:
-        return payload
-
-    existing_blocks = {name: block for name, block in extracted_blocks}
-    ordered_names = [name for name, _ in extracted_blocks]
-    metadata_fields = _symbol_metadata_fields(component)
-    custom_blocks = {
-        label: _symbol_property_block(label, value, indent=indent, hidden=label != "Value")
-        for label, value in metadata_fields.items()
-    }
-    if footprint_ref:
-        custom_blocks["Footprint"] = _symbol_property_block("Footprint", footprint_ref, indent=indent)
-    elif "Footprint" in existing_blocks:
-        custom_blocks["Footprint"] = existing_blocks["Footprint"]
-
-    for property_name in SYMBOL_METADATA_FIELD_ORDER:
-        if property_name not in ordered_names:
-            ordered_names.append(property_name)
-    for property_name in sorted(set(metadata_fields) - set(SYMBOL_METADATA_FIELD_ORDER)):
-        if property_name not in ordered_names:
-            ordered_names.append(property_name)
-    if "Footprint" not in ordered_names:
-        ordered_names.append("Footprint")
-
-    rebuilt_blocks = [
-        custom_blocks.get(property_name, existing_blocks.get(property_name, ""))
-        for property_name in ordered_names
-    ]
-    return (prefix + "".join(rebuilt_blocks) + trailing + suffix).encode("utf-8")
-
-
-def _rewrite_footprint_payload(
-    payload: bytes,
-    asset: dict[str, Any],
-    model_assets: list[dict[str, Any]] | None = None,
-) -> bytes:
-    text = payload.decode("utf-8")
-    models = list(model_assets or [])
-    if not models or "(model " not in text:
-        return payload
-    prefix = _sanitize_name(settings.REMOTE_PROVIDER_LIBRARY_PREFIX, "remote").lower()
-    destination = settings.REMOTE_PROVIDER_DESTINATION_DIR.rstrip("/")
-    if destination in {"/RemoteLibrary", "$/RemoteLibrary"}:
-        destination = "${KIPRJMOD}/RemoteLibrary"
-    model_index = 0
-
-    def replace_model(match: re.Match[str]) -> str:
-        nonlocal model_index
-        if model_index >= len(models):
-            return match.group(0)
-        model = models[model_index]
-        model_index += 1
-        model_name = Path(str(model.get("canonical_path") or model.get("name") or "model.step")).name
-        model_path = f"{destination}/{prefix}_3d/{model_name}"
-        return f'(model "{model_path}"'
-
-    text = re.sub(r'\(model\s+"[^"]+"', replace_model, text)
-    return text.encode("utf-8")
 
 
 def _release_allows_remote(release_status: str) -> bool:
@@ -332,25 +180,8 @@ def _normalize_workflow_stage(stage: str) -> str:
     return normalize_workflow_stage(stage)
 
 
-def _quote_identifier(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
 
 
-def _sexpr_string(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _part_number_nocolon(value: str) -> str:
-    cleaned = re.sub(r":+", "_", value.strip())
-    cleaned = re.sub(r"\s+", "_", cleaned)
-    return cleaned or "PART"
-
-
-def _dbl_symbol_library_name(part_number: str, symbol_asset: dict[str, Any] | None) -> str:
-    if not symbol_asset:
-        return ""
-    raw = f"Prism_{part_number}_{symbol_asset['target_library']}_{symbol_asset['target_name']}"
-    return _sanitize_name(raw, "Prism_Symbol")
 
 
 class ComponentCatalogDomainService:
@@ -385,6 +216,9 @@ class ComponentCatalogDomainService:
         _catalog_locks, _revision_kernel, _component_read_models, _revision_finalizer, _klc_validation
     )
     _catalog_health: CatalogHealth = CatalogHealth(_component_queries, _klc_validation)
+    _placement: CatalogPlacement = CatalogPlacement(_revision_kernel, _component_read_models)
+    _dbl_export: CatalogDblExport = CatalogDblExport(_placement)
+    _provider_tokens: CatalogProviderTokens = CatalogProviderTokens()
     _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
     _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
     _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
@@ -463,6 +297,9 @@ class ComponentCatalogDomainService:
             self._klc_validation,
         )
         self._catalog_health = CatalogHealth(self._component_queries, self._klc_validation)
+        self._placement = CatalogPlacement(self._revision_kernel, self._component_read_models)
+        self._dbl_export = CatalogDblExport(self._placement)
+        self._provider_tokens = CatalogProviderTokens()
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
@@ -2984,58 +2821,18 @@ class ComponentCatalogDomainService:
         # so existing callers retain their UX while compliance history remains intact.
         return self.deactivate_component(component_id, actor=actor, reason=reason)
 
-    def _materialize_asset(self, asset: dict[str, Any], assets_for_revision: list[dict[str, Any]], component: dict[str, Any] | None = None) -> dict[str, Any]:
-        path = Path(str(asset["canonical_path"]))
-        payload = path.read_bytes()
-        if asset["asset_type"] == "symbol":
-            footprint_asset = next((candidate for candidate in assets_for_revision if candidate["asset_type"] == "footprint"), None)
-            footprint_ref = None
-            if footprint_asset:
-                footprint_ref = f"{_remote_library_nickname(str(footprint_asset['target_library']))}:{footprint_asset['target_name']}"
-            payload = _rewrite_symbol_payload(payload, footprint_ref, component)
-        elif asset["asset_type"] == "footprint":
-            payload = _rewrite_footprint_payload(
-                payload,
-                asset,
-                [candidate for candidate in assets_for_revision if candidate["asset_type"] == "3dmodel"],
-            )
-        content_type = _content_type_for_asset(str(asset["asset_type"]), path)
-        return {
-            **asset,
-            "payload": payload,
-            "content_type": content_type,
-            "size_bytes": len(payload),
-            "sha256": _sha256_bytes(payload),
-            "name": path.name,
-        }
+    def _materialize_asset(
+        self,
+        asset: dict[str, Any],
+        assets_for_revision: list[dict[str, Any]],
+        component: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return materialize_asset(asset, assets_for_revision, component)
 
     def _placement_assets(
         self, conn: Any, revision_id: str, representation_id: str = ""
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        if representation_id:
-            row = conn.execute(
-                "SELECT * FROM revision_representations WHERE id = %s AND revision_id = %s",
-                (representation_id, revision_id),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT * FROM revision_representations WHERE revision_id = %s AND is_default = 1 LIMIT 1",
-                (revision_id,),
-            ).fetchone()
-        if not row:
-            raise ValueError("Representation was not found on this revision")
-        if not row["symbol_asset_id"] or not row["footprint_asset_id"]:
-            raise ValueError("Selected representation is incomplete")
-        all_assets = self._load_assets_for_revision(conn, revision_id)
-        selected_ids = {str(row["symbol_asset_id"]), str(row["footprint_asset_id"])}
-        assets = [
-            asset
-            for asset in all_assets
-            if str(asset["asset_type"]) in {"3dmodel", "spice"} or str(asset["id"]) in selected_ids
-        ]
-        if len([asset for asset in assets if str(asset["id"]) in selected_ids]) != 2:
-            raise ValueError("Selected representation references unavailable assets")
-        return dict(row), assets
+        return self._placement.placement_assets(conn, revision_id, representation_id)
 
     def build_manifest(
         self, component_id: str, base_url: str, representation_id: str = ""
@@ -3044,41 +2841,8 @@ class ComponentCatalogDomainService:
         component = self.get_component(component_id, include_inactive=False, released_only=True)
         if not component:
             return None
-        if not component["place_enabled"]:
-            raise ValueError("Component is not placeable because it is not released or required files are missing")
         with self._connect() as conn:
-            representation, assets = self._placement_assets(
-                conn, component["revision_id"], representation_id
-            )
-        manifest_assets = []
-        for raw_asset in assets:
-            asset = self._materialize_asset(raw_asset, assets, component)
-            manifest_assets.append(
-                {
-                    "asset_type": asset["asset_type"],
-                    "name": asset["name"],
-                    "target_library": asset["target_library"],
-                    "target_name": asset["target_name"],
-                    "content_type": asset["content_type"],
-                    "size_bytes": asset["size_bytes"],
-                    "sha256": asset["sha256"],
-                    "required": bool(raw_asset["required"]),
-                    "download_url": self.build_signed_asset_url(
-                        asset["id"], component["revision_id"], base_url,
-                        representation_id=str(representation["id"]),
-                    ),
-                }
-            )
-        return {
-            "part_id": component["id"],
-            "display_name": component["name"],
-            "summary": component["summary"] or component["description"],
-            "license": "Managed in KiCAD Prism",
-            "representation_id": str(representation["id"]),
-            "library_name": next(str(a["target_library"]) for a in assets if a["asset_type"] == "symbol"),
-            "symbol_name": next(str(a["target_name"]) for a in assets if a["asset_type"] == "symbol"),
-            "assets": manifest_assets,
-        }
+            return self._placement.build_manifest(conn, component, base_url, representation_id)
 
     def build_inline_bundle(
         self, component_id: str, representation_id: str = ""
@@ -3087,61 +2851,17 @@ class ComponentCatalogDomainService:
         component = self.get_component(component_id, include_inactive=False, released_only=True)
         if not component:
             return None
-        if not component["place_enabled"]:
-            raise ValueError("Component is not placeable because it is not released or required files are missing")
         with self._connect() as conn:
-            representation, assets = self._placement_assets(
-                conn, component["revision_id"], representation_id
-            )
-        bundle_entries = []
-        for raw_asset in assets:
-            asset = self._materialize_asset(raw_asset, assets, component)
-            bundle_entries.append(
-                {
-                    "type": asset["asset_type"],
-                    "name": asset["name"] if asset["asset_type"] == "3dmodel" else asset["target_name"] or asset["name"],
-                    "compression": "NONE",
-                    "content": base64.b64encode(asset["payload"]).decode("ascii"),
-                    "checksum": asset["sha256"],
-                }
-            )
-        return {
-            "part_id": component["id"],
-            "display_name": component["name"],
-            "representation_id": str(representation["id"]),
-            "library": next(str(a["target_library"]) for a in assets if a["asset_type"] == "symbol"),
-            "symbol_name": next(str(a["target_name"]) for a in assets if a["asset_type"] == "symbol"),
-            "compression": "NONE",
-            "data": base64.b64encode(json.dumps(bundle_entries, separators=(",", ":")).encode("utf-8")).decode("ascii"),
-        }
+            return self._placement.build_inline_bundle(conn, component, representation_id)
 
     def get_asset_by_id(
         self, asset_id: str, *, revision_id: str = "", representation_id: str = ""
     ) -> dict[str, Any] | None:
         self.initialize()
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM assets WHERE id = %s", (asset_id,)).fetchone()
-            if not row:
-                return None
-            asset = dict(row)
-            effective_revision_id = revision_id
-            if not effective_revision_id:
-                link = conn.execute("SELECT revision_id FROM revision_assets WHERE asset_id = %s ORDER BY updated_at DESC LIMIT 1", (asset_id,)).fetchone()
-                effective_revision_id = str(link["revision_id"]) if link else ""
-            if effective_revision_id and representation_id:
-                _, assets_for_revision = self._placement_assets(
-                    conn, effective_revision_id, representation_id
-                )
-            else:
-                assets_for_revision = self._load_assets_for_revision(conn, effective_revision_id) if effective_revision_id else [asset]
-            component = None
-            if effective_revision_id:
-                revision = self._revision_row(conn, effective_revision_id)
-                if revision:
-                    component_row = self._component_row(conn, str(revision["component_id"]))
-                    if component_row:
-                        component = self._component_payload(conn, component_row, revision)
-        return self._materialize_asset(asset, assets_for_revision, component)
+            return self._placement.asset_by_id(
+                conn, asset_id, revision_id=revision_id, representation_id=representation_id
+            )
 
     def get_preview(self, preview_id: str) -> CatalogPreview | None:
         self.initialize()
@@ -3149,78 +2869,49 @@ class ComponentCatalogDomainService:
             return self._preview_pipeline.preview_record(conn, preview_id)
 
     def _sign(self, message: str) -> str:
-        if not settings.SESSION_SECRET:
-            raise RuntimeError("SESSION_SECRET is required to sign catalog asset URLs")
-        secret = settings.SESSION_SECRET.encode("utf-8")
-        return base64.urlsafe_b64encode(hmac.new(secret, message.encode("utf-8"), hashlib.sha256).digest()).rstrip(b"=").decode("ascii")
+        return CatalogAssetUrlSigner.sign(message)
 
     def build_signed_asset_url(
         self, asset_id: str, revision_id: str, base_url: str, ttl_seconds: int = 300,
         *, representation_id: str = "",
     ) -> str:
-        expires_at = int(time.time()) + ttl_seconds
-        signature = self._sign(f"{asset_id}:{revision_id}:{representation_id}:{expires_at}")
-        return (
-            f"{base_url.rstrip('/')}/api/remote-provider/assets/{asset_id}?rev={revision_id}"
-            f"&representation={representation_id}&exp={expires_at}&sig={signature}"
+        return CatalogAssetUrlSigner.build_signed_asset_url(
+            asset_id, revision_id, base_url, ttl_seconds, representation_id=representation_id
         )
 
     def validate_asset_signature(
         self, asset_id: str, revision_id: str, expires_at: int, signature: str,
         representation_id: str = "",
     ) -> bool:
-        if expires_at <= int(time.time()):
-            return False
-        return hmac.compare_digest(
-            self._sign(f"{asset_id}:{revision_id}:{representation_id}:{expires_at}"), signature
+        return CatalogAssetUrlSigner.validate_asset_signature(
+            asset_id, revision_id, expires_at, signature, representation_id
         )
 
     def store_auth_code(self, code: str, grant: dict[str, Any], exp: int) -> None:
         self.initialize()
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO oauth_auth_codes (code, grant_json, exp)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (code) DO UPDATE SET grant_json = excluded.grant_json, exp = excluded.exp
-                """,
-                (code, json.dumps(grant, separators=(",", ":")), exp),
-            )
+            self._provider_tokens.store_auth_code(conn, code, grant, exp)
             conn.commit()
 
     def consume_auth_code(self, code: str) -> dict[str, Any] | None:
         self.initialize()
-        now = int(time.time())
         with self._connect() as conn:
-            row = conn.execute("SELECT grant_json, exp FROM oauth_auth_codes WHERE code = %s", (code,)).fetchone()
-            conn.execute("DELETE FROM oauth_auth_codes WHERE code = %s", (code,))
-            conn.execute("DELETE FROM oauth_auth_codes WHERE exp <= %s", (now,))
+            grant = self._provider_tokens.consume_auth_code(conn, code, now=int(time.time()))
             conn.commit()
-        if not row or int(row["exp"]) <= now:
-            return None
-        return dict(_json_loads(row["grant_json"], {}))
+        return grant
 
     def add_revoked_token(self, jti: str, exp: int) -> None:
         self.initialize()
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO oauth_revoked_tokens (jti, exp)
-                VALUES (%s, %s)
-                ON CONFLICT (jti) DO UPDATE SET exp = excluded.exp
-                """,
-                (jti, exp),
-            )
+            self._provider_tokens.add_revoked_token(conn, jti, exp)
             conn.commit()
 
     def is_token_revoked(self, jti: str) -> bool:
         self.initialize()
-        now = int(time.time())
         with self._connect() as conn:
-            conn.execute("DELETE FROM oauth_revoked_tokens WHERE exp <= %s", (now,))
-            row = conn.execute("SELECT 1 FROM oauth_revoked_tokens WHERE jti = %s", (jti,)).fetchone()
+            revoked = self._provider_tokens.is_token_revoked(conn, jti, now=int(time.time()))
             conn.commit()
-        return bool(row)
+        return revoked
 
     def _released_place_ready_components(self) -> list[dict[str, Any]]:
         return [
@@ -3235,35 +2926,7 @@ class ComponentCatalogDomainService:
         part_number: str,
         custom_fields: list[dict[str, Any]],
     ) -> dict[str, str]:
-        default_representation = next(
-            (item for item in component.get("representations", []) if item.get("is_default")),
-            None,
-        )
-        symbol_asset = default_representation.get("symbol") if default_representation else None
-        footprint_asset = default_representation.get("footprint") if default_representation else None
-        lib_symbol = ""
-        lib_footprint = ""
-        if symbol_asset:
-            lib_symbol = f"{_dbl_symbol_library_name(part_number, symbol_asset)}:{symbol_asset['target_name']}"
-        if footprint_asset:
-            lib_footprint = f"{footprint_asset['target_library']}:{footprint_asset['target_name']}"
-        row = {
-            "Part Number": part_number,
-            "Part Number Nocolon": part_number,
-            "Comment": component["value"] or component["name"],
-            "Value": component["value"],
-            "Manufacturer": component["manufacturer"],
-            "Manufacturer Part Number": component["mpn"],
-            "PackageDescription": component["package_name"],
-            "Status": component["workflow_stage"],
-            "Part Description": component["description"],
-            "Datasheet": component["datasheet_url"],
-            "LibSymbol": lib_symbol,
-            "LibFootprint": lib_footprint,
-        }
-        extras = dict(component.get("extra_fields") or {})
-        row.update({field["key"]: str(extras.get(field["storage_key"], "")) for field in custom_fields})
-        return row
+        return dbl_row_for_component(component, part_number, custom_fields)
 
     def _collect_dbl_assets(
         self,
@@ -3272,150 +2935,16 @@ class ComponentCatalogDomainService:
         export_root: Path,
         conn: Any,
     ) -> None:
-        _, assets = self._placement_assets(conn, component["revision_id"])
-        for raw_asset in assets:
-            if raw_asset["asset_type"] not in {"symbol", "footprint"}:
-                continue
-            asset = self._materialize_asset(raw_asset, assets, component)
-            if raw_asset["asset_type"] == "symbol":
-                library_name = _dbl_symbol_library_name(part_number, asset)
-                destination = export_root / "SchLib" / f"{library_name}.kicad_sym"
-            else:
-                destination = export_root / "PcbLib" / f"{asset['target_library']}.pretty" / f"{asset['target_name']}.kicad_mod"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(asset["payload"])
+        self._dbl_export.collect_dbl_assets(conn, component, part_number, export_root)
 
-    def _write_dbl_config(self, export_root: Path, *, filename: str, connection_string: str, libraries: list[dict[str, Any]]) -> None:
-        payload = {
-            "meta": {"version": 0},
-            "name": "KiCAD Prism Database Library",
-            "description": "KiCAD Prism released component database library",
-            "source": {
-                "type": "odbc",
-                "dsn": "",
-                "username": "",
-                "password": "",
-                "timeout_seconds": 2,
-                "connection_string": connection_string,
-            },
-            "cache": {"max_age": 28800},
-            "libraries": libraries,
-        }
-        (export_root / filename).write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
+    def _write_dbl_config(
+        self, export_root: Path, *, filename: str, connection_string: str, libraries: list[dict[str, Any]]
+    ) -> None:
+        write_dbl_config(export_root, filename=filename, connection_string=connection_string, libraries=libraries)
 
     def export_kicad_dbl_bundle(self) -> dict[str, Any]:
-        # The generated KiCad database-library bundle intentionally uses SQLite as
-        # an interchange artifact. Prism's runtime state is PostgreSQL-only.
-        import sqlite3 as sqlite_export
-
         self.initialize()
-        export_root = self.export_root
-        if export_root.exists():
-            shutil.rmtree(export_root)
-        (export_root / "SchLib").mkdir(parents=True, exist_ok=True)
-        (export_root / "PcbLib").mkdir(parents=True, exist_ok=True)
-
-        components = sorted(self._released_place_ready_components(), key=lambda c: (c["category"], c["mpn"], c["id"]))
-        custom_fields = [
-            field for field in self.list_metadata_fields()
-            if field["storage_kind"] == "extra" and field["key"] not in DBL_COMMON_COLUMNS
-        ]
-        custom_columns = [field["key"] for field in custom_fields]
-        effective_columns = (*DBL_COMMON_COLUMNS, *custom_columns)
-        db_path = export_root / "Prism.sqlite"
-        used_part_numbers: set[str] = set()
-        grouped_rows: dict[str, list[dict[str, str]]] = {}
-
-        with self._connect() as catalog_conn:
-            for component in components:
-                base_part = _part_number_nocolon(component["mpn"] or component["value"] or component["id"])
-                part_number = base_part
-                counter = 2
-                while part_number in used_part_numbers:
-                    part_number = f"{base_part}_{counter}"
-                    counter += 1
-                used_part_numbers.add(part_number)
-                category = component["category"] or "Uncategorized"
-                grouped_rows.setdefault(category, []).append(self._dbl_row_for_component(component, part_number, custom_fields))
-                self._collect_dbl_assets(component, part_number, export_root, catalog_conn)
-
-        with sqlite_export.connect(db_path) as dbl_conn:
-            for category, rows in sorted(grouped_rows.items()):
-                table = _quote_identifier(category)
-                columns_sql = ", ".join(f"{_quote_identifier(column)} TEXT NOT NULL DEFAULT ''" for column in effective_columns)
-                dbl_conn.execute(f"CREATE TABLE {table} ({columns_sql})")
-                column_names = ", ".join(_quote_identifier(column) for column in effective_columns)
-                placeholders = ", ".join("?" for _ in effective_columns)
-                for row in rows:
-                    dbl_conn.execute(
-                        f"INSERT INTO {table} ({column_names}) VALUES ({placeholders})",
-                        tuple(row.get(column, "") for column in effective_columns),
-                    )
-
-        fields = [
-            {
-                "column": column,
-                "name": column,
-                "visible_on_add": False,
-                "visible_in_chooser": column not in {"LibSymbol", "LibFootprint"},
-                "show_name": True,
-                "inherit_properties": True,
-            }
-            for column in effective_columns
-            if column not in {"Part Number Nocolon"}
-        ]
-        libraries = [
-            {
-                "name": category,
-                "table": category,
-                "key": "Part Number Nocolon",
-                "symbols": "LibSymbol",
-                "footprints": "LibFootprint",
-                "fields": fields,
-            }
-            for category in sorted(grouped_rows)
-        ]
-        self._write_dbl_config(
-            export_root,
-            filename="Prism_Linux.kicad_dbl",
-            connection_string="Driver={SQLite3};Database=${CWD}/Prism.sqlite;",
-            libraries=libraries,
-        )
-        self._write_dbl_config(
-            export_root,
-            filename="Prism_Windows.kicad_dbl",
-            connection_string="Driver={SQLite3 ODBC Driver};Database=${CWD}/Prism.sqlite;",
-            libraries=libraries,
-        )
-
-        symbol_libraries = sorted(path.stem for path in (export_root / "SchLib").glob("*.kicad_sym"))
-        footprint_libraries = sorted({asset["target_library"] for component in components for asset in component["assets"] if asset["asset_type"] == "footprint"})
-        sym_lines = [
-            '(sym_lib_table',
-            '  (lib (name "Prism")(type "Database")(uri "${PRISM_LIB_DIR}/Prism_Linux.kicad_dbl")(options "")(descr ""))',
-        ]
-        sym_lines.extend(
-            f'  (lib (name "{_sexpr_string(library)}")(type "KiCad")(uri "${{PRISM_LIB_DIR}}/SchLib/{_sexpr_string(library)}.kicad_sym")(options "")(descr "")(hidden))'
-            for library in symbol_libraries
-        )
-        sym_lines.append(")")
-        (export_root / "sym-lib-table").write_text("\n".join(sym_lines) + "\n", encoding="utf-8")
-
-        fp_lines = ["(fp_lib_table"]
-        fp_lines.extend(
-            f'  (lib (name "{_sexpr_string(library)}")(type "KiCad")(uri "${{PRISM_LIB_DIR}}/PcbLib/{_sexpr_string(library)}.pretty")(options "")(descr ""))'
-            for library in footprint_libraries
-        )
-        fp_lines.append(")")
-        (export_root / "fp-lib-table").write_text("\n".join(fp_lines) + "\n", encoding="utf-8")
-
-        return {
-            "export_root": str(export_root),
-            "component_count": len(components),
-            "category_count": len(grouped_rows),
-            "sqlite_path": str(db_path),
-            "linux_dbl": str(export_root / "Prism_Linux.kicad_dbl"),
-            "windows_dbl": str(export_root / "Prism_Windows.kicad_dbl"),
-            "sym_lib_table": str(export_root / "sym-lib-table"),
-            "fp_lib_table": str(export_root / "fp-lib-table"),
-        }
+        components = self._released_place_ready_components()
+        metadata_fields = self.list_metadata_fields()
+        with self._connect() as conn:
+            return self._dbl_export.export_bundle(conn, self._runtime_for_compat(), components, metadata_fields)
