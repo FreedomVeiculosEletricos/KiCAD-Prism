@@ -424,6 +424,21 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         assert corrected is not None
         self.assertEqual(corrected["mpn"], corrected_mpn)
 
+    def test_unchanged_metadata_patch_does_not_create_a_revision(self) -> None:
+        component = self._component("unchanged-" + uuid.uuid4().hex[:8])
+        before = self.service.list_component_revisions(component["id"])
+
+        unchanged = self.service.update_component_metadata(
+            component["id"],
+            {},
+            actor="editor@example.com",
+            expected_revision_id=component["revision_id"],
+        )
+
+        assert unchanged is not None
+        self.assertEqual(unchanged["revision_id"], component["revision_id"])
+        self.assertEqual(self.service.list_component_revisions(component["id"]), before)
+
     def test_concurrent_edits_serialize_head_and_audit(self) -> None:
         component = self._component("concurrent-" + uuid.uuid4().hex[:8])
         expected_revision_id = component["revision_id"]

@@ -1896,11 +1896,11 @@ class ComponentCatalogDomainService:
     def _parse_klc_junit(self, junit_path: Path) -> list[dict[str, Any]]:
         return self._klc_validation.parse_klc_junit(junit_path)
 
-    def _write_validation_report_json(self, path: Path, **report: Any) -> None:
-        self._klc_validation.write_validation_report_json(path, **report)
+    def _write_validation_report_json(self, path: Path, *, run_id: str, asset: dict[str, Any], status: str, exit_code: int | None, findings: list[dict[str, Any]], stdout: str, stderr: str, tool_version: str, created_at: str, finished_at: str) -> None:
+        self._klc_validation.write_validation_report_json(path, run_id=run_id, asset=asset, status=status, exit_code=exit_code, findings=findings, stdout=stdout, stderr=stderr, tool_version=tool_version, created_at=created_at, finished_at=finished_at)
 
-    def _store_validation_run(self, conn: Any, **run: Any) -> dict[str, Any]:
-        return self._klc_validation.store_validation_run(conn, **run)
+    def _store_validation_run(self, conn: Any, *, run_id: str, component_id: str, revision_id: str, asset: dict[str, Any], status: str, exit_code: int | None, findings: list[dict[str, Any]], report_dir: Path, stdout_path: Path, stderr_path: Path, junit_path: Path, json_path: Path, raw_output: str, tool_version: str, created_at: str, finished_at: str) -> dict[str, Any]:
+        return self._klc_validation.store_validation_run(conn, run_id=run_id, component_id=component_id, revision_id=revision_id, asset=asset, status=status, exit_code=exit_code, findings=findings, report_dir=report_dir, stdout_path=stdout_path, stderr_path=stderr_path, junit_path=junit_path, json_path=json_path, raw_output=raw_output, tool_version=tool_version, created_at=created_at, finished_at=finished_at)
 
     def _run_klc_for_asset(
         self,

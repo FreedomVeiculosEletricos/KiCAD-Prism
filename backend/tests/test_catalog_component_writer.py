@@ -16,7 +16,6 @@ from app.services.catalog.component_writer import (  # noqa: E402
 from app.services.catalog.metadata_normalization import (  # noqa: E402
     IDENTITY_KIND_MPN,
     IDENTITY_KIND_PROVISIONAL_IPN,
-    normalize_metadata,
 )
 from app.services.catalog.remote_heads import remote_head_payload  # noqa: E402
 
@@ -29,6 +28,9 @@ def _revision(**overrides: object) -> dict[str, object]:
         "datasheet_url": "https://prism.example/r1.pdf",
         "manufacturer": "Prism",
         "mpn": "PG-R-1",
+        "normalized_manufacturer": "prism",
+        "normalized_mpn": "pg-r-1",
+        "mpn_source": "manufacturer",
         "category": "Passives",
         "package_name": "0402",
         "vendor": "",
@@ -41,7 +43,7 @@ def _revision(**overrides: object) -> dict[str, object]:
         "power_dissipation_w": "",
         "rate": "",
         "sap_code": "",
-        "summary": "",
+        "summary": "Resistor",
         "extra_fields": '{"Tolerance": "1%"}',
     }
     base.update(overrides)
@@ -75,22 +77,13 @@ class MergeMetadataPatchTests(unittest.TestCase):
     def test_unchanged_patch_is_detected_against_the_revision(self) -> None:
         component = {"identity_kind": IDENTITY_KIND_MPN, "identity_source": ""}
         revision = _revision()
-        normalized = normalize_metadata(
-            {
-                **revision,
-                "identity_kind": IDENTITY_KIND_MPN,
-                "identity_source": "",
-                "extra_fields": {"Tolerance": "1%"},
-            }
-        )
-        stored = {**revision, **{k: v for k, v in normalized.items() if k != "extra_fields"}}
-        self.assertTrue(metadata_matches_revision(stored, merge_metadata_patch(component, stored, {})))
+        self.assertTrue(metadata_matches_revision(revision, merge_metadata_patch(component, revision, {})))
         self.assertFalse(
-            metadata_matches_revision(stored, merge_metadata_patch(component, stored, {"value": "33k"}))
+            metadata_matches_revision(revision, merge_metadata_patch(component, revision, {"value": "33k"}))
         )
         self.assertFalse(
             metadata_matches_revision(
-                stored, merge_metadata_patch(component, stored, {"extra_fields": {"Tolerance": "5%"}})
+                revision, merge_metadata_patch(component, revision, {"extra_fields": {"Tolerance": "5%"}})
             )
         )
 

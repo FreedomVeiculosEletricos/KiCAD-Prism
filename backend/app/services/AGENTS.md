@@ -14,8 +14,9 @@ Three files, and the names do not tell you which to use:
 | `component_catalog_domain.py` | Compatibility facade: the historical callable surface, delegating to collaborators in `catalog/`. |
 
 `ComponentCatalogPostgresService` inherits `ComponentCatalogDomainService`,
-composes the `catalog/` collaborators, and owns transactions. The behavior
-itself lives in `backend/app/services/catalog/`; read
+owns PostgreSQL connection and schema setup, and composes the `catalog/`
+collaborators. The compatibility facade owns transaction boundaries. The
+behavior itself lives in `backend/app/services/catalog/`; read
 `backend/app/services/catalog/AGENTS.md` for the layer map. To find where a
 facade method lands, search the facade for the method name and follow the
 `self._<collaborator>.` call. Public reads generally begin with `list_`,

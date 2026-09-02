@@ -25,6 +25,17 @@ parameters and never commit; the facade owns transactions. The exception is
 batch preview generation, which commits per component for durability and says
 so at the call site.
 
+## Compatibility-facade size waiver
+
+The alpha-lifecycle compatibility facade is explicitly grandfathered at 2,132
+physical lines, above the 500-line target for new facades and orchestrators.
+Its size comes from 183 explicit, signature-preserving forwarding methods and
+the transaction scopes around them. It may contain no domain implementation,
+may not grow, and its architecture ceiling can only decrease. New behavior
+belongs in this package; dynamic delegation, mixins, and collaborators that
+depend back on the facade remain prohibited. The retirement conditions and
+rationale are recorded in `docs/CATALOG_DECOMPOSITION_HANDOFF.md`.
+
 ## Contracts that must not move
 
 - Revision manifest hashes, audit-chain hashes, and preview fingerprints
