@@ -5,10 +5,14 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 import re
+from typing import Any
 
 from app.services.catalog.metadata_normalization import dedupe
 from app.services.catalog.normalization import sanitize_name, sha256_bytes
 from app.services.catalog.runtime import CatalogRuntime
+
+
+STEP_SUFFIXES = frozenset({".step", ".stp"})
 
 
 def discover_symbol_names_in_text(text: str) -> list[str]:
@@ -183,6 +187,59 @@ class CatalogAssetFiles:
         safe_library = sanitize_name(target_library, "Prism_Assets")
         safe_name = sanitize_name(Path(upload_name).name, f"{asset_type}.bin")
         return CatalogAssetFiles.asset_root(runtime, asset_type) / safe_library / safe_name
+
+    @staticmethod
+    def purge_superseded_step_files(conn: Any, runtime: CatalogRuntime) -> dict[str, Any]:
+        """Purge obsolete STEP bytes while preserving immutable revision evidence.
+
+        The asset row, hash, revision link, and audit history remain intact. A file
+        is removed only when a newer current revision for that component has a
+        different 3D model and no component currently uses the old asset.
+        """
+        rows = conn.execute(
+            """
+            WITH current_models AS (
+                SELECT revision.component_id, link.asset_id
+                FROM components component
+                JOIN component_revisions revision ON revision.id = component.current_revision_id
+                JOIN revision_assets link ON link.revision_id = revision.id
+                WHERE link.asset_type = '3dmodel'
+            ), superseded_models AS (
+                SELECT DISTINCT revision.component_id, link.asset_id
+                FROM component_revisions revision
+                JOIN components component ON component.id = revision.component_id
+                JOIN revision_assets link ON link.revision_id = revision.id
+                JOIN current_models replacement
+                  ON replacement.component_id = revision.component_id
+                 AND replacement.asset_id <> link.asset_id
+                WHERE revision.id <> component.current_revision_id
+                  AND link.asset_type = '3dmodel'
+            )
+            SELECT DISTINCT asset.id, asset.canonical_path
+            FROM superseded_models superseded
+            JOIN assets asset ON asset.id = superseded.asset_id
+            LEFT JOIN current_models active ON active.asset_id = superseded.asset_id
+            WHERE active.asset_id IS NULL
+              AND (
+                lower(asset.canonical_path) LIKE %s
+                OR lower(asset.canonical_path) LIKE %s
+              )
+            """,
+            ("%.step", "%.stp"),
+        ).fetchall()
+        purged: list[str] = []
+        for row in rows:
+            path = Path(str(row["canonical_path"] or "")).resolve()
+            try:
+                path.relative_to(runtime.store_root)
+            except ValueError:
+                continue
+            if path.suffix.lower() not in STEP_SUFFIXES:
+                continue
+            if path.is_file():
+                path.unlink()
+                purged.append(str(row["id"]))
+        return {"purged": len(purged), "asset_ids": purged}
 
 
 __all__ = [
