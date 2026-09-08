@@ -506,10 +506,10 @@ def _restore_asset_payloads(
         if not asset:
             raise ValueError(f"Archived active revision references missing asset {legacy_id}")
         payload = payloads[str(asset["archive_path"])]
-        destination = _permanent_asset_path(Path(service._store_root), asset)  # type: ignore[attr-defined]
+        destination = _permanent_asset_path(Path(service.store_root), asset)
         if destination.is_file() and _sha256_file(destination) != str(asset["sha256"]):
             destination = (
-                Path(service._store_root)  # type: ignore[attr-defined]
+                Path(service.store_root)
                 / "revisions"
                 / str(asset["sha256"])
                 / destination.name
@@ -519,7 +519,8 @@ def _restore_asset_payloads(
             destination.write_bytes(payload)
         if _sha256_file(destination) != str(asset["sha256"]):
             raise ValueError(f"Restored asset checksum failed at {destination}")
-        registered = service._register_asset(  # type: ignore[attr-defined]
+        registered = service.asset_registry.register_asset(
+            service.runtime,
             conn,
             asset_type=str(asset["asset_type"]),
             canonical_path=destination,
@@ -707,13 +708,13 @@ def _insert_restored_component(
                     now,
                 ),
             )
-        manifest_hash = service._revision_manifest_hash(conn, revision_id)  # type: ignore[attr-defined]
+        manifest_hash = service.revisions.revision_manifest_hash(conn, revision_id)
         restored_status = revision_plan["restored_status"]
         conn.execute(
             "UPDATE catalog.component_revisions SET manifest_hash = %s, release_status = %s, updated_at = %s WHERE id = %s",
             (manifest_hash, restored_status, now, revision_id),
         )
-        service._append_audit_event(  # type: ignore[attr-defined]
+        service.revisions.append_audit_event(
             conn,
             component_id=str(component["id"]),
             revision_id=revision_id,
@@ -939,7 +940,7 @@ def restore_archive(args: argparse.Namespace) -> dict[str, Any]:
     service_class = _load_runtime()
     service = service_class(database_url=_dsn(args.database_url))
     service.initialize()
-    with service._connect() as conn:  # type: ignore[attr-defined]
+    with service.connection() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("prism-component-catalog-schema",))
         _preflight_destination(conn, plans)
         if args.dry_run:

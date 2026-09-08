@@ -31,11 +31,11 @@ class AssetSourceResolution(unittest.TestCase):
     """`catalog_asset_source` on the domain service."""
 
     def setUp(self) -> None:
-        from app.services.component_catalog_domain import (  # noqa: PLC0415
-            _content_type_for_asset,
+        from app.services.catalog.asset_files import (  # noqa: PLC0415
+            content_type_for_asset,
         )
 
-        self._content_type_for_asset = _content_type_for_asset
+        self._content_type_for_asset = content_type_for_asset
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.store = Path(tmp.name) / "components"

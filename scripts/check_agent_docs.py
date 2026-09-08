@@ -31,6 +31,8 @@ SOURCE_SUFFIXES = {".py", ".ts", ".tsx", ".md", ".yml", ".yaml", ".json", ".conf
 SKIP_PREFIXES = ("http://", "https://", "mailto:", "#")
 CANONICAL_SKILLS = REPO / ".agents" / "skills"
 CLAUDE_SKILLS = REPO / ".claude" / "skills"
+TASK_SKILLS_HEADING = "## Task skills"
+SKILL_REFERENCE = re.compile(r"`?\.agents/skills/([^/`\s]+)/SKILL\.md`?")
 
 
 def agent_guidance() -> list[Path]:
@@ -120,6 +122,57 @@ def skill_body(path: Path) -> str:
     return "\n".join(lines[end + 1 :]).strip()
 
 
+def canonical_skill_table_references(text: str) -> set[str]:
+    """Return canonical skill names listed in the root task-skill table only."""
+
+    lines = text.splitlines()
+    try:
+        start = next(index for index, line in enumerate(lines) if line.strip() == TASK_SKILLS_HEADING)
+    except StopIteration:
+        return set()
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.match(r"^#{1,6}\s+", lines[index]):
+            end = index
+            break
+    return {
+        match.group(1)
+        for match in SKILL_REFERENCE.finditer("\n".join(lines[start + 1 : end]))
+    }
+
+
+def canonical_skill_table_failures(
+    text: str,
+    canonical_skill_names: set[str] | frozenset[str],
+) -> list[str]:
+    """Require every canonical skill directory in the root task-skill table."""
+
+    listed = canonical_skill_table_references(text)
+    return [
+        f"Root AGENTS.md task-skill table omits canonical skill -> {skill_name}"
+        for skill_name in sorted(set(canonical_skill_names) - listed)
+    ]
+
+
+def canonical_skill_navigation_failures(
+    repo: Path = REPO,
+) -> list[str]:
+    """Check that root AGENTS.md links every canonical skill playbook."""
+
+    guidance_path = repo / "AGENTS.md"
+    if not guidance_path.is_file():
+        return ["Root AGENTS.md is missing; canonical task-skill table cannot be checked"]
+    canonical_root = repo / ".agents" / "skills"
+    canonical_skill_names = {
+        path.parent.name
+        for path in canonical_root.glob("*/SKILL.md")
+        if path.is_file()
+    }
+    return canonical_skill_table_failures(
+        guidance_path.read_text(encoding="utf-8"), canonical_skill_names
+    )
+
+
 def skill_shim_failures() -> tuple[list[str], int]:
     """Keep Claude discovery shims aligned with model-neutral canonical skills."""
     canonical = {
@@ -176,6 +229,7 @@ def main() -> int:
 
     shim_failures, shim_count = skill_shim_failures()
     failures.extend(shim_failures)
+    failures.extend(canonical_skill_navigation_failures())
 
     if failures:
         print(f"Stale agent guidance ({len(failures)} issue(s)):\n")

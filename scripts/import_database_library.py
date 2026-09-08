@@ -22,6 +22,9 @@ for candidate in (REPO_ROOT / "backend", REPO_ROOT):
         sys.path.insert(0, str(candidate))
         break
 
+from app.services.catalog.metadata_normalization import metadata_keywords, metadata_search_document, normalize_metadata  # noqa: E402
+from app.services.catalog.metadata_schema import CatalogMetadataSchema  # noqa: E402
+
 ComponentCatalogService: Any = None
 _discover_footprint_name_in_text: Any = None
 _sanitize_name: Any = None
@@ -33,21 +36,20 @@ MAX_REPORTED_ERRORS = 100
 
 def _load_catalog_runtime() -> None:
     global ComponentCatalogService
-    global _discover_footprint_name_in_text
-    global _sanitize_name
-    global _utc_now_iso
-
-    global _slugify
+    global _discover_footprint_name_in_text, _sanitize_name
+    global _utc_now_iso, _slugify
 
     try:
-        from app.services.component_catalog_domain import (  # noqa: PLC0415
-            _discover_footprint_name_in_text as loaded_discover_footprint_name,
-            _sanitize_name as loaded_sanitize_name,
-            _slugify as loaded_slugify,
-            _utc_now_iso as loaded_utc_now_iso,
+        from app.services.catalog.asset_files import (  # noqa: PLC0415
+            discover_footprint_name_in_text as loaded_discover_footprint_name,
         )
         from app.services.component_catalog_service_postgres import (  # noqa: PLC0415
             ComponentCatalogPostgresService,
+        )
+        from app.services.catalog.normalization import (  # noqa: PLC0415
+            sanitize_name as loaded_sanitize_name,
+            slugify as loaded_slugify,
+            utc_now_iso as loaded_utc_now_iso,
         )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
@@ -432,7 +434,7 @@ def _release_component_fast(
     revision_id: str,
     now: str,
 ) -> None:
-    manifest_hash = service._revision_manifest_hash(conn, revision_id)  # type: ignore[attr-defined]
+    manifest_hash = service.revisions.revision_manifest_hash(conn, revision_id)
     conn.execute(
         """
         UPDATE component_revisions
@@ -459,7 +461,7 @@ def _release_component_fast(
             json.dumps({"trusted_import": True}, sort_keys=True, separators=(",", ":")), now,
         ),
     )
-    service._append_audit_event(  # type: ignore[attr-defined]
+    service.revisions.append_audit_event(
         conn,
         component_id=component_id,
         revision_id=revision_id,
@@ -477,12 +479,12 @@ def _finalize_import_component_fast(
     revision_id: str,
     now: str,
 ) -> str:
-    manifest_hash = service._revision_manifest_hash(conn, revision_id)  # type: ignore[attr-defined]
+    manifest_hash = service.revisions.revision_manifest_hash(conn, revision_id)
     conn.execute(
         "UPDATE component_revisions SET manifest_hash = %s, updated_at = %s WHERE id = %s",
         (manifest_hash, now, revision_id),
     )
-    service._append_audit_event(  # type: ignore[attr-defined]
+    service.revisions.append_audit_event(
         conn,
         component_id=component_id,
         revision_id=revision_id,
@@ -573,9 +575,9 @@ def _insert_import_component(
             metadata["rate"],
             metadata["sap_code"],
             metadata["summary"],
-            json.dumps(service._keywords(metadata), separators=(",", ":")),  # type: ignore[attr-defined]
+            json.dumps(metadata_keywords(metadata), separators=(",", ":")),
             json.dumps(metadata["extra_fields"], sort_keys=True, separators=(",", ":")),
-            service._search_document(metadata),  # type: ignore[attr-defined]
+            metadata_search_document(metadata),
             now,
             now,
         ),
@@ -651,14 +653,11 @@ def _collect_import_plans(
                 continue
 
             stats.rows_selected += 1
-            metadata = service._normalize_metadata(  # type: ignore[attr-defined]
+            metadata = normalize_metadata(
                 _metadata_from_row_cached(
                     row, table, import_name, column_map, source_namespace
                 )
             )
-            # _normalize_metadata intentionally returns only catalog revision
-            # fields. Keep import origin alongside that normalized payload so
-            # every identity kind receives the component-level provenance tag.
             metadata["import_source_namespace"] = source_namespace
             if metadata["extra_fields"].get(MPN_SOURCE_FIELD_LABEL) == MPN_SOURCE_DATABASE:
                 stats.mpn_recovered += 1
@@ -942,7 +941,7 @@ def _register_planned_assets(
         if key in symbol_asset_cache:
             continue
         payload = _symbol_payload_cached(symbol_payload_cache, library, symbol_name)
-        destination = service._symbol_destination(target_library, symbol_name)  # type: ignore[attr-defined]
+        destination = service.asset_files.symbol_destination(service.runtime, target_library, symbol_name)
         canonical = _write_or_copy(destination, None, payload, overwrite=overwrite_assets)
         asset = _register_asset(
             service,
@@ -957,7 +956,7 @@ def _register_planned_assets(
         if generate_previews:
             preview_asset = dict(asset)
             preview_asset["canonical_path"] = str(canonical)
-            service._ensure_asset_preview(target_conn, preview_asset)  # type: ignore[attr-defined]
+            service.previews.ensure_asset_previews(target_conn, service.runtime, preview_asset)
         symbol_asset_cache[key] = asset
         stats.symbol_assets_registered += 1
         pending += 1
@@ -968,7 +967,7 @@ def _register_planned_assets(
         key = (target_library, target_name)
         if key in footprint_asset_cache:
             continue
-        destination = service._footprint_destination(target_library, target_name)  # type: ignore[attr-defined]
+        destination = service.asset_files.footprint_destination(service.runtime, target_library, target_name)
         canonical = _write_or_copy(destination, footprint.path, None, overwrite=overwrite_assets)
         asset = _register_asset(
             service,
@@ -983,7 +982,7 @@ def _register_planned_assets(
         if generate_previews:
             preview_asset = dict(asset)
             preview_asset["canonical_path"] = str(canonical)
-            service._ensure_asset_preview(target_conn, preview_asset)  # type: ignore[attr-defined]
+            service.previews.ensure_asset_previews(target_conn, service.runtime, preview_asset)
         footprint_asset_cache[key] = asset
         stats.footprint_assets_registered += 1
         pending += 1
@@ -1039,7 +1038,7 @@ def _import_groups(
         for key in group.metadata.get("extra_fields", {})
     }
     if discovered_keys:
-        service._ensure_extra_field_definitions(  # type: ignore[attr-defined]
+        CatalogMetadataSchema().ensure_extra_field_definitions(
             target_conn,
             sorted(discovered_keys),
             actor=DATABASE_LIBRARY_IMPORT_ACTOR,
@@ -1184,8 +1183,8 @@ def _build_symbol_index(service: Any, symbols_root: Path) -> dict[str, SymbolLib
         raw_library = symbol_file.stem
         target_library = _sanitize_name(raw_library, "Prism_Symbols")
         text = _read_text(symbol_file)
-        blocks_list = service._extract_top_level_symbol_blocks(text)  # type: ignore[attr-defined]
-        version, generator = service._symbol_header(text)  # type: ignore[attr-defined]
+        blocks_list = service.asset_files.extract_top_level_symbol_blocks(text)
+        version, generator = service.asset_files.symbol_header(text)
         blocks = {name: block for name, block in blocks_list}
         aliases: dict[str, str | None] = {}
         for symbol_name in blocks:
@@ -1380,8 +1379,8 @@ def _register_asset(
     runtime_store_root: Path | None,
 ) -> dict[str, Any]:
     local_path = canonical_path.resolve()
-    asset = service._register_asset(  # type: ignore[attr-defined]
-        conn,
+    asset = service.asset_registry.register_asset(
+        service.runtime, conn,
         asset_type=asset_type,
         canonical_path=local_path,
         target_library=target_library,
@@ -1523,7 +1522,7 @@ def main() -> int:
                 _record_error(stats, conflict)
         elif not args.dry_run:
             service.initialize()
-            target_conn_context = service._connect()  # type: ignore[attr-defined]
+            target_conn_context = service.connection()
             target_conn = target_conn_context.__enter__()
             _begin_import_transaction(target_conn)
             if args.replace_catalog:
