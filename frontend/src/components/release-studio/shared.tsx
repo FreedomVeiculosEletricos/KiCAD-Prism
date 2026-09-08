@@ -68,7 +68,7 @@ export function DocumentSheetPreview({
             {error && <p className="shrink-0 text-sm text-destructive">{error}</p>}
             <div className="relative min-h-0 flex-1 overflow-hidden border bg-preview-surface">
                 {url && (
-                    // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox
+                    // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox - unsandboxed by design: Chromium never loads its PDF viewer in a sandboxed frame, and src is a digest-checked same-origin blob on the pdf-only branch
                     <iframe
                         title={sheet.key}
                         src={url}
@@ -184,7 +184,7 @@ export function MemberViewer({
                 <p className="text-sm text-muted-foreground">No preview. Download to inspect.</p>
             )}
             {!failure && kind === "pdf" && objectUrl && (
-                // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox
+                // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox - unsandboxed by design: Chromium never loads its PDF viewer in a sandboxed frame, and src is a digest-checked same-origin blob on the pdf-only branch
                 <iframe title={member.path} src={objectUrl} className="h-[70vh] w-full border" />
             )}
             {!failure && kind === "image" && objectUrl && (
