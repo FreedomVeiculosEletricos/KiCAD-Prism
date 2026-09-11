@@ -53,7 +53,7 @@ METADATA_PATCH_COLUMNS: dict[str, str] = {
     "sap_code": "sap_code",
 }
 
-_METADATA_COLUMNS: tuple[str, ...] = (
+METADATA_INSERT_COLUMNS: tuple[str, ...] = (
     "name",
     "value",
     "description",
@@ -77,6 +77,7 @@ _METADATA_COLUMNS: tuple[str, ...] = (
     "sap_code",
     "summary",
 )
+_METADATA_COLUMNS = METADATA_INSERT_COLUMNS
 
 
 def _metadata_column_values(metadata: dict[str, Any]) -> tuple[Any, ...]:
@@ -438,6 +439,7 @@ class CatalogComponentWriter:
 
 
 __all__ = [
+    "METADATA_INSERT_COLUMNS",
     "METADATA_PATCH_COLUMNS",
     "SOURCE_EXTERNAL",
     "SOURCE_MANUAL",
