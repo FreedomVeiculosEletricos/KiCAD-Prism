@@ -1372,6 +1372,16 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
             missing=["footprint"],
             place_enabled=False,
         )
+        before_queue = self.service.release_queue_summary()
+        self.service.set_release_status(
+            str(mismatched["id"]), "in_progress", actor="designer@example.com"
+        )
+        self.service.set_release_status(
+            str(mismatched["id"]), "qa_review", actor="designer@example.com"
+        )
+        queued = self.service.release_queue_summary()
+        self.assertEqual(queued["qa_review"], before_queue["qa_review"] + 1)
+        self.assertEqual(queued["blocked"], before_queue["blocked"] + 1)
 
         ready = self._complete_cad(
             self._component("avail-ready-" + uuid.uuid4().hex[:8]),

@@ -19,15 +19,29 @@ from app.services.catalog.component_read_models import (
 from app.services.catalog.revision_kernel import WORKFLOW_STAGES, normalize_workflow_stage
 
 
-def default_representation_has_asset(revision_ref: str, column: str, alias: str) -> str:
-    """SQL predicate: the default representation has a non-empty ``column`` asset id."""
+REPRESENTATION_ASSET_COLUMNS = {
+    "symbol": "symbol_asset_id",
+    "footprint": "footprint_asset_id",
+}
 
+
+def default_representation_has_asset(revision_ref: str, asset_type: str, alias: str) -> str:
+    """SQL predicate: the default representation has a non-empty asset for ``asset_type``."""
+
+    column = REPRESENTATION_ASSET_COLUMNS[asset_type]
     return (
         f"EXISTS (SELECT 1 FROM revision_representations {alias} "
         f"WHERE {alias}.revision_id = {revision_ref}.id "
         f"AND {alias}.is_default = 1 "
         f"AND COALESCE({alias}.{column}, '') <> '')"
     )
+
+
+def default_rep_slot_present(asset_type: str) -> str:
+    """SQL predicate over the ``default_rep`` join used by the paged list query."""
+
+    column = REPRESENTATION_ASSET_COLUMNS[asset_type]
+    return f"COALESCE(default_rep.{column}, '') <> ''"
 
 
 @dataclass(frozen=True)
@@ -114,10 +128,10 @@ class CatalogComponentQueries:
             params.extend(requested_workflow_stages)
         if availability_state:
             symbol_exists = default_representation_has_asset(
-                revision_ref, "symbol_asset_id", "rr_avail_symbol"
+                revision_ref, "symbol", "rr_avail_symbol"
             )
             footprint_exists = default_representation_has_asset(
-                revision_ref, "footprint_asset_id", "rr_avail_footprint"
+                revision_ref, "footprint", "rr_avail_footprint"
             )
             if availability_state == STATE_PLACE_READY:
                 filters.append(f"{symbol_exists} AND {footprint_exists}")
@@ -218,13 +232,13 @@ class CatalogComponentQueries:
         sort_direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
         sort_column = sort_columns.get(sort_by)
         if sort_by == "availability_state":
-            symbol_exists = default_representation_has_asset(
-                revision_ref, "symbol_asset_id", "rr_avail_symbol_sort"
+            # Paged SELECT already LEFT JOINs default_rep; COUNT has no ORDER BY.
+            symbol_present = default_rep_slot_present("symbol")
+            footprint_present = default_rep_slot_present("footprint")
+            sort_column = (
+                f"CASE WHEN {symbol_present} AND {footprint_present} THEN 0 "
+                f"WHEN ({symbol_present}) <> ({footprint_present}) THEN 1 ELSE 2 END"
             )
-            footprint_exists = default_representation_has_asset(
-                revision_ref, "footprint_asset_id", "rr_avail_footprint_sort"
-            )
-            sort_column = f"CASE WHEN {symbol_exists} AND {footprint_exists} THEN 0 WHEN ({symbol_exists}) <> ({footprint_exists}) THEN 1 ELSE 2 END"
 
         if sort_column:
             order_sql = f"ORDER BY {sort_column} {sort_direction}, {revision_ref}.updated_at DESC"
@@ -473,26 +487,21 @@ class CatalogComponentQueries:
 
         The release workspace is server paginated, so its header metrics must be
         computed independently from the visible page. A blocker is either missing
-        required CAD or a failed validation run for the exact current revision.
+        required CAD on the default representation or a failed validation run for
+        the exact current revision.
         """
 
+        symbol_exists = default_representation_has_asset("cr", "symbol", "rr_queue_symbol")
+        footprint_exists = default_representation_has_asset("cr", "footprint", "rr_queue_footprint")
         row = conn.execute(
-            """
+            f"""
             SELECT
                 SUM(CASE WHEN cr.release_status = 'qa_review' THEN 1 ELSE 0 END) AS qa_review,
                 SUM(CASE WHEN cr.release_status = 'done' THEN 1 ELSE 0 END) AS done,
                 SUM(
                     CASE WHEN
-                        NOT EXISTS (
-                            SELECT 1 FROM revision_assets ra_symbol
-                            WHERE ra_symbol.revision_id = cr.id
-                              AND ra_symbol.asset_type = 'symbol'
-                        )
-                        OR NOT EXISTS (
-                            SELECT 1 FROM revision_assets ra_footprint
-                            WHERE ra_footprint.revision_id = cr.id
-                              AND ra_footprint.asset_type = 'footprint'
-                        )
+                        NOT {symbol_exists}
+                        OR NOT {footprint_exists}
                         OR EXISTS (
                             SELECT 1
                             FROM revision_assets ra_validation
@@ -528,5 +537,7 @@ class CatalogComponentQueries:
 __all__ = [
     "CatalogComponentListPlan",
     "CatalogComponentQueries",
+    "REPRESENTATION_ASSET_COLUMNS",
+    "default_rep_slot_present",
     "default_representation_has_asset",
 ]

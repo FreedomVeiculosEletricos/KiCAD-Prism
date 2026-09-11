@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.config import settings
+from app.services.catalog.asset_types import PLACE_REQUIRED_ASSET_TYPES
 from app.services.catalog.metadata_normalization import IDENTITY_KIND_MPN
 from app.services.catalog.normalization import (
     json_loads,
@@ -16,31 +17,23 @@ from app.services.catalog.revision_kernel import CatalogRevisionKernel, normaliz
 
 
 PREVIEW_STATUS_READY = "ready"
-PLACE_REQUIRED_ASSET_TYPES = ("symbol", "footprint")
 
 STATE_METADATA_ONLY = "metadata_only"
 STATE_FILES_PARTIAL = "files_partial"
 STATE_PLACE_READY = "place_ready"
 
 
-def representation_slot_present(value: Any) -> bool:
-    """True when a default-representation symbol or footprint slot is populated."""
+def representation_slot_present(asset: dict[str, Any] | None) -> bool:
+    """True when a representation symbol or footprint slot carries an asset id."""
 
-    if value is None:
-        return False
-    if isinstance(value, dict):
-        return bool(str(value.get("id") or "").strip())
-    return bool(str(value).strip())
+    return bool(asset) and bool(str(asset.get("id") or "").strip())
 
 
 def cad_availability(has_symbol: bool, has_footprint: bool) -> tuple[str, list[str]]:
     """Classify CAD completeness from the effective representation pair."""
 
-    missing = [
-        kind
-        for kind, present in (("symbol", has_symbol), ("footprint", has_footprint))
-        if not present
-    ]
+    present = {"symbol": has_symbol, "footprint": has_footprint}
+    missing = [kind for kind in PLACE_REQUIRED_ASSET_TYPES if not present[kind]]
     if not missing:
         return STATE_PLACE_READY, missing
     if len(missing) == 1:
@@ -518,15 +511,13 @@ class CatalogComponentReadModels:
 
     def availability(
         self,
-        assets: list[dict[str, Any]],
+        *,
+        default_symbol: dict[str, Any] | None,
+        default_footprint: dict[str, Any] | None,
         release_status: str,
         is_active: bool,
-        *,
-        default_symbol: Any = None,
-        default_footprint: Any = None,
         identity_kind: str = IDENTITY_KIND_MPN,
     ) -> tuple[str, list[str], bool]:
-        del assets  # Historical facade argument; completeness is the default pair.
         state, missing = cad_availability(
             representation_slot_present(default_symbol),
             representation_slot_present(default_footprint),
@@ -576,11 +567,10 @@ class CatalogComponentReadModels:
         symbol_asset = effective_representation.get("symbol") if effective_representation else None
         footprint_asset = effective_representation.get("footprint") if effective_representation else None
         availability_state, missing_assets, place_enabled = self.availability(
-            assets,
-            str(revision_row["release_status"]),
-            bool(component_row["is_active"]),
             default_symbol=symbol_asset,
             default_footprint=footprint_asset,
+            release_status=str(revision_row["release_status"]),
+            is_active=bool(component_row["is_active"]),
             identity_kind=str(component_row.get("identity_kind") or IDENTITY_KIND_MPN),
         )
         local_inventory = self.local_inventory(conn, str(component_row["id"]))
@@ -718,11 +708,10 @@ class CatalogComponentReadModels:
         symbol_asset = assets_by_id.get(str(default_symbol_asset_id or ""))
         footprint_asset = assets_by_id.get(str(default_footprint_asset_id or ""))
         availability_state, missing_assets, place_enabled = self.availability(
-            assets,
-            str(revision_row["release_status"]),
-            bool(component_row["is_active"]),
             default_symbol=symbol_asset,
             default_footprint=footprint_asset,
+            release_status=str(revision_row["release_status"]),
+            is_active=bool(component_row["is_active"]),
             identity_kind=str(component_row.get("identity_kind") or IDENTITY_KIND_MPN),
         )
         # Lightweight payloads are used by the KiCad remote panel; avoid validation lookups on search paths.
@@ -763,6 +752,7 @@ class CatalogComponentReadModels:
             "summary": str(revision_row["summary"]),
             "revision": int(revision_row["version"]),
             "version": f"{int(revision_row['version'])}.0.0",
+            # LIB_ID follows the default pair, matching detail payloads.
             "library_name": str(symbol_asset["target_library"]) if symbol_asset else "",
             "symbol_name": str(symbol_asset["target_name"]) if symbol_asset else "",
             "availability_state": availability_state,
