@@ -11,9 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.catalog.component_read_models import (
-    STATE_FILES_PARTIAL,
-    STATE_METADATA_ONLY,
-    STATE_PLACE_READY,
+    cad_availability,
+    remote_place_enabled,
     supply_source_payload,
 )
 from app.services.catalog.metadata_normalization import IDENTITY_KIND_MPN
@@ -31,15 +30,7 @@ def remote_head_payload(raw: Any) -> dict[str, Any]:
     has_symbol = bool(row.get("has_symbol"))
     has_footprint = bool(row.get("has_footprint"))
     identity_kind = str(row.get("identity_kind") or IDENTITY_KIND_MPN)
-    missing_assets = [
-        kind for kind, present in (("symbol", has_symbol), ("footprint", has_footprint)) if not present
-    ]
-    if has_symbol and has_footprint:
-        availability_state = STATE_PLACE_READY
-    elif has_symbol or has_footprint:
-        availability_state = STATE_FILES_PARTIAL
-    else:
-        availability_state = STATE_METADATA_ONLY
+    availability_state, missing_assets = cad_availability(has_symbol, has_footprint)
     assets: list[dict[str, Any]] = []
     if has_symbol:
         assets.append(
@@ -83,7 +74,12 @@ def remote_head_payload(raw: Any) -> dict[str, Any]:
         "previews": previews,
         "availability_state": availability_state,
         "missing_assets": missing_assets,
-        "place_enabled": has_symbol and has_footprint and identity_kind == IDENTITY_KIND_MPN,
+        "place_enabled": remote_place_enabled(
+            is_active=True,
+            identity_kind=identity_kind,
+            missing_assets=missing_assets,
+            release_status="released",
+        ),
         "release_status": "released",
         "workflow_stage": "released",
         "supply": {

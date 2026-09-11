@@ -640,9 +640,6 @@ class ComponentCatalogDomainService:
             preloaded_runs=preloaded_runs,
         )
 
-    def _availability(self, assets: list[dict[str, Any]], release_status: str, is_active: bool) -> tuple[str, list[str], bool]:
-        return self._component_read_models.availability(assets, release_status, is_active)
-
     def _component_payload(
         self,
         conn: Any,
