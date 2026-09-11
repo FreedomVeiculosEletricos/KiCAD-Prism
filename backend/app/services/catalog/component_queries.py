@@ -19,6 +19,17 @@ from app.services.catalog.component_read_models import (
 from app.services.catalog.revision_kernel import WORKFLOW_STAGES, normalize_workflow_stage
 
 
+def default_representation_has_asset(revision_ref: str, column: str, alias: str) -> str:
+    """SQL predicate: the default representation has a non-empty ``column`` asset id."""
+
+    return (
+        f"EXISTS (SELECT 1 FROM revision_representations {alias} "
+        f"WHERE {alias}.revision_id = {revision_ref}.id "
+        f"AND {alias}.is_default = 1 "
+        f"AND COALESCE({alias}.{column}, '') <> '')"
+    )
+
+
 @dataclass(frozen=True)
 class CatalogComponentListPlan:
     """Purely prepared SQL fragments and values for one component-list read."""
@@ -102,13 +113,11 @@ class CatalogComponentQueries:
             filters.append(f"{revision_ref}.release_status IN ({placeholders})")
             params.extend(requested_workflow_stages)
         if availability_state:
-            symbol_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_symbol "
-                f"WHERE ra_symbol.revision_id = {revision_ref}.id AND ra_symbol.asset_type = 'symbol')"
+            symbol_exists = default_representation_has_asset(
+                revision_ref, "symbol_asset_id", "rr_avail_symbol"
             )
-            footprint_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_footprint "
-                f"WHERE ra_footprint.revision_id = {revision_ref}.id AND ra_footprint.asset_type = 'footprint')"
+            footprint_exists = default_representation_has_asset(
+                revision_ref, "footprint_asset_id", "rr_avail_footprint"
             )
             if availability_state == STATE_PLACE_READY:
                 filters.append(f"{symbol_exists} AND {footprint_exists}")
@@ -209,13 +218,11 @@ class CatalogComponentQueries:
         sort_direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
         sort_column = sort_columns.get(sort_by)
         if sort_by == "availability_state":
-            symbol_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_symbol_sort "
-                f"WHERE ra_symbol_sort.revision_id = {revision_ref}.id AND ra_symbol_sort.asset_type = 'symbol')"
+            symbol_exists = default_representation_has_asset(
+                revision_ref, "symbol_asset_id", "rr_avail_symbol_sort"
             )
-            footprint_exists = (
-                f"EXISTS (SELECT 1 FROM revision_assets ra_footprint_sort "
-                f"WHERE ra_footprint_sort.revision_id = {revision_ref}.id AND ra_footprint_sort.asset_type = 'footprint')"
+            footprint_exists = default_representation_has_asset(
+                revision_ref, "footprint_asset_id", "rr_avail_footprint_sort"
             )
             sort_column = f"CASE WHEN {symbol_exists} AND {footprint_exists} THEN 0 WHEN ({symbol_exists}) <> ({footprint_exists}) THEN 1 ELSE 2 END"
 
@@ -267,22 +274,30 @@ class CatalogComponentQueries:
         )
         rows = conn.execute(
             f"""
-            SELECT c.*, {plan.revision_ref}.id AS revision_id
+            SELECT c.*, {plan.revision_ref}.id AS revision_id,
+                   default_rep.symbol_asset_id AS default_symbol_asset_id,
+                   default_rep.footprint_asset_id AS default_footprint_asset_id
             FROM components c
             JOIN component_revisions {plan.revision_ref} ON {plan.revision_ref}.id = c.{plan.revision_join_column}
+            LEFT JOIN revision_representations default_rep
+              ON default_rep.revision_id = {plan.revision_ref}.id AND default_rep.is_default = 1
             {plan.where_sql}
             {plan.order_sql}
             LIMIT %s OFFSET %s
             """,
             plan.params + plan.order_params + (plan.page_size, plan.offset),
         ).fetchall()
-        row_pairs: list[tuple[dict[str, Any], str]] = []
+        row_pairs: list[tuple[dict[str, Any], str, str, str]] = []
         for row in rows:
             component_row = dict(row)
             revision_id = str(component_row.pop("revision_id"))
-            row_pairs.append((component_row, revision_id))
+            default_symbol_asset_id = str(component_row.pop("default_symbol_asset_id") or "")
+            default_footprint_asset_id = str(component_row.pop("default_footprint_asset_id") or "")
+            row_pairs.append(
+                (component_row, revision_id, default_symbol_asset_id, default_footprint_asset_id)
+            )
 
-        revision_ids = [revision_id for _, revision_id in row_pairs]
+        revision_ids = [revision_id for _, revision_id, _, _ in row_pairs]
         revisions_by_id: dict[str, dict[str, Any]] = {}
         if revision_ids:
             placeholders = ",".join("%s" for _ in revision_ids)
@@ -293,12 +308,19 @@ class CatalogComponentQueries:
             revisions_by_id = {str(revision["id"]): dict(revision) for revision in revision_rows}
 
         parsed_rows = []
-        for component_row, revision_id in row_pairs:
+        for component_row, revision_id, default_symbol_asset_id, default_footprint_asset_id in row_pairs:
             revision = revisions_by_id.get(revision_id)
             if revision:
-                parsed_rows.append((component_row, revision))
+                parsed_rows.append(
+                    (
+                        component_row,
+                        revision,
+                        default_symbol_asset_id,
+                        default_footprint_asset_id,
+                    )
+                )
 
-        revision_ids = [str(rev["id"]) for _, rev in parsed_rows]
+        revision_ids = [str(rev["id"]) for _, rev, _, _ in parsed_rows]
         assets_by_revision: dict[str, list[dict[str, Any]]] = {}
         all_asset_ids: list[str] = []
         if revision_ids:
@@ -367,7 +389,7 @@ class CatalogComponentQueries:
                     revision_runs[asset_id] = dict(inherited_row)
 
         items = []
-        for component_row, revision_row in parsed_rows:
+        for component_row, revision_row, default_symbol_asset_id, default_footprint_asset_id in parsed_rows:
             rev_assets = assets_by_revision.get(str(revision_row["id"]), [])
             if plan.lightweight:
                 validation = self._component_read_models.component_validation_summary(
@@ -383,6 +405,8 @@ class CatalogComponentQueries:
                         rev_assets,
                         released_view=plan.released_only,
                         validation_summary=validation,
+                        default_symbol_asset_id=default_symbol_asset_id,
+                        default_footprint_asset_id=default_footprint_asset_id,
                     )
                 )
                 continue
@@ -501,4 +525,8 @@ class CatalogComponentQueries:
         }
 
 
-__all__ = ["CatalogComponentListPlan", "CatalogComponentQueries"]
+__all__ = [
+    "CatalogComponentListPlan",
+    "CatalogComponentQueries",
+    "default_representation_has_asset",
+]

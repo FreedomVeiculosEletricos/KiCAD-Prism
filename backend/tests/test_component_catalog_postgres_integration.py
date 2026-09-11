@@ -1234,6 +1234,232 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
                 )
                 conn.commit()
 
+    def _import_symbol(self, component_id: str, name: str) -> dict:
+        payload = f'''(kicad_symbol_lib (version 20231120) (generator "test")
+          (symbol "{name}"
+            (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+            (property "Value" "{name}" (at 0 0 0) (effects (font (size 1.27 1.27))))
+          )
+        )'''.encode()
+        return self.service.import_symbol_library(
+            component_id,
+            upload_name=f"{name}.kicad_sym",
+            payload=payload,
+            target_library="Availability",
+            selected_symbol=name,
+            actor="designer@example.com",
+        )["component"]
+
+    def _import_footprint(self, component_id: str, name: str) -> dict:
+        return self.service.import_footprint(
+            component_id,
+            upload_name=f"{name}.kicad_mod",
+            payload=f'(footprint "{name}" (version 20240108) (generator "test"))'.encode(),
+            target_library="Availability",
+            selected_footprint=name,
+            actor="designer@example.com",
+        )["component"]
+
+    def _complete_cad(self, component: dict, name: str) -> dict:
+        after_symbol = self._import_symbol(str(component["id"]), name)
+        return self._import_footprint(str(after_symbol["id"]), name)
+
+    def _listed(
+        self,
+        component_id: str,
+        *,
+        lightweight: bool = False,
+        include_inactive: bool = False,
+        **kwargs: object,
+    ) -> dict:
+        detail = self.service.get_component(component_id, include_inactive=True)
+        assert detail is not None
+        page = self.service.list_components(
+            query=str(detail.get("mpn") or detail.get("name") or ""),
+            page=1,
+            page_size=50,
+            lightweight=lightweight,
+            include_inactive=include_inactive,
+            **kwargs,
+        )
+        match = next((item for item in page["items"] if item["id"] == component_id), None)
+        self.assertIsNotNone(match, f"{component_id} missing from list {kwargs}")
+        return match or {}
+
+    def _assert_availability(
+        self,
+        component_id: str,
+        *,
+        state: str,
+        missing: list[str],
+        place_enabled: bool,
+        include_inactive: bool = False,
+    ) -> None:
+        detail = self.service.get_component(component_id, include_inactive=include_inactive)
+        assert detail is not None
+        summary = self._listed(
+            component_id, lightweight=True, include_inactive=include_inactive
+        )
+        full_list = self._listed(
+            component_id, lightweight=False, include_inactive=include_inactive
+        )
+        for payload in (detail, summary, full_list):
+            self.assertEqual(payload["availability_state"], state)
+            self.assertEqual(payload["missing_assets"], missing)
+            self.assertEqual(payload["place_enabled"], place_enabled)
+        filtered = self.service.list_components(
+            query=str(detail.get("mpn") or detail.get("name") or ""),
+            availability_state=state,
+            page=1,
+            page_size=50,
+            include_inactive=include_inactive,
+        )
+        self.assertIn(component_id, {item["id"] for item in filtered["items"]})
+        other_states = {"metadata_only", "files_partial", "place_ready"} - {state}
+        for other in other_states:
+            other_page = self.service.list_components(
+                query=str(detail.get("mpn") or detail.get("name") or ""),
+                availability_state=other,
+                page=1,
+                page_size=50,
+                include_inactive=include_inactive,
+            )
+            self.assertNotIn(component_id, {item["id"] for item in other_page["items"]})
+
+    def test_availability_agrees_across_filter_summary_and_detail(self) -> None:
+        metadata = self._component("avail-meta-" + uuid.uuid4().hex[:8])
+        self._assert_availability(
+            str(metadata["id"]),
+            state="metadata_only",
+            missing=["symbol", "footprint"],
+            place_enabled=False,
+        )
+
+        partial = self._import_symbol(
+            str(self._component("avail-partial-" + uuid.uuid4().hex[:8])["id"]),
+            "PartialSym",
+        )
+        self._assert_availability(
+            str(partial["id"]),
+            state="files_partial",
+            missing=["footprint"],
+            place_enabled=False,
+        )
+
+        complete = self._complete_cad(
+            self._component("avail-complete-" + uuid.uuid4().hex[:8]),
+            "Complete",
+        )
+        default_symbol_id = next(
+            item["symbol"]["id"]
+            for item in complete["representations"]
+            if item.get("is_default") and item.get("symbol")
+        )
+        mismatched = self.service.create_representation(
+            str(complete["id"]),
+            label="Incomplete default",
+            symbol_asset_id=default_symbol_id,
+            make_default=True,
+            expected_revision_id=str(complete["revision_id"]),
+            actor="designer@example.com",
+        )
+        self.assertTrue(
+            any(asset["asset_type"] == "footprint" for asset in mismatched["assets"])
+        )
+        self._assert_availability(
+            str(mismatched["id"]),
+            state="files_partial",
+            missing=["footprint"],
+            place_enabled=False,
+        )
+
+        ready = self._complete_cad(
+            self._component("avail-ready-" + uuid.uuid4().hex[:8]),
+            "Ready",
+        )
+        self._assert_availability(
+            str(ready["id"]),
+            state="place_ready",
+            missing=[],
+            place_enabled=False,
+        )
+
+        token = uuid.uuid4().hex[:8]
+        provisional = self._complete_cad(
+            self.service.create_manual_component(
+                name=f"IPN-{token}",
+                value="provisional",
+                description="Provisional availability fixture",
+                datasheet="https://example.com/provisional.pdf",
+                manufacturer="Prism Availability",
+                manufacturer_part_number="",
+                identity_kind="provisional_ipn",
+                identity_source="fixture",
+                source_internal_part_number=f"IPN-{token}",
+                actor="author@example.com",
+            ),
+            "Provisional",
+        )
+        self.component_ids.append(str(provisional["id"]))
+        self._assert_availability(
+            str(provisional["id"]),
+            state="place_ready",
+            missing=[],
+            place_enabled=False,
+        )
+
+        inactive = self._complete_cad(
+            self._component("avail-inactive-" + uuid.uuid4().hex[:8]),
+            "Inactive",
+        )
+        self.assertTrue(
+            self.service.deactivate_component(
+                str(inactive["id"]), actor="author@example.com", reason="availability fixture"
+            )
+        )
+        hidden = self.service.list_components(page=1, page_size=100, include_inactive=False)
+        self.assertNotIn(str(inactive["id"]), {item["id"] for item in hidden["items"]})
+        self._assert_availability(
+            str(inactive["id"]),
+            state="place_ready",
+            missing=[],
+            place_enabled=False,
+            include_inactive=True,
+        )
+
+        released = self._complete_cad(
+            self._component("avail-released-" + uuid.uuid4().hex[:8]),
+            "Released",
+        )
+        self.service.set_release_status(
+            str(released["id"]), "in_progress", actor="designer@example.com"
+        )
+        self.service.set_release_status(
+            str(released["id"]), "qa_review", actor="designer@example.com"
+        )
+        current = self.service.get_component(str(released["id"]))
+        assert current is not None
+        approved = self.service.set_release_status(
+            str(released["id"]),
+            "done",
+            actor="qa@example.com",
+            expected_revision_id=current["revision_id"],
+            expected_manifest_hash=current["manifest_hash"],
+        )
+        self.service.set_release_status(
+            str(released["id"]),
+            "released",
+            actor="designer@example.com",
+            expected_revision_id=approved["revision_id"],
+            expected_manifest_hash=approved["manifest_hash"],
+        )
+        self._assert_availability(
+            str(released["id"]),
+            state="place_ready",
+            missing=[],
+            place_enabled=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

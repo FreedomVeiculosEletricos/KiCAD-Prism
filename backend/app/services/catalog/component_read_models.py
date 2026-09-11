@@ -22,6 +22,48 @@ STATE_METADATA_ONLY = "metadata_only"
 STATE_FILES_PARTIAL = "files_partial"
 STATE_PLACE_READY = "place_ready"
 
+
+def representation_slot_present(value: Any) -> bool:
+    """True when a default-representation symbol or footprint slot is populated."""
+
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return bool(str(value.get("id") or "").strip())
+    return bool(str(value).strip())
+
+
+def cad_availability(has_symbol: bool, has_footprint: bool) -> tuple[str, list[str]]:
+    """Classify CAD completeness from the effective representation pair."""
+
+    missing = [
+        kind
+        for kind, present in (("symbol", has_symbol), ("footprint", has_footprint))
+        if not present
+    ]
+    if not missing:
+        return STATE_PLACE_READY, missing
+    if len(missing) == 1:
+        return STATE_FILES_PARTIAL, missing
+    return STATE_METADATA_ONLY, missing
+
+
+def remote_place_enabled(
+    *,
+    is_active: bool,
+    identity_kind: str,
+    missing_assets: list[str],
+    release_status: str,
+) -> bool:
+    """Permission to place is separate from CAD completeness."""
+
+    return (
+        bool(is_active)
+        and str(identity_kind or IDENTITY_KIND_MPN) == IDENTITY_KIND_MPN
+        and not missing_assets
+        and _release_allows_remote(release_status)
+    )
+
 # Availability sources shown in the remote-provider payload. Everything today
 # is local inventory; distributor adapters (supply_quotes) extend
 # SUPPLY_VENDOR_SOURCE_NAMES when they land.
@@ -475,22 +517,26 @@ class CatalogComponentReadModels:
         }
 
     def availability(
-        self, assets: list[dict[str, Any]], release_status: str, is_active: bool
+        self,
+        assets: list[dict[str, Any]],
+        release_status: str,
+        is_active: bool,
+        *,
+        default_symbol: Any = None,
+        default_footprint: Any = None,
+        identity_kind: str = IDENTITY_KIND_MPN,
     ) -> tuple[str, list[str], bool]:
-        asset_types = {str(asset["asset_type"]) for asset in assets}
-        missing = [
-            asset_type
-            for asset_type in PLACE_REQUIRED_ASSET_TYPES
-            if asset_type not in asset_types
-        ]
-        if missing and len(missing) == len(PLACE_REQUIRED_ASSET_TYPES):
-            state = STATE_METADATA_ONLY
-        elif missing:
-            state = STATE_FILES_PARTIAL
-        else:
-            state = STATE_PLACE_READY
-        place_enabled = is_active and not missing and _release_allows_remote(release_status)
-        return state, missing, place_enabled
+        del assets  # Historical facade argument; completeness is the default pair.
+        state, missing = cad_availability(
+            representation_slot_present(default_symbol),
+            representation_slot_present(default_footprint),
+        )
+        return state, missing, remote_place_enabled(
+            is_active=is_active,
+            identity_kind=identity_kind,
+            missing_assets=missing,
+            release_status=release_status,
+        )
 
     def component_payload(
         self,
@@ -529,23 +575,13 @@ class CatalogComponentReadModels:
                 raise ValueError("Selected representation is incomplete")
         symbol_asset = effective_representation.get("symbol") if effective_representation else None
         footprint_asset = effective_representation.get("footprint") if effective_representation else None
-        missing_assets = [
-            kind
-            for kind, value in (("symbol", symbol_asset), ("footprint", footprint_asset))
-            if not value
-        ]
-        availability_state = (
-            STATE_PLACE_READY
-            if not missing_assets
-            else STATE_FILES_PARTIAL
-            if len(missing_assets) == 1
-            else STATE_METADATA_ONLY
-        )
-        place_enabled = (
-            bool(component_row["is_active"])
-            and str(component_row.get("identity_kind") or IDENTITY_KIND_MPN) == IDENTITY_KIND_MPN
-            and not missing_assets
-            and _release_allows_remote(str(revision_row["release_status"]))
+        availability_state, missing_assets, place_enabled = self.availability(
+            assets,
+            str(revision_row["release_status"]),
+            bool(component_row["is_active"]),
+            default_symbol=symbol_asset,
+            default_footprint=footprint_asset,
+            identity_kind=str(component_row.get("identity_kind") or IDENTITY_KIND_MPN),
         )
         local_inventory = self.local_inventory(conn, str(component_row["id"]))
         supply_sources = self.supply_sources(conn, str(component_row["id"]))
@@ -675,15 +711,20 @@ class CatalogComponentReadModels:
         *,
         released_view: bool = False,
         validation_summary: dict[str, Any] | None = None,
+        default_symbol_asset_id: str = "",
+        default_footprint_asset_id: str = "",
     ) -> dict[str, Any]:
+        assets_by_id = {str(asset["id"]): asset for asset in assets}
+        symbol_asset = assets_by_id.get(str(default_symbol_asset_id or ""))
+        footprint_asset = assets_by_id.get(str(default_footprint_asset_id or ""))
         availability_state, missing_assets, place_enabled = self.availability(
             assets,
             str(revision_row["release_status"]),
             bool(component_row["is_active"]),
+            default_symbol=symbol_asset,
+            default_footprint=footprint_asset,
+            identity_kind=str(component_row.get("identity_kind") or IDENTITY_KIND_MPN),
         )
-        if str(component_row.get("identity_kind") or IDENTITY_KIND_MPN) != IDENTITY_KIND_MPN:
-            place_enabled = False
-        symbol_asset = next((asset for asset in assets if asset["asset_type"] == "symbol"), None)
         # Lightweight payloads are used by the KiCad remote panel; avoid validation lookups on search paths.
         validation_summary = validation_summary or {
             "status": VALIDATION_STATUS_NOT_RUN,
@@ -784,6 +825,9 @@ class CatalogComponentReadModels:
 
 __all__ = [
     "CatalogComponentReadModels",
+    "cad_availability",
+    "remote_place_enabled",
+    "representation_slot_present",
     "supply_source_payload",
     "SUPPLY_KIND_VENDOR",
     "SUPPLY_KIND_LOCAL",
