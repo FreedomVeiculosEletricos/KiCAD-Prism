@@ -203,7 +203,7 @@ tooling, and finally mechanical migration-file separation.
 
 ## Approved compatibility-facade size exception
 
-The completed decomposition retains `component_catalog_domain.py` as a 2,132
+The completed decomposition retains `component_catalog_domain.py` as a 2,014
 line compatibility facade for the alpha lifecycle. This is an explicit waiver
 from the original 500-line facade/orchestrator target, not permission for a new
 god module. The stable historical surface has 183 forwarding signatures, and
@@ -216,7 +216,7 @@ The exception has these hard bounds:
 - the facade contains transaction and connection scopes plus explicit
   delegation, but no domain implementation;
 - new catalog behavior must be implemented in `backend/app/services/catalog/`;
-- the checked-in 2,132-line architecture ceiling may only shrink and must never
+- the checked-in 2,014-line architecture ceiling may only shrink and must never
   increase;
 - collaborators must not import or retain a reference to the facade; and
 - after the alpha compatibility window, callers should migrate to supported

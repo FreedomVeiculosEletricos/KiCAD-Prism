@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from app.services.catalog.collaborators import build_catalog_collaborators
 from app.services.catalog.component_history import CatalogComponentHistoryReads
 from app.services.catalog.component_read_models import (
     CatalogComponentReadModels,
@@ -187,175 +188,59 @@ def _normalize_workflow_stage(stage: str) -> str:
 
 
 class ComponentCatalogDomainService:
-    _catalog_locks: CatalogLockOperations = NoopCatalogLocks()
-    _revision_kernel: CatalogRevisionKernel = CatalogRevisionKernel(_catalog_locks)
-    _revision_comparison: CatalogRevisionComparison = CatalogRevisionComparison(_revision_kernel)
-    _component_history_reads: CatalogComponentHistoryReads = CatalogComponentHistoryReads(_revision_kernel)
-    _component_read_models: CatalogComponentReadModels = CatalogComponentReadModels(_revision_kernel)
-    _component_queries: CatalogComponentQueries = CatalogComponentQueries(_component_read_models)
-    _asset_browser: CatalogAssetBrowser = CatalogAssetBrowser()
-    _asset_files: CatalogAssetFiles = CatalogAssetFiles()
-    _asset_registry: CatalogAssetRegistry = CatalogAssetRegistry()
-    _preview_renderer: CatalogPreviewRenderer = CatalogPreviewRenderer()
-    _preview_store: CatalogPreviewStore = CatalogPreviewStore()
-    _preview_pipeline: CatalogPreviewPipeline = CatalogPreviewPipeline(
-        _catalog_locks, _revision_kernel, _component_read_models, _preview_renderer, _preview_store
-    )
-    _revision_finalizer: CatalogRevisionFinalizer = CatalogRevisionFinalizer(
-        _revision_kernel, _preview_pipeline
-    )
-    _asset_links: CatalogAssetLinks = CatalogAssetLinks(
-        _revision_kernel, _preview_pipeline, _revision_finalizer
-    )
-    _asset_imports: CatalogAssetImports = CatalogAssetImports(
-        _revision_kernel, _asset_links, _revision_finalizer, _asset_files, _asset_registry
-    )
-    _representations: CatalogRepresentations = CatalogRepresentations(
-        _revision_kernel, _revision_finalizer
-    )
-    _component_writer: CatalogComponentWriter = CatalogComponentWriter(
-        _catalog_locks, _revision_kernel, _revision_finalizer, CatalogMetadataSchema()
-    )
-    _klc_validation: CatalogKlcValidation = CatalogKlcValidation(_revision_kernel, _component_read_models)
-    _release_workflow: CatalogReleaseWorkflow = CatalogReleaseWorkflow(
-        _catalog_locks, _revision_kernel, _component_read_models, _revision_finalizer, _klc_validation
-    )
-    _catalog_health: CatalogHealth = CatalogHealth(_component_queries, _klc_validation)
-    _placement: CatalogPlacement = CatalogPlacement(_revision_kernel, _component_read_models)
-    _dbl_export: CatalogDblExport = CatalogDblExport(_placement)
-    _provider_tokens: CatalogProviderTokens = CatalogProviderTokens()
-    _remote_heads: CatalogRemoteHeads = CatalogRemoteHeads()
-    _project_import_sessions: CatalogProjectImportSessions = CatalogProjectImportSessions()
-    _project_import_matching: CatalogProjectImportMatching = CatalogProjectImportMatching()
-    _project_import_assets: CatalogProjectImportAssets = CatalogProjectImportAssets(_revision_kernel)
-    _project_import_acceptance: CatalogProjectImportAcceptance = CatalogProjectImportAcceptance(
-        _catalog_locks,
-        _revision_kernel,
-        _project_import_assets,
-        _project_import_matching,
-        _asset_files,
-        _asset_registry,
-        _asset_links,
-        _revision_finalizer,
-        _component_writer,
-    )
-    _metadata_schema: CatalogMetadataSchema = CatalogMetadataSchema()
-    _metadata_fields: CatalogMetadataFields = CatalogMetadataFields(_metadata_schema)
-    _metadata_grid: CatalogMetadataGrid = CatalogMetadataGrid()
-    _metadata_csv: CatalogMetadataCsv = CatalogMetadataCsv()
-    _inventory_csv: CatalogInventoryCsv = CatalogInventoryCsv()
-    _metadata_batches: CatalogMetadataBatches = CatalogMetadataBatches()
-    _metadata_batch_staging: CatalogMetadataBatchStaging = CatalogMetadataBatchStaging()
-    _metadata_batch_application: CatalogMetadataBatchApplication = CatalogMetadataBatchApplication()
-    _metadata_batch_workflow: CatalogMetadataBatchWorkflow = CatalogMetadataBatchWorkflow(
-        _catalog_locks,
-        _revision_kernel,
-        _revision_finalizer,
-        _component_writer,
-        _metadata_fields,
-        _metadata_batches,
-        _metadata_batch_staging,
-        _metadata_batch_application,
-    )
-    _metadata_csv_importer: CatalogMetadataCsvImporter = CatalogMetadataCsvImporter(
-        _component_writer, _asset_imports, _asset_links, _revision_finalizer
-    )
+    _catalog_locks: CatalogLockOperations
+    _revision_kernel: CatalogRevisionKernel
+    _revision_comparison: CatalogRevisionComparison
+    _component_history_reads: CatalogComponentHistoryReads
+    _component_read_models: CatalogComponentReadModels
+    _component_queries: CatalogComponentQueries
+    _asset_browser: CatalogAssetBrowser
+    _asset_files: CatalogAssetFiles
+    _asset_registry: CatalogAssetRegistry
+    _preview_renderer: CatalogPreviewRenderer
+    _preview_store: CatalogPreviewStore
+    _preview_pipeline: CatalogPreviewPipeline
+    _revision_finalizer: CatalogRevisionFinalizer
+    _asset_links: CatalogAssetLinks
+    _asset_imports: CatalogAssetImports
+    _representations: CatalogRepresentations
+    _component_writer: CatalogComponentWriter
+    _klc_validation: CatalogKlcValidation
+    _release_workflow: CatalogReleaseWorkflow
+    _catalog_health: CatalogHealth
+    _placement: CatalogPlacement
+    _dbl_export: CatalogDblExport
+    _provider_tokens: CatalogProviderTokens
+    _remote_heads: CatalogRemoteHeads
+    _project_import_sessions: CatalogProjectImportSessions
+    _project_import_matching: CatalogProjectImportMatching
+    _project_import_assets: CatalogProjectImportAssets
+    _project_import_acceptance: CatalogProjectImportAcceptance
+    _metadata_schema: CatalogMetadataSchema
+    _metadata_fields: CatalogMetadataFields
+    _metadata_grid: CatalogMetadataGrid
+    _metadata_csv: CatalogMetadataCsv
+    _inventory_csv: CatalogInventoryCsv
+    _metadata_batches: CatalogMetadataBatches
+    _metadata_batch_staging: CatalogMetadataBatchStaging
+    _metadata_batch_application: CatalogMetadataBatchApplication
+    _metadata_batch_workflow: CatalogMetadataBatchWorkflow
+    _metadata_csv_importer: CatalogMetadataCsvImporter
 
-    def __init__(self, store_root: Path | None = None, database_url: str | None = None) -> None:
+    def __init__(
+        self,
+        store_root: Path | None = None,
+        database_url: str | None = None,
+        *,
+        catalog_locks: CatalogLockOperations | None = None,
+    ) -> None:
         self._catalog_runtime = CatalogRuntime(
             store_root=store_root,
             database_path=self._database_path(database_url),
         )
-        self._catalog_locks: CatalogLockOperations = NoopCatalogLocks()
-        self._revision_kernel = CatalogRevisionKernel(self._catalog_locks)
-        self._revision_comparison = CatalogRevisionComparison(self._revision_kernel)
-        self._component_history_reads = CatalogComponentHistoryReads(self._revision_kernel)
-        self._component_read_models = CatalogComponentReadModels(self._revision_kernel)
-        self._component_queries = CatalogComponentQueries(self._component_read_models)
-        self._asset_browser = CatalogAssetBrowser()
-        self._asset_files = CatalogAssetFiles()
-        self._asset_registry = CatalogAssetRegistry()
-        self._preview_renderer = CatalogPreviewRenderer()
-        self._preview_store = CatalogPreviewStore()
-        self._metadata_schema: CatalogMetadataSchema = CatalogMetadataSchema()
-        self._metadata_fields: CatalogMetadataFields = CatalogMetadataFields(self._metadata_schema)
-        self._metadata_grid: CatalogMetadataGrid = CatalogMetadataGrid()
-        self._metadata_csv: CatalogMetadataCsv = CatalogMetadataCsv()
-        self._inventory_csv: CatalogInventoryCsv = CatalogInventoryCsv()
-        self._metadata_batches = CatalogMetadataBatches()
-        self._metadata_batch_staging = CatalogMetadataBatchStaging()
-        self._metadata_batch_application = CatalogMetadataBatchApplication()
-        self._project_import_sessions = CatalogProjectImportSessions()
-        self._project_import_matching = CatalogProjectImportMatching()
-        self._project_import_assets = CatalogProjectImportAssets(self._revision_kernel)
-        self._compose_revision_writers()
-
-    def _compose_revision_writers(self) -> None:
-        """Wire the collaborators that write revisions on top of this instance's kernel.
-
-        The PostgreSQL subclass swaps in transactional locks and a fresh kernel
-        after ``super().__init__``; it calls this again so every writer shares
-        that kernel instead of the no-op base wiring.
-        """
-        self._preview_pipeline = CatalogPreviewPipeline(
-            self._catalog_locks,
-            self._revision_kernel,
-            self._component_read_models,
-            self._preview_renderer,
-            self._preview_store,
-        )
-        self._revision_finalizer = CatalogRevisionFinalizer(self._revision_kernel, self._preview_pipeline)
-        self._asset_links = CatalogAssetLinks(
-            self._revision_kernel, self._preview_pipeline, self._revision_finalizer
-        )
-        self._asset_imports = CatalogAssetImports(
-            self._revision_kernel,
-            self._asset_links,
-            self._revision_finalizer,
-            self._asset_files,
-            self._asset_registry,
-        )
-        self._representations = CatalogRepresentations(self._revision_kernel, self._revision_finalizer)
-        self._component_writer = CatalogComponentWriter(
-            self._catalog_locks, self._revision_kernel, self._revision_finalizer, self._metadata_schema
-        )
-        self._klc_validation = CatalogKlcValidation(self._revision_kernel, self._component_read_models)
-        self._release_workflow = CatalogReleaseWorkflow(
-            self._catalog_locks,
-            self._revision_kernel,
-            self._component_read_models,
-            self._revision_finalizer,
-            self._klc_validation,
-        )
-        self._catalog_health = CatalogHealth(self._component_queries, self._klc_validation)
-        self._placement = CatalogPlacement(self._revision_kernel, self._component_read_models)
-        self._dbl_export = CatalogDblExport(self._placement)
-        self._provider_tokens = CatalogProviderTokens()
-        self._remote_heads = CatalogRemoteHeads()
-        self._project_import_acceptance = CatalogProjectImportAcceptance(
-            self._catalog_locks,
-            self._revision_kernel,
-            self._project_import_assets,
-            self._project_import_matching,
-            self._asset_files,
-            self._asset_registry,
-            self._asset_links,
-            self._revision_finalizer,
-            self._component_writer,
-        )
-        self._metadata_batch_workflow = CatalogMetadataBatchWorkflow(
-            self._catalog_locks,
-            self._revision_kernel,
-            self._revision_finalizer,
-            self._component_writer,
-            self._metadata_fields,
-            self._metadata_batches,
-            self._metadata_batch_staging,
-            self._metadata_batch_application,
-        )
-        self._metadata_csv_importer = CatalogMetadataCsvImporter(
-            self._component_writer, self._asset_imports, self._asset_links, self._revision_finalizer
-        )
+        build_catalog_collaborators(
+            catalog_locks=catalog_locks or NoopCatalogLocks(),
+        ).bind(self)
 
     def _runtime_for_compat(self) -> CatalogRuntime:
         """Lazily support legacy ``__new__``-constructed test doubles."""
