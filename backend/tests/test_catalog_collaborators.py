@@ -56,6 +56,21 @@ class CatalogCollaboratorConstructionTests(unittest.TestCase):
                     self.assertIsNot(nested, first)
                     self.assertIsNot(nested, second)
 
+    def test_facade_declares_every_collaborator_attribute(self) -> None:
+        declared = ComponentCatalogDomainService.__annotations__
+        for field in CatalogCollaborators.__dataclass_fields__:
+            self.assertIn(f"_{field}", declared)
+
+    def test_bind_requires_declared_collaborator_annotations(self) -> None:
+        graph = build_catalog_collaborators(catalog_locks=NoopCatalogLocks())
+
+        class MissingAnnotations:
+            pass
+
+        with self.assertRaises(AttributeError) as raised:
+            graph.bind(MissingAnnotations())
+        self.assertIn("_revision_kernel", str(raised.exception))
+
     def test_postgres_instances_do_not_share_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
             first = ComponentCatalogPostgresService(store_root=Path(first_dir))

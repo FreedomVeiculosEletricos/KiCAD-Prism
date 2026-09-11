@@ -93,8 +93,24 @@ class CatalogCollaborators:
     metadata_csv_importer: CatalogMetadataCsvImporter
 
     def bind(self, target: object) -> None:
+        declared = _declared_annotation_names(type(target))
+        missing = [
+            f"_{field.name}" for field in fields(self) if f"_{field.name}" not in declared
+        ]
+        if missing:
+            raise AttributeError(
+                f"{type(target).__name__} is missing collaborator annotations: "
+                + ", ".join(missing)
+            )
         for field in fields(self):
             setattr(target, f"_{field.name}", getattr(self, field.name))
+
+
+def _declared_annotation_names(cls: type) -> set[str]:
+    names: set[str] = set()
+    for base in cls.__mro__:
+        names.update(getattr(base, "__annotations__", {}))
+    return names
 
 
 def build_catalog_collaborators(

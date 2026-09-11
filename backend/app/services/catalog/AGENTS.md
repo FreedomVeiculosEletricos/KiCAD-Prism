@@ -28,7 +28,7 @@ so at the call site.
 
 ## Compatibility-facade size waiver
 
-The alpha-lifecycle compatibility facade is explicitly grandfathered at 1,975
+The alpha-lifecycle compatibility facade is explicitly grandfathered at 2,014
 physical lines, above the 500-line target for new facades and orchestrators.
 Its size comes from explicit, signature-preserving forwarding methods and
 the transaction scopes around them. It may contain no domain implementation,

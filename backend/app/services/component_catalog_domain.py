@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from app.services.catalog.collaborators import build_catalog_collaborators
 from app.services.catalog.component_history import CatalogComponentHistoryReads
 from app.services.catalog.component_read_models import (
     CatalogComponentReadModels,
@@ -55,7 +56,6 @@ from app.services.catalog.asset_types import (
 )
 from app.services.catalog.kicad_cli import KicadCliRunner
 from app.services.catalog.locking import CatalogLockOperations, NoopCatalogLocks
-from app.services.catalog.collaborators import build_catalog_collaborators
 from app.services.catalog.metadata_batch_application import CatalogMetadataBatchApplication
 from app.services.catalog.metadata_batches import CatalogMetadataBatches
 from app.services.catalog.metadata_batch_staging import CatalogMetadataBatchStaging
@@ -188,6 +188,45 @@ def _normalize_workflow_stage(stage: str) -> str:
 
 
 class ComponentCatalogDomainService:
+    _catalog_locks: CatalogLockOperations
+    _revision_kernel: CatalogRevisionKernel
+    _revision_comparison: CatalogRevisionComparison
+    _component_history_reads: CatalogComponentHistoryReads
+    _component_read_models: CatalogComponentReadModels
+    _component_queries: CatalogComponentQueries
+    _asset_browser: CatalogAssetBrowser
+    _asset_files: CatalogAssetFiles
+    _asset_registry: CatalogAssetRegistry
+    _preview_renderer: CatalogPreviewRenderer
+    _preview_store: CatalogPreviewStore
+    _preview_pipeline: CatalogPreviewPipeline
+    _revision_finalizer: CatalogRevisionFinalizer
+    _asset_links: CatalogAssetLinks
+    _asset_imports: CatalogAssetImports
+    _representations: CatalogRepresentations
+    _component_writer: CatalogComponentWriter
+    _klc_validation: CatalogKlcValidation
+    _release_workflow: CatalogReleaseWorkflow
+    _catalog_health: CatalogHealth
+    _placement: CatalogPlacement
+    _dbl_export: CatalogDblExport
+    _provider_tokens: CatalogProviderTokens
+    _remote_heads: CatalogRemoteHeads
+    _project_import_sessions: CatalogProjectImportSessions
+    _project_import_matching: CatalogProjectImportMatching
+    _project_import_assets: CatalogProjectImportAssets
+    _project_import_acceptance: CatalogProjectImportAcceptance
+    _metadata_schema: CatalogMetadataSchema
+    _metadata_fields: CatalogMetadataFields
+    _metadata_grid: CatalogMetadataGrid
+    _metadata_csv: CatalogMetadataCsv
+    _inventory_csv: CatalogInventoryCsv
+    _metadata_batches: CatalogMetadataBatches
+    _metadata_batch_staging: CatalogMetadataBatchStaging
+    _metadata_batch_application: CatalogMetadataBatchApplication
+    _metadata_batch_workflow: CatalogMetadataBatchWorkflow
+    _metadata_csv_importer: CatalogMetadataCsvImporter
+
     def __init__(
         self,
         store_root: Path | None = None,
