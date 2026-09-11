@@ -329,19 +329,17 @@ def builtin_metadata_mapping_gaps(
         if diff_keys is not None and descriptor.key not in diff_keys:
             gaps.append(f"revision diff missing {descriptor.key}")
         if import_labels is not None and descriptor.symbol_label is not None:
-            if descriptor.key in PROJECT_IMPORT_LABEL_SKIP_KEYS:
-                continue
-            mapped_import = import_labels.get(descriptor.symbol_label)
-            if descriptor.key in known_import_gaps:
-                if mapped_import == descriptor.key:
+            if descriptor.key not in PROJECT_IMPORT_LABEL_SKIP_KEYS:
+                mapped_import = import_labels.get(descriptor.symbol_label)
+                if descriptor.key in known_import_gaps:
+                    if mapped_import == descriptor.key:
+                        gaps.append(
+                            f"project import closed known gap {descriptor.key} without updating the allowlist"
+                        )
+                elif mapped_import != descriptor.key:
                     gaps.append(
-                        f"project import closed known gap {descriptor.key} without updating the allowlist"
+                        f"project import missing {descriptor.symbol_label!r}"
                     )
-                continue
-            if mapped_import != descriptor.key:
-                gaps.append(
-                    f"project import missing {descriptor.symbol_label!r}"
-                )
     flagged_search = {
         descriptor.key
         for descriptor in BUILTIN_METADATA_DESCRIPTORS
