@@ -12,7 +12,10 @@ from app.api.catalog_admin import (  # noqa: E402
     CreateManualComponentRequest,
     UpdateComponentMetadataRequest,
 )
-from app.services.catalog.component_writer import METADATA_PATCH_COLUMNS  # noqa: E402
+from app.services.catalog.component_writer import (  # noqa: E402
+    METADATA_INSERT_COLUMNS,
+    METADATA_PATCH_COLUMNS,
+)
 from app.services.catalog.metadata_csv import (  # noqa: E402
     CSV_REQUIRED_COLUMNS,
     CatalogMetadataCsv,
@@ -20,6 +23,7 @@ from app.services.catalog.metadata_csv import (  # noqa: E402
 from app.services.catalog.metadata_descriptors import (  # noqa: E402
     BUILTIN_METADATA_DESCRIPTORS,
     BUILTIN_METADATA_FIELDS,
+    PROJECT_IMPORT_KNOWN_LABEL_GAPS,
     SYMBOL_METADATA_FIELD_ORDER,
     SYMBOL_METADATA_LABEL_TO_KEY,
     builtin_metadata_mapping_gaps,
@@ -30,6 +34,15 @@ from app.services.catalog.metadata_normalization import (  # noqa: E402
 )
 from app.services.catalog.placement_payloads import (  # noqa: E402
     SYMBOL_METADATA_FIELD_ORDER as PLACEMENT_FIELD_ORDER,
+)
+from app.services.catalog.project_import_acceptance import (  # noqa: E402
+    PROJECT_IMPORT_SYMBOL_LABEL_TO_KEY,
+)
+from app.services.catalog.project_import_assets import (  # noqa: E402
+    IMPORT_UNCHANGED_METADATA_FIELDS,
+)
+from app.services.catalog.revision_comparison import (  # noqa: E402
+    REVISION_DIFF_METADATA_FIELDS,
 )
 
 
@@ -64,6 +77,11 @@ class BuiltinMetadataDescriptorTests(unittest.TestCase):
             symbol_label_to_key=SYMBOL_METADATA_LABEL_TO_KEY,
             csv_payload_keys=csv_payload,
             patch_columns=METADATA_PATCH_COLUMNS,
+            insert_columns=METADATA_INSERT_COLUMNS,
+            import_label_to_key=PROJECT_IMPORT_SYMBOL_LABEL_TO_KEY,
+            import_label_gaps=PROJECT_IMPORT_KNOWN_LABEL_GAPS,
+            import_unchanged_keys=IMPORT_UNCHANGED_METADATA_FIELDS,
+            revision_diff_keys=REVISION_DIFF_METADATA_FIELDS,
         )
         self.assertEqual(gaps, ())
 
@@ -80,6 +98,69 @@ class BuiltinMetadataDescriptorTests(unittest.TestCase):
             patch_columns=METADATA_PATCH_COLUMNS,
         )
         self.assertIn("create API missing manufacturer_part_number", gaps)
+
+    def test_mapping_gaps_catch_a_field_missing_from_insert_columns(self) -> None:
+        gaps = builtin_metadata_mapping_gaps(
+            normalized_keys=normalize_metadata(_required_payload()),
+            create_fields=CreateManualComponentRequest.model_fields,
+            update_fields=UpdateComponentMetadataRequest.model_fields,
+            symbol_label_to_key=SYMBOL_METADATA_LABEL_TO_KEY,
+            csv_payload_keys=normalize_metadata(_required_payload()),
+            patch_columns=METADATA_PATCH_COLUMNS,
+            insert_columns=set(METADATA_INSERT_COLUMNS) - {"mass_g"},
+        )
+        self.assertIn("insert columns missing mass_g", gaps)
+
+    def test_project_import_names_sap_code_as_a_known_label_gap(self) -> None:
+        common = dict(
+            normalized_keys=normalize_metadata(_required_payload()),
+            create_fields=CreateManualComponentRequest.model_fields,
+            update_fields=UpdateComponentMetadataRequest.model_fields,
+            symbol_label_to_key=SYMBOL_METADATA_LABEL_TO_KEY,
+            csv_payload_keys=normalize_metadata(_required_payload()),
+            import_label_to_key=PROJECT_IMPORT_SYMBOL_LABEL_TO_KEY,
+        )
+        unnamed = builtin_metadata_mapping_gaps(**common)
+        self.assertIn("project import missing 'SAP Code'", unnamed)
+        named = builtin_metadata_mapping_gaps(
+            **common, import_label_gaps=PROJECT_IMPORT_KNOWN_LABEL_GAPS
+        )
+        self.assertNotIn("project import missing 'SAP Code'", named)
+        dropped_rate = builtin_metadata_mapping_gaps(
+            **{
+                **common,
+                "import_label_to_key": {
+                    label: key
+                    for label, key in PROJECT_IMPORT_SYMBOL_LABEL_TO_KEY.items()
+                    if key != "rate"
+                },
+            },
+            import_label_gaps=PROJECT_IMPORT_KNOWN_LABEL_GAPS,
+        )
+        self.assertIn("project import missing 'Rate'", dropped_rate)
+
+    def test_mapping_gaps_catch_fields_missing_from_comparison_tuples(self) -> None:
+        common = dict(
+            normalized_keys=normalize_metadata(_required_payload()),
+            create_fields=CreateManualComponentRequest.model_fields,
+            update_fields=UpdateComponentMetadataRequest.model_fields,
+            symbol_label_to_key=SYMBOL_METADATA_LABEL_TO_KEY,
+            csv_payload_keys=normalize_metadata(_required_payload()),
+        )
+        unchanged_gaps = builtin_metadata_mapping_gaps(
+            **common,
+            import_unchanged_keys=tuple(
+                key for key in IMPORT_UNCHANGED_METADATA_FIELDS if key != "sap_code"
+            ),
+        )
+        self.assertIn("import unchanged-check missing sap_code", unchanged_gaps)
+        diff_gaps = builtin_metadata_mapping_gaps(
+            **common,
+            revision_diff_keys=tuple(
+                key for key in REVISION_DIFF_METADATA_FIELDS if key != "mass_g"
+            ),
+        )
+        self.assertIn("revision diff missing mass_g", diff_gaps)
 
     def test_registry_shape_and_symbol_order_stay_stable(self) -> None:
         self.assertEqual(
