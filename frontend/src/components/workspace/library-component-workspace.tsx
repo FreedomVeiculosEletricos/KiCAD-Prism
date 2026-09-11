@@ -63,7 +63,7 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
-import { fetchJson } from "@/lib/api";
+import { ApiHttpError, fetchJson } from "@/lib/api";
 import { allowedWorkflowTransitions, canWriteCatalog, workflowStage } from "@/lib/roles";
 import { cn } from "@/lib/utils";
 import { useCommittedRef } from "@/hooks/use-committed-ref";
@@ -90,7 +90,7 @@ import type {
 import type { Project } from "@/types/project";
 import { LibraryPreviewPair } from "./library-preview-inspector";
 import { LibraryPreviewViewport } from "./library-preview-viewport";
-import { assetMutationRevisionId } from "./library-asset-mutation";
+import { assetMutationRevisionId, releaseRetainedRevisionOnConflict } from "./library-asset-mutation";
 import { resolveLibraryPreviewPairAssetIds } from "./library-preview-pair";
 
 type ComponentTab = "overview" | "assets" | "revisions" | "review" | "usage" | "audit";
@@ -2241,6 +2241,8 @@ export function LibraryComponentWorkspace({
       setRefreshKey((value) => value + 1);
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : String(reason));
+      const status = reason instanceof ApiHttpError ? reason.status : undefined;
+      setImportSelection((current) => releaseRetainedRevisionOnConflict(current, status));
     } finally {
       setBusyAction("");
     }
