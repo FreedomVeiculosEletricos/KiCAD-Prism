@@ -90,6 +90,7 @@ import type {
 import type { Project } from "@/types/project";
 import { LibraryPreviewPair } from "./library-preview-inspector";
 import { LibraryPreviewViewport } from "./library-preview-viewport";
+import { assetMutationRevisionId } from "./library-asset-mutation";
 import { resolveLibraryPreviewPairAssetIds } from "./library-preview-pair";
 
 type ComponentTab = "overview" | "assets" | "revisions" | "review" | "usage" | "audit";
@@ -123,6 +124,7 @@ type AssetImportSelection = {
   targetLibrary: string;
   options: string[];
   selected: string;
+  expectedRevisionId: string;
 };
 
 type ValidationJob = {
@@ -2217,6 +2219,7 @@ export function LibraryComponentWorkspace({
       const form = new FormData();
       form.append("file", sourceFile);
       form.append("target_library", importSelection?.targetLibrary || attachTargetLibrary || currentComponent.name);
+      form.append("expected_revision_id", assetMutationRevisionId(currentComponent.revision_id, importSelection?.expectedRevisionId));
       if (attachCounterpartId) form.append("counterpart_asset_id", attachCounterpartId);
       if (importSelection?.selected) {
         form.append(attachAssetType === "symbol" ? "selected_symbol" : "selected_footprint", importSelection.selected);
@@ -2229,7 +2232,7 @@ export function LibraryComponentWorkspace({
       const response = await fetchJson<SelectionRequiredResponse | ImportCompletedResponse | { component: CatalogComponent }>(endpoint, { method: "POST", body: form });
       if ("mode" in response && response.mode === "selection_required") {
         const options = response.discovered_symbols || response.discovered_footprints || [];
-        setImportSelection({ file: sourceFile, targetLibrary: attachTargetLibrary || currentComponent.name, options, selected: options[0] || "" });
+        setImportSelection({ file: sourceFile, targetLibrary: attachTargetLibrary || currentComponent.name, options, selected: options[0] || "", expectedRevisionId: assetMutationRevisionId(currentComponent.revision_id, importSelection?.expectedRevisionId) });
         return;
       }
       toast.success(`${ASSET_LABELS[attachAssetType]} attached as a new revision.`);
@@ -2254,6 +2257,7 @@ export function LibraryComponentWorkspace({
           target_library: attachTargetLibrary.trim() || currentComponent.name,
           target_name: attachTargetName.trim(),
           counterpart_asset_id: attachCounterpartId,
+          expected_revision_id: currentComponent.revision_id,
         }),
       });
       toast.success(`${ASSET_LABELS[attachAssetType]} linked as a new revision.`);

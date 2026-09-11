@@ -1724,7 +1724,7 @@ class ComponentCatalogDomainService:
         target_name: str,
         *,
         counterpart_asset_id: str = "",
-        actor: str = "",
+        actor: str = "", expected_revision_id: str = "",
     ) -> dict[str, Any]:
         if asset_type not in SUPPORTED_ASSET_TYPES:
             raise ValueError("Unsupported asset type")
@@ -1739,7 +1739,7 @@ class ComponentCatalogDomainService:
                 target_library,
                 target_name,
                 counterpart_asset_id=counterpart_asset_id,
-                actor=actor,
+                actor=actor, expected_revision_id=expected_revision_id,
             )
             conn.commit()
         return {"component": self.get_component(component_id)}
@@ -1758,7 +1758,7 @@ class ComponentCatalogDomainService:
         target_library: str,
         selected_symbol: str,
         counterpart_asset_id: str = "",
-        actor: str = "",
+        actor: str = "", expected_revision_id: str = "",
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
@@ -1771,7 +1771,7 @@ class ComponentCatalogDomainService:
                 target_library=target_library,
                 selected_symbol=selected_symbol,
                 counterpart_asset_id=counterpart_asset_id,
-                actor=actor,
+                actor=actor, expected_revision_id=expected_revision_id,
             )
             if result["mode"] == "imported":
                 conn.commit()
@@ -1791,7 +1791,7 @@ class ComponentCatalogDomainService:
         target_library: str,
         selected_footprint: str,
         counterpart_asset_id: str = "",
-        actor: str = "",
+        actor: str = "", expected_revision_id: str = "",
     ) -> dict[str, Any]:
         self.initialize()
         with self._connect() as conn:
@@ -1804,7 +1804,7 @@ class ComponentCatalogDomainService:
                 target_library=target_library,
                 selected_footprint=selected_footprint,
                 counterpart_asset_id=counterpart_asset_id,
-                actor=actor,
+                actor=actor, expected_revision_id=expected_revision_id,
             )
             if result["mode"] == "imported":
                 conn.commit()
@@ -1820,7 +1820,7 @@ class ComponentCatalogDomainService:
         upload_name: str,
         payload: bytes,
         target_library: str,
-        actor: str = "",
+        actor: str = "", expected_revision_id: str = "",
     ) -> dict[str, Any]:
         if asset_type not in {"3dmodel", "spice"}:
             raise ValueError("Unsupported auxiliary asset type")
@@ -1834,7 +1834,7 @@ class ComponentCatalogDomainService:
                 upload_name=upload_name,
                 payload=payload,
                 target_library=target_library,
-                actor=actor,
+                actor=actor, expected_revision_id=expected_revision_id,
             )
             conn.commit()
         return {"component": self.get_component(component_id)}
