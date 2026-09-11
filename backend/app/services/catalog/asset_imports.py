@@ -67,6 +67,14 @@ class CatalogAssetImports:
         self._asset_files = asset_files or CatalogAssetFiles()
         self._asset_registry = asset_registry or CatalogAssetRegistry()
 
+    def _require_expected_revision(self, conn: Any, component_id: str, expected_revision_id: str = "") -> None:
+        if not expected_revision_id:
+            return
+        _, current = self._revision_kernel.active_revision_row(conn, component_id, released=False)
+        if not current:
+            raise ValueError("Component not found")
+        self._revision_kernel.assert_expected_revision(str(current["id"]), expected_revision_id)
+
     # -- pure upload shaping --------------------------------------------------
 
     @staticmethod
@@ -189,9 +197,11 @@ class CatalogAssetImports:
         *,
         counterpart_asset_id: str = "",
         actor: str = "",
+        expected_revision_id: str = "",
     ) -> dict[str, Any]:
         if asset_type not in SUPPORTED_ASSET_TYPES:
             raise ValueError("Unsupported asset type")
+        self._require_expected_revision(conn, component_id, expected_revision_id)
         asset = self.resolve_existing_asset(
             conn,
             runtime,
@@ -209,6 +219,7 @@ class CatalogAssetImports:
             actor=actor,
             change_summary=f"Link {asset_type} asset",
             counterpart_asset_id=counterpart_asset_id,
+            expected_revision_id=expected_revision_id,
         )
         return asset
 
@@ -226,8 +237,10 @@ class CatalogAssetImports:
         selected_symbol: str,
         counterpart_asset_id: str = "",
         actor: str = "",
+        expected_revision_id: str = "",
     ) -> dict[str, Any]:
         """Import one symbol; ``mode`` is ``selection_required`` until a symbol is chosen."""
+        self._require_expected_revision(conn, component_id, expected_revision_id)
         normalized = self.normalize_symbol_upload(runtime, upload_name, payload)
         text = normalized.decode("utf-8", errors="ignore")
         discovered = discover_symbol_names_in_text(text)
@@ -260,6 +273,7 @@ class CatalogAssetImports:
             actor=actor,
             change_summary=f"Import symbol {chosen}",
             counterpart_asset_id=counterpart_asset_id,
+            expected_revision_id=expected_revision_id,
         )
         return {"mode": "imported", "discovered_symbols": discovered, "selected_symbol": chosen}
 
@@ -275,7 +289,9 @@ class CatalogAssetImports:
         selected_footprint: str,
         counterpart_asset_id: str = "",
         actor: str = "",
+        expected_revision_id: str = "",
     ) -> dict[str, Any]:
+        self._require_expected_revision(conn, component_id, expected_revision_id)
         discovered = self.extract_footprints_from_upload(upload_name, payload)
         names = sorted(discovered)
         if not names:
@@ -306,6 +322,7 @@ class CatalogAssetImports:
             actor=actor,
             change_summary=f"Import footprint {chosen}",
             counterpart_asset_id=counterpart_asset_id,
+            expected_revision_id=expected_revision_id,
         )
         return {"mode": "imported", "discovered_footprints": names, "selected_footprint": chosen}
 
@@ -320,9 +337,11 @@ class CatalogAssetImports:
         payload: bytes,
         target_library: str,
         actor: str = "",
+        expected_revision_id: str = "",
     ) -> dict[str, Any]:
         if asset_type not in AUXILIARY_ASSET_TYPES:
             raise ValueError("Unsupported auxiliary asset type")
+        self._require_expected_revision(conn, component_id, expected_revision_id)
         library = target_library or DEFAULT_AUXILIARY_LIBRARY
         destination = self._asset_files.write_canonical_file(
             runtime,
@@ -345,6 +364,7 @@ class CatalogAssetImports:
             required=False,
             actor=actor,
             change_summary=f"Import {asset_type} asset {destination.name}",
+            expected_revision_id=expected_revision_id,
         )
         return asset
 

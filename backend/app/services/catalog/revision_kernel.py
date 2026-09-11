@@ -202,6 +202,12 @@ class CatalogRevisionKernel:
         canonical = canonical_json(payload)
         return sha256_text(canonical)
 
+    @staticmethod
+    def assert_expected_revision(current_id: str, expected_revision_id: str = "") -> None:
+        # Empty expected_revision_id is the legacy skip used by older callers.
+        if expected_revision_id and current_id != expected_revision_id:
+            raise ValueError("Component revision conflict: refresh the component before saving")
+
     def clone_revision(
         self,
         conn: Any,
@@ -216,8 +222,7 @@ class CatalogRevisionKernel:
         component, current = self.active_revision_row(conn, component_id, released=False)
         if not component or not current:
             raise ValueError("Component not found")
-        if expected_revision_id and str(current["id"]) != expected_revision_id:
-            raise ValueError("Component revision conflict: refresh the component before saving")
+        self.assert_expected_revision(str(current["id"]), expected_revision_id)
 
         now = _utc_now_iso()
         next_version = int(

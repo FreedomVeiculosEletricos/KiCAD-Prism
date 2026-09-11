@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import sys
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
+from fastapi.params import Form as FormParam
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -114,6 +117,82 @@ class CatalogAdminPermissionTests(unittest.TestCase):
         self.assertEqual(updates[-1]["progress"], 100)
         self.assertEqual(result["validated"], 3)
         self.assertEqual(result["total"], 3)
+
+
+CONFLICT = "Component revision conflict: refresh the component before saving"
+WRITER = AuthenticatedUser(email="designer@example.com", name="Designer", role="designer")
+
+
+def _upload(name: str, payload: bytes = b"payload") -> UploadFile:
+    return UploadFile(filename=name, file=BytesIO(payload))
+
+
+class CatalogAdminAssetRevisionTests(unittest.IsolatedAsyncioTestCase):
+    def test_upload_and_link_keep_expected_revision_optional_for_legacy_callers(self) -> None:
+        for name in ("import_symbol_library", "import_footprint", "import_auxiliary_asset"):
+            default = inspect.signature(getattr(catalog_admin, name)).parameters["expected_revision_id"].default
+            self.assertIsInstance(default, FormParam)
+            self.assertEqual(default.default, "")
+        field = catalog_admin.LinkAssetRequest.model_fields["expected_revision_id"]
+        self.assertEqual(field.default, "")
+
+    async def test_stale_uploads_and_link_return_409_and_keep_session_actor(self) -> None:
+        cases = (
+            (
+                catalog_admin.import_symbol_library,
+                "import_symbol_library",
+                {"file": _upload("a.kicad_sym"), "target_library": "", "selected_symbol": "", "counterpart_asset_id": ""},
+            ),
+            (
+                catalog_admin.import_footprint,
+                "import_footprint",
+                {"file": _upload("a.kicad_mod"), "target_library": "", "selected_footprint": "", "counterpart_asset_id": ""},
+            ),
+            (
+                catalog_admin.import_auxiliary_asset,
+                "attach_auxiliary_asset",
+                {"asset_type": "3dmodel", "file": _upload("a.step"), "target_library": ""},
+            ),
+        )
+        for handler, service_name, kwargs in cases:
+            with self.subTest(service_name):
+                with patch.object(
+                    catalog_admin.catalog_service, service_name, side_effect=ValueError(CONFLICT)
+                ) as mocked:
+                    with self.assertRaises(HTTPException) as raised:
+                        await handler("cmp-1", expected_revision_id="stale-rev", user=WRITER, **kwargs)
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(mocked.call_args.kwargs["expected_revision_id"], "stale-rev")
+                self.assertEqual(mocked.call_args.kwargs["actor"], WRITER.email)
+
+        payload = catalog_admin.LinkAssetRequest(file_path="lib/a.kicad_sym", expected_revision_id="stale-rev")
+        with patch.object(
+            catalog_admin.catalog_service, "link_library_asset", side_effect=ValueError(CONFLICT)
+        ) as mocked:
+            with self.assertRaises(HTTPException) as raised:
+                catalog_admin.link_library_asset("cmp-1", "symbol", payload, user=WRITER)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(mocked.call_args.kwargs["expected_revision_id"], "stale-rev")
+        self.assertEqual(mocked.call_args.kwargs["actor"], WRITER.email)
+
+    async def test_non_conflict_upload_errors_stay_400(self) -> None:
+        with patch.object(
+            catalog_admin.catalog_service,
+            "import_symbol_library",
+            side_effect=ValueError("No symbols were found in the uploaded library"),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await catalog_admin.import_symbol_library(
+                    "cmp-1",
+                    file=_upload("empty.kicad_sym"),
+                    target_library="",
+                    selected_symbol="",
+                    counterpart_asset_id="",
+                    expected_revision_id="rev-1",
+                    user=WRITER,
+                )
+        self.assertEqual(raised.exception.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

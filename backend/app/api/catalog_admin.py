@@ -1079,7 +1079,7 @@ async def import_symbol_library(
     file: UploadFile = File(...),
     target_library: str = Form(default=""),
     selected_symbol: str = Form(default=""),
-    counterpart_asset_id: str = Form(default=""),
+    counterpart_asset_id: str = Form(default=""), expected_revision_id: str = Form(default=""),
     user: AuthenticatedUser = Depends(require_catalog_writer),
 ):
     payload = await file.read()
@@ -1094,10 +1094,10 @@ async def import_symbol_library(
             target_library=target_library or component_id,
             selected_symbol=selected_symbol,
             counterpart_asset_id=counterpart_asset_id,
-            actor=user.email,
+            actor=user.email, expected_revision_id=expected_revision_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=409 if "revision conflict" in str(exc).lower() else 400, detail=str(exc)) from exc
 
 
 @router.post("/components/{component_id}/footprint-import")
@@ -1106,7 +1106,7 @@ async def import_footprint(
     file: UploadFile = File(...),
     target_library: str = Form(default=""),
     selected_footprint: str = Form(default=""),
-    counterpart_asset_id: str = Form(default=""),
+    counterpart_asset_id: str = Form(default=""), expected_revision_id: str = Form(default=""),
     user: AuthenticatedUser = Depends(require_catalog_writer),
 ):
     payload = await file.read()
@@ -1121,10 +1121,10 @@ async def import_footprint(
             target_library=target_library or "Prism_Footprints",
             selected_footprint=selected_footprint,
             counterpart_asset_id=counterpart_asset_id,
-            actor=user.email,
+            actor=user.email, expected_revision_id=expected_revision_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=409 if "revision conflict" in str(exc).lower() else 400, detail=str(exc)) from exc
 
 
 @router.post("/components/{component_id}/assets/{asset_type}")
@@ -1132,7 +1132,7 @@ async def import_auxiliary_asset(
     component_id: str,
     asset_type: str,
     file: UploadFile = File(...),
-    target_library: str = Form(default=""),
+    target_library: str = Form(default=""), expected_revision_id: str = Form(default=""),
     user: AuthenticatedUser = Depends(require_catalog_writer),
 ):
     payload = await file.read()
@@ -1146,10 +1146,10 @@ async def import_auxiliary_asset(
             upload_name=file.filename or f"{asset_type}.bin",
             payload=payload,
             target_library=target_library or "Prism_Assets",
-            actor=user.email,
+            actor=user.email, expected_revision_id=expected_revision_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=409 if "revision conflict" in str(exc).lower() else 400, detail=str(exc)) from exc
 
 
 @router.delete("/components/{component_id}/assets/{asset_type}")
@@ -1575,7 +1575,7 @@ class LinkAssetRequest(BaseModel):
     target_library: str = ""
     target_name: str = ""
     counterpart_asset_id: str = ""
-
+    expected_revision_id: str = ""
 
 @router.post("/components/{component_id}/assets/{asset_type}/link")
 def link_library_asset(
@@ -1593,7 +1593,7 @@ def link_library_asset(
             target_library=payload.target_library,
             target_name=payload.target_name,
             counterpart_asset_id=payload.counterpart_asset_id,
-            actor=user.email,
+            actor=user.email, expected_revision_id=payload.expected_revision_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=409 if "revision conflict" in str(exc).lower() else 400, detail=str(exc)) from exc

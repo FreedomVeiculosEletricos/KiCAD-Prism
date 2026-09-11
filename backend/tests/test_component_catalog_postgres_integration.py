@@ -464,6 +464,127 @@ class ComponentCatalogPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.service.list_component_revisions(component["id"])), 2)
         self.assertTrue(self.service.verify_component_audit_chain(component["id"])["valid"])
 
+    def test_stale_asset_upload_and_link_do_not_advance_head(self) -> None:
+        component = self._component("asset-rev-" + uuid.uuid4().hex[:8])
+        self._import_symbol(str(self._component("asset-donor-" + uuid.uuid4().hex[:8])["id"]), "DonorSym")
+        stale_id = component["revision_id"]
+        advanced = self.service.update_component_metadata(
+            component["id"],
+            {"description": "Editor B advanced the head"},
+            actor="editor-b@example.com",
+            expected_revision_id=stale_id,
+        )
+        assert advanced is not None
+        head_id = str(advanced["revision_id"])
+        revisions_before = self.service.list_component_revisions(component["id"])
+        donor_file = next(
+            path for path in self.service.browse_library_assets("symbol")["files"]
+            if "DonorSym" in path
+        )
+
+        def conflict(action) -> None:
+            with self.assertRaisesRegex(ValueError, "revision conflict"):
+                action()
+
+        stale_symbol = b'''(kicad_symbol_lib (version 20231120) (generator "test")
+          (symbol "StaleSym"
+            (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+            (property "Value" "StaleSym" (at 0 0 0) (effects (font (size 1.27 1.27))))
+          )
+        )'''
+        conflict(lambda: self.service.import_symbol_library(
+            component["id"], upload_name="StaleSym.kicad_sym", payload=stale_symbol,
+            target_library="Stale", selected_symbol="StaleSym", actor="editor-a@example.com",
+            expected_revision_id=stale_id,
+        ))
+        conflict(lambda: self.service.import_footprint(
+            component["id"], upload_name="StaleFp.kicad_mod",
+            payload=b'(footprint "StaleFp" (version 20240108) (generator "test"))',
+            target_library="Stale", selected_footprint="StaleFp", actor="editor-a@example.com",
+            expected_revision_id=stale_id,
+        ))
+        conflict(lambda: self.service.attach_auxiliary_asset(
+            component["id"], asset_type="3dmodel", upload_name="stale.step",
+            payload=b"ISO-10303-21;END-ISO-10303-21;", target_library="Stale",
+            actor="editor-a@example.com", expected_revision_id=stale_id,
+        ))
+        conflict(lambda: self.service.link_library_asset(
+            component["id"], "symbol", file_path_rel=donor_file,
+            target_library="Availability", target_name="DonorSym", actor="editor-a@example.com",
+            expected_revision_id=stale_id,
+        ))
+
+        blocked = self.service.get_component(component["id"])
+        assert blocked is not None
+        self.assertEqual(blocked["revision_id"], head_id)
+        self.assertEqual(blocked["assets"], [])
+        self.assertEqual(self.service.list_component_revisions(component["id"]), revisions_before)
+
+        imported = self.service.import_symbol_library(
+            component["id"], upload_name="FreshSym.kicad_sym",
+            payload=stale_symbol.replace(b"StaleSym", b"FreshSym"),
+            target_library="Fresh", selected_symbol="FreshSym", actor="editor-a@example.com",
+            expected_revision_id=head_id,
+        )
+        self.assertEqual(imported["mode"], "imported")
+        self.assertNotEqual(imported["component"]["revision_id"], head_id)
+
+        legacy = self.service.import_footprint(
+            component["id"], upload_name="LegacyFp.kicad_mod",
+            payload=b'(footprint "LegacyFp" (version 20240108) (generator "test"))',
+            target_library="Fresh", selected_footprint="LegacyFp", actor="editor-a@example.com",
+        )
+        self.assertEqual(legacy["mode"], "imported")
+
+        auxiliary = self.service.attach_auxiliary_asset(
+            component["id"], asset_type="3dmodel", upload_name="fresh.step",
+            payload=b"ISO-10303-21;END-ISO-10303-21;", target_library="Fresh",
+            actor="editor-a@example.com",
+            expected_revision_id=legacy["component"]["revision_id"],
+        )
+        self.assertTrue(any(item["asset_type"] == "3dmodel" for item in auxiliary["component"]["assets"]))
+
+        self.service.link_library_asset(
+            component["id"], "symbol", file_path_rel=donor_file,
+            target_library="Availability", target_name="DonorSym", actor="editor-a@example.com",
+            expected_revision_id=auxiliary["component"]["revision_id"],
+        )
+        after_link = self.service.get_component(component["id"])
+        assert after_link is not None
+        self.assertNotEqual(after_link["revision_id"], auxiliary["component"]["revision_id"])
+        self.assertGreaterEqual(sum(1 for item in after_link["assets"] if item["asset_type"] == "symbol"), 2)
+
+        multi = b'''(kicad_symbol_lib (version 20231120) (generator "test")
+          (symbol "PickA"
+            (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+            (property "Value" "PickA" (at 0 0 0) (effects (font (size 1.27 1.27))))
+          )
+          (symbol "PickB"
+            (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+            (property "Value" "PickB" (at 0 0 0) (effects (font (size 1.27 1.27))))
+          )
+        )'''
+        picker_head = str(after_link["revision_id"])
+        picker = self.service.import_symbol_library(
+            component["id"], upload_name="multi.kicad_sym", payload=multi,
+            target_library="Fresh", selected_symbol="", actor="editor-a@example.com",
+            expected_revision_id=picker_head,
+        )
+        self.assertEqual(picker["mode"], "selection_required")
+        self.assertEqual(self.service.get_component(component["id"])["revision_id"], picker_head)
+        chosen = self.service.import_symbol_library(
+            component["id"], upload_name="multi.kicad_sym", payload=multi,
+            target_library="Fresh", selected_symbol="PickB", actor="editor-a@example.com",
+            expected_revision_id=picker_head,
+        )
+        self.assertEqual(chosen["mode"], "imported")
+        self.assertEqual(chosen["selected_symbol"], "PickB")
+        conflict(lambda: self.service.import_symbol_library(
+            component["id"], upload_name="multi.kicad_sym", payload=multi,
+            target_library="Fresh", selected_symbol="", actor="editor-a@example.com",
+            expected_revision_id=picker_head,
+        ))
+
     def test_metadata_schema_and_qa_batch_round_trip(self) -> None:
         token = uuid.uuid4().hex[:10]
         component = self._component(f"metadata-{token}")
