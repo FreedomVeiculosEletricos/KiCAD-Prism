@@ -17,7 +17,7 @@ export function emptyPanelLog(): PanelLogBuffer {
 export function redactPanelLogMessage(message: string): string {
   const redacted = message
     .replace(
-      /"(token|access_token|api_token|authorization|data)"\s*:\s*"[^"]*"/gi,
+      /"(token|access_token|api_token|authorization|data)"\s*:\s*"(?:\\.|[^"\\])*"/gi,
       (_match, key: string) => `"${key}":"[redacted]"`,
     )
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]");

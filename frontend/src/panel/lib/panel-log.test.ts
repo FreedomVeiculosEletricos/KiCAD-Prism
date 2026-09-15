@@ -47,4 +47,16 @@ describe("redactPanelLogMessage", () => {
     const log = appendPanelLog(emptyPanelLog(), 'Authorization: Bearer super-secret');
     expect(log.entries).toEqual(["Authorization: Bearer [redacted]"]);
   });
+
+  it("removes complete escaped JSON values before storing them", () => {
+    const message = JSON.stringify({
+      data: JSON.stringify({ token: "synthetic-secret" }),
+      access_token: 'prefix"secret-suffix\\tail',
+      command: "PLACE_COMPONENT",
+    });
+    const log = appendPanelLog(emptyPanelLog(), message);
+    expect(JSON.parse(log.entries[0])).toEqual({
+      data: "[redacted]", access_token: "[redacted]", command: "PLACE_COMPONENT",
+    });
+  });
 });

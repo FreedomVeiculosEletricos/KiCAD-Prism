@@ -105,6 +105,13 @@ export interface AssetTextRequest {
  */
 const assetText = new Map<string, Promise<string>>();
 
+export class AssetTextHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`Asset request failed (${status})`);
+    this.name = "AssetTextHttpError";
+  }
+}
+
 export function loadAssetText(
   url: string,
   request: AssetTextRequest = {},
@@ -117,7 +124,7 @@ export function loadAssetText(
       headers: request.headers,
     }).then((response) => {
       if (!response.ok) {
-        throw new Error(`Asset request failed (${response.status})`);
+        throw new AssetTextHttpError(response.status);
       }
       return response.text();
     });
