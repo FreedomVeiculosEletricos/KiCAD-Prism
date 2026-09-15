@@ -204,6 +204,21 @@ docker compose logs --tail=200 frontend
 For a failed job, capture its job ID, type, project or component, attempt logs,
 worker logs, release version, and source commit. Record evidence before retrying.
 
+### Recover failed import follow-ups
+
+A completed project import records metadata and thumbnail scheduling outcomes in
+`result.follow_ups`. A designer can retry those follow-ups for a registered
+project with:
+
+```text
+POST /api/projects/{project_id}/import-follow-ups/retry
+```
+
+The response lists one outcome for each operation, including any partial
+failures. Job IDs identify the follow-up work for log and worker diagnosis.
+The retry does not register or remove the project; existing metadata and
+thumbnail artifact keys let active work be reused instead of duplicated.
+
 ## Capacity and retention
 
 Monitor:
