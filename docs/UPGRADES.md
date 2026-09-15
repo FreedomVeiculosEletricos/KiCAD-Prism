@@ -31,7 +31,7 @@ startup under an advisory lock:
 
 | Schema | Ledger | Migrations |
 | --- | --- | --- |
-| `workspace` | `workspace.ws_schema_migrations` | [`workspace_schema_migrations.py`](../backend/app/services/workspace_schema_migrations.py) |
+| `workspace` | `workspace.ws_schema_migrations` | [`workspace_schema_migrations.py`](../backend/app/services/workspace_schema_migrations.py) (registry), bodies under [`workspace_migrations/`](../backend/app/services/workspace_migrations/) |
 | `catalog` | `catalog.catalog_schema_versions` | [`catalog_schema_migrations.py`](../backend/app/services/catalog_schema_migrations.py) |
 
 Derived state sits outside those ledgers on purpose. Component-head projections,
