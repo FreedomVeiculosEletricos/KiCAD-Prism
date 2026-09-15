@@ -135,4 +135,24 @@ describe("LibraryAssetRenderer", () => {
       handles.every((handle) => handle.dispose.mock.calls.length === 1),
     ).toBe(true);
   });
+
+  it("loads preview bytes through the injected asset loader", async () => {
+    const handle: Handle = { controller: controller(), dispose: vi.fn() };
+    renderer.renderSymbol.mockResolvedValue(handle);
+    const loadAsset = vi.fn().mockResolvedValue("(kicad_symbol_lib)");
+
+    const view = render(
+      <LibraryAssetRenderer
+        assetId="symbol-injected"
+        kind="symbol"
+        label="Symbol"
+        loadAsset={loadAsset}
+      />,
+    );
+
+    await waitFor(() => expect(loadAsset).toHaveBeenCalledTimes(1));
+    expect(loadAsset).toHaveBeenCalledWith("/asset/symbol-injected");
+    await waitFor(() => expect(renderer.renderSymbol).toHaveBeenCalledTimes(1));
+    view.unmount();
+  });
 });

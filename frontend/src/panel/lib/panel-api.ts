@@ -2,6 +2,7 @@
  * Panel API client — typed fetch helpers for the remote-provider endpoints.
  */
 
+import { loadAssetText, type AssetTextRequest } from "@/lib/ecad-renderer";
 import { normalizePanelPageSize, PANEL_PAGE_SIZE } from "@/panel/lib/panel-page";
 
 export interface PanelComponent {
@@ -103,9 +104,34 @@ export class PanelApiError extends Error {
 }
 
 let apiToken: string | null = null;
+let apiTokenGeneration = 0;
 
 export function setApiToken(token: string | null) {
+  if (token === apiToken) return;
   apiToken = token;
+  apiTokenGeneration += 1;
+}
+
+const PANEL_ASSET_PREFIX = "/api/remote-provider/";
+
+/**
+ * Fetch options for live preview bytes in the KiCad panel. The bearer token
+ * is attached only to same-origin remote-provider URLs.
+ */
+export function panelAssetTextRequest(url: string): AssetTextRequest {
+  const headers: Record<string, string> = {};
+  if (apiToken && url.startsWith(PANEL_ASSET_PREFIX)) {
+    headers.Authorization = `Bearer ${apiToken}`;
+  }
+  return {
+    authScope: `panel:${apiTokenGeneration}:${apiToken ? "authed" : "anon"}`,
+    headers,
+    credentials: "include",
+  };
+}
+
+export function loadPanelAssetText(url: string): Promise<string> {
+  return loadAssetText(url, panelAssetTextRequest(url));
 }
 
 async function panelFetch<T>(url: string, signal?: AbortSignal): Promise<T> {

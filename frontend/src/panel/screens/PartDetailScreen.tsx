@@ -28,7 +28,12 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 
 import type { PanelComponent, PanelSupplySource } from "@/panel/lib/panel-api";
-import { getComponent, getInlineBundle, getPartManifest } from "@/panel/lib/panel-api";
+import {
+  getComponent,
+  getInlineBundle,
+  getPartManifest,
+  loadPanelAssetText,
+} from "@/panel/lib/panel-api";
 import { getSessionId, KiCadRpcError, sendRpcCommand } from "@/panel/lib/kicad-bridge";
 import { formatPlacementError, PLACEMENT_RESPONSE_TIMEOUT_MS } from "@/panel/lib/panel-placement";
 import { LibraryPreviewPair } from "@/components/workspace/library-preview-inspector";
@@ -330,6 +335,7 @@ export function PartDetailScreen({
             stacked
             symbolMeta={`${symbolMeta} · Rev.${component.version}`}
             footprintMeta={selectedRepresentation.footprint?.target_name || component.package_name || "—"}
+            loadAsset={loadPanelAssetText}
           />
         </Section>
       )}
