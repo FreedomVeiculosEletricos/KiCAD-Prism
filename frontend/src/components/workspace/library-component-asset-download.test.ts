@@ -326,6 +326,25 @@ describe("useReleasedAssetDownload", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
+  it("cancels a pending download when the component changes without unmounting", async () => {
+    let finish!: (value: PlacementManifest) => void;
+    const fetchManifest = vi.fn<FetchPlacementManifest>(() => new Promise((resolve) => { finish = resolve; }));
+    const startDownload = vi.fn();
+    const released = releasedComponent();
+    const { result, rerender } = renderHook(
+      ({ componentId }) => useReleasedAssetDownload(componentId, { fetchManifest, startDownload }),
+      { initialProps: { componentId: "comp-1" } },
+    );
+    void result.current(symbolB, released, released);
+    const signal = fetchManifest.mock.calls[0]?.[1]?.signal;
+    rerender({ componentId: "comp-2" });
+    expect(signal?.aborted).toBe(true);
+    await act(async () => {
+      finish({ assets: [{ asset_type: "symbol", name: symbolB.name, download_url: "/signed/stale" }] });
+    });
+    expect(startDownload).not.toHaveBeenCalled();
+  });
+
   it("surfaces a missing placement entry as an error, not a download", async () => {
     const fetchManifest = vi.fn<FetchPlacementManifest>(async () => ({
       assets: [

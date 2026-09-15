@@ -153,9 +153,9 @@ export function useLibraryComponentValidation({
   onRefresh: () => void;
   intervalMs?: number;
 }) {
-  const [validationBusy, setValidationBusy] = useState(false);
+  const [activeRun, setActiveRun] = useState<{ componentId: string; controller: AbortController } | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
-  const originatingIdRef = useRef<string | null>(null);
+  const runningControllerRef = useRef<AbortController | null>(null);
   const componentIdRef = useCommittedRef(componentId);
   const onRefreshRef = useCommittedRef(onRefresh);
 
@@ -172,20 +172,22 @@ export function useLibraryComponentValidation({
   const runValidation = useCallback(async () => {
     const originatingId = componentId;
     const controller = controllerRef.current;
-    if (!controller || controller.signal.aborted) return;
-    originatingIdRef.current = originatingId;
-    setValidationBusy(true);
+    if (!controller || controller.signal.aborted || runningControllerRef.current === controller) return;
+    runningControllerRef.current = controller;
+    setActiveRun({ componentId: originatingId, controller });
     try {
       const queued = await fetchJson<{ job_id: string }>(
         `/api/catalog/components/${encodeURIComponent(originatingId)}/validate`,
         { method: "POST", signal: controller.signal },
       );
+      if (controller.signal.aborted || componentIdRef.current !== originatingId) return;
       toast.message("KLC validation started.");
       let lastNotice = "";
       const outcome = await watchCatalogValidationJob(queued.job_id, {
         signal: controller.signal,
         intervalMs,
         onUpdate: (job) => {
+          if (controller.signal.aborted || componentIdRef.current !== originatingId) return;
           if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
             return;
           }
@@ -203,18 +205,16 @@ export function useLibraryComponentValidation({
       if (componentIdRef.current !== originatingId) return;
       toast.error(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      // An unconditional reset would let an aborted run for A clear B's
-      // in-flight spinner after the user switched components.
-      if (!controller.signal.aborted && componentIdRef.current === originatingId) {
-        originatingIdRef.current = null;
-        // react-doctor-disable-next-line react-doctor/no-loading-flag-reset-outside-finally - aborting a watcher must not clear a later component's validation busy state
-        setValidationBusy(false);
+      // A late run must not clear a newer component's watcher or busy state.
+      if (runningControllerRef.current === controller) {
+        runningControllerRef.current = null;
+        if (!controller.signal.aborted) setActiveRun(null);
       }
     }
   }, [componentId, componentIdRef, intervalMs, onRefreshRef]);
 
   return {
     runValidation,
-    validationBusy: validationBusy && originatingIdRef.current === componentId,
+    validationBusy: activeRun?.componentId === componentId && !activeRun.controller.signal.aborted,
   };
 }
