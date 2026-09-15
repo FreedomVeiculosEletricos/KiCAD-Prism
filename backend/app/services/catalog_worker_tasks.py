@@ -23,25 +23,54 @@ from app.services.local_artifact_store import artifact_store
 Progress = Callable[..., bool]
 
 
+def _list_active_component_ids() -> list[str]:
+    ids: list[str] = []
+    page = 1
+    while True:
+        result = catalog_service.list_components(
+            include_inactive=False, page=page, page_size=10000, lightweight=True
+        )
+        ids.extend(str(component["id"]) for component in result["items"])
+        if page >= int(result.get("pages") or 1):
+            break
+        page += 1
+    return ids
+
+
+def resolve_validation_worklist(job: dict[str, Any]) -> list[str]:
+    """Return the frozen validation worklist for this job.
+
+    Resume uses checkpoint.component_ids, never a fresh catalog listing. A
+    crash after validating item i but before checkpointing i+1 re-runs i:
+    the index is at-least-once, not exact-once.
+    """
+    saved = job.get("checkpoint", {}).get("component_ids")
+    if saved is not None:
+        return [str(value) for value in saved]
+    requested = job.get("payload", {}).get("component_ids")
+    if requested is not None:
+        return [str(value) for value in requested]
+    return _list_active_component_ids()
+
+
 def run_validation(job: dict[str, Any], progress: Progress) -> dict[str, Any]:
-    requested = job["payload"].get("component_ids")
-    if requested is None:
-        ids: list[str] = []
-        page = 1
-        while True:
-            result = catalog_service.list_components(
-                include_inactive=False, page=page, page_size=10000, lightweight=True
-            )
-            ids.extend(str(component["id"]) for component in result["items"])
-            if page >= int(result.get("pages") or 1):
-                break
-            page += 1
-    else:
-        ids = [str(value) for value in requested]
+    ids = resolve_validation_worklist(job)
     errors: list[dict[str, str]] = list(job["result"].get("errors") or [])
     validated = int(job["checkpoint"].get("index") or 0)
     component_payload: dict[str, Any] | None = None
     total = len(ids)
+    if validated < total:
+        start_message = f"Validating {validated + 1}/{total} components"
+    elif total:
+        start_message = f"Validated {validated}/{total} components"
+    else:
+        start_message = "No components to validate"
+    progress(
+        progress=(validated / total) * 100 if total else 100,
+        message=start_message,
+        checkpoint={"index": validated, "component_ids": ids},
+        result={"validated": validated, "total": total, "errors": errors},
+    )
     for index in range(validated, total):
         component_id = ids[index]
         progress(
