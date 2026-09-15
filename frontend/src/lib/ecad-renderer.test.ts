@@ -118,7 +118,9 @@ describe("asset text caching", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const url = "/api/remote-provider/assets/unauthorized-then-ok/content";
-    await expect(loadAssetText(url)).rejects.toThrow("401");
+    await expect(loadAssetText(url)).rejects.toMatchObject({
+      name: "AssetTextHttpError", status: 401,
+    });
     await expect(
       loadAssetText(url, { authScope: "panel:2:authed" }),
     ).resolves.toBe("(symbol)");

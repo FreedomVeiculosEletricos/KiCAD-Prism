@@ -83,8 +83,9 @@ npm run build:panel
 backend/venv/bin/python -m unittest discover -s backend/tests -p 'test_*.py'
 ```
 
-PostgreSQL integration tests use `TEST_POSTGRES_URL`. Use a disposable test
-database; do not point the suite at a production database.
+PostgreSQL integration tests use `TEST_POSTGRES_URL` and, for the catalog
+epoch-2 cutover, `LEGACY_SURVIVOR_TEST_POSTGRES_URL`. Use disposable test
+databases; do not point either suite at a production database.
 
 ### Semantic viewer
 

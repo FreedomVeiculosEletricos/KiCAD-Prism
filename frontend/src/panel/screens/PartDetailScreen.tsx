@@ -34,8 +34,8 @@ import {
   getComponent,
   getInlineBundle,
   getPartManifest,
-  loadPanelAssetText,
 } from "@/panel/lib/panel-api";
+import { usePanelAssetLoader } from "@/panel/lib/use-panel-asset-loader";
 import { getSessionId, KiCadRpcError, sendRpcCommand } from "@/panel/lib/kicad-bridge";
 import { formatPlacementError, PLACEMENT_RESPONSE_TIMEOUT_MS } from "@/panel/lib/panel-placement";
 import { LibraryPreviewPair } from "@/components/workspace/library-preview-inspector";
@@ -113,6 +113,7 @@ export function PartDetailScreen({
   onAuthRequired,
   appendLog,
 }: PartDetailScreenProps) {
+  const loadPreviewAsset = usePanelAssetLoader(onAuthRequired);
   const [load, setLoad] = useState<DetailLoad>(() => ({
     phase: "loading",
     preview: previewFor(componentId, prefetched),
@@ -404,7 +405,7 @@ export function PartDetailScreen({
             stacked
             symbolMeta={`${symbolMeta} · Rev.${component.version}`}
             footprintMeta={selectedRepresentation.footprint?.target_name || component.package_name || "—"}
-            loadAsset={loadPanelAssetText}
+            loadAsset={loadPreviewAsset}
           />
         </Section>
       )}
