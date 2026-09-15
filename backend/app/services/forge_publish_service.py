@@ -1,18 +1,19 @@
 """Publish a Release Studio dossier as a GitHub or GitLab Release asset.
 
 Prism's workspace SSH key can clone; it cannot create forge Releases. This
-module uses the workspace ``GITHUB_TOKEN`` / ``GITLAB_TOKEN`` instead, and
-says so when those tokens are missing or lack write scope.
+module uses the token environment variable selected by the resolved forge host,
+and says so when that token is missing or lacks write scope.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import tarfile
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from urllib.parse import quote
 
 import requests
@@ -103,11 +104,12 @@ def list_releases(repo_url: str | None, *, limit: int = 10) -> list[dict[str, st
     if target.kind == "unsupported" or not target.token_configured:
         return []
     try:
+        headers = _headers_for_target(target)
         if target.kind == "github":
             payload = _request(
                 "GET",
                 f"{target.api_root}/repos/{target.owner_repo}/releases",
-                headers=_github_headers(),
+                headers=headers,
                 forge="GitHub",
                 params={"per_page": max(1, min(limit, 30))},
             )
@@ -117,7 +119,7 @@ def list_releases(repo_url: str | None, *, limit: int = 10) -> list[dict[str, st
         payload = _request(
             "GET",
             f"{target.api_root}/projects/{project}/releases",
-            headers=_gitlab_headers(),
+            headers=headers,
             forge="GitLab",
             params={"per_page": max(1, min(limit, 30))},
         )
@@ -147,12 +149,13 @@ def tag_exists(repo_url: str | None, tag: str) -> bool:
     if target.kind == "unsupported" or not target.token_configured:
         return False
     try:
+        headers = _headers_for_target(target)
         if target.kind == "github":
             _request(
                 "GET",
                 f"{target.api_root}/repos/{target.owner_repo}/git/ref/"
                 f"tags/{quote(candidate, safe='')}",
-                headers=_github_headers(),
+                headers=headers,
                 forge="GitHub",
             )
             return True
@@ -161,7 +164,7 @@ def tag_exists(repo_url: str | None, tag: str) -> bool:
             "GET",
             f"{target.api_root}/projects/{project}/repository/tags/"
             f"{quote(candidate, safe='')}",
-            headers=_gitlab_headers(),
+            headers=headers,
             forge="GitLab",
         )
         return True
@@ -232,16 +235,12 @@ def _target_from_parsed(parsed: ParsedRemote) -> ForgeTarget:
                 f"Publishing is only implemented for GitHub and GitLab remotes, not {parsed.host}."
             ),
         )
-    token = (
-        settings.GITHUB_TOKEN.strip()
-        if registered.kind == "github"
-        else settings.GITLAB_TOKEN.strip()
-    )
+    token = _token_for_name(registered.token_name)
     hint = (
-        "Set GITHUB_TOKEN with contents:write to create a GitHub Release. "
+        f"Set {registered.token_name} with contents:write to create a GitHub Release. "
         "The workspace SSH key can clone but cannot publish."
         if registered.kind == "github"
-        else "Set GITLAB_TOKEN with api scope to create a GitLab Release. "
+        else f"Set {registered.token_name} with api scope to create a GitLab Release. "
         "The workspace SSH key can clone but cannot publish."
     )
     return ForgeTarget(
@@ -266,16 +265,35 @@ def _require_tag(tag: str) -> str:
     return candidate
 
 
-def _github_headers() -> dict[str, str]:
+def _github_headers(token: str | None = None) -> dict[str, str]:
+    configured = _token_for_name("GITHUB_TOKEN") if token is None else token
     return {
-        "Authorization": f"Bearer {settings.GITHUB_TOKEN.strip()}",
+        "Authorization": f"Bearer {configured}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
-def _gitlab_headers() -> dict[str, str]:
-    return {"PRIVATE-TOKEN": settings.GITLAB_TOKEN.strip()}
+def _gitlab_headers(token: str | None = None) -> dict[str, str]:
+    configured = _token_for_name("GITLAB_TOKEN") if token is None else token
+    return {"PRIVATE-TOKEN": configured}
+
+
+def _headers_for_target(target: ForgeTarget) -> dict[str, str]:
+    registered = resolve_forge_host(target.host, settings.PRISM_FORGE_HOSTS)
+    if registered is None:
+        raise ForgePublishError("The configured forge target is no longer available.")
+    token = _token_for_name(registered.token_name)
+    if registered.kind == "github":
+        return _github_headers(token)
+    return _gitlab_headers(token)
+
+
+def _token_for_name(token_name: str) -> str:
+    configured = getattr(settings, token_name, None)
+    if configured is None:
+        configured = os.environ.get(token_name, "")
+    return str(configured or "").strip()
 
 
 def _github_release_row(item: dict[str, Any]) -> dict[str, str]:
@@ -318,7 +336,7 @@ def _publish_github(
     filename: str,
     extra_assets: Sequence[tuple[str, bytes]] = (),
 ) -> dict[str, str]:
-    headers = _github_headers()
+    headers = _headers_for_target(target)
     created = _request(
         "POST",
         f"{target.api_root}/repos/{target.owner_repo}/releases",
@@ -397,7 +415,7 @@ def _publish_gitlab(
     filename: str,
     extra_assets: Sequence[tuple[str, bytes]] = (),
 ) -> dict[str, str]:
-    headers = _gitlab_headers()
+    headers = _headers_for_target(target)
     project = quote(target.owner_repo, safe="")
     assets = [(filename, zip_bytes), *list(extra_assets)]
     links: list[dict[str, str]] = []
@@ -450,6 +468,7 @@ def _request(
             data=data,
             params=params,
             timeout=60,
+            allow_redirects=False,
         )
     except requests.RequestException as exc:
         raise ForgePublishError(f"{forge} could not be reached: {exc}") from exc
@@ -461,8 +480,16 @@ def _request(
             f"({'contents:write' if forge == 'GitHub' else 'api scope'}), not clone-only.",
             status_code=403,
         )
+    if 300 <= response.status_code < 400:
+        raise ForgePublishError(
+            f"{forge} returned an unexpected redirect.",
+            status_code=502,
+        )
     if response.status_code >= 400:
-        detail = _error_detail(response)
+        detail = _error_detail(
+            response,
+            sensitive_values=_sensitive_header_values(headers),
+        )
         raise ForgePublishError(
             f"{forge} rejected the release ({response.status_code}): {detail}",
             status_code=409 if response.status_code in {409, 422} else 502,
@@ -476,14 +503,40 @@ def _request(
     return parsed
 
 
-def _error_detail(response: requests.Response) -> str:
+def _error_detail(
+    response: requests.Response,
+    *,
+    sensitive_values: Sequence[str] = (),
+) -> str:
     try:
         payload = response.json()
     except ValueError:
         text = (response.text or "").strip()
-        return text[:300] or response.reason
+        detail = _redact(text or response.reason, sensitive_values)
+        return detail[:300]
     if isinstance(payload, dict):
         message = payload.get("message") or payload.get("error") or payload.get("error_description")
         if message:
-            return str(message)[:300]
-    return response.reason
+            return _redact(str(message), sensitive_values)[:300]
+    return _redact(response.reason, sensitive_values)[:300]
+
+
+def _redact(value: str, sensitive_values: Sequence[str]) -> str:
+    redacted = str(value or "")
+    for sensitive in sensitive_values:
+        candidate = str(sensitive or "")
+        if candidate:
+            redacted = redacted.replace(candidate, "[redacted]")
+    return redacted
+
+
+def _sensitive_header_values(headers: Mapping[str, str]) -> tuple[str, ...]:
+    values: list[str] = []
+    for value in headers.values():
+        candidate = str(value or "")
+        if not candidate:
+            continue
+        values.append(candidate)
+        if candidate.casefold().startswith("bearer "):
+            values.append(candidate[7:])
+    return tuple(values)
