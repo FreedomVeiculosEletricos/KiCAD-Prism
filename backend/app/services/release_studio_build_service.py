@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from app.release_studio import dossier as dossier_module
+from app.release_studio.git_publish import GitPublishError, run_git
 from app.release_studio.canonical import (
     CANONICALIZER_REGISTRY_NAME,
     CANONICALIZER_REGISTRY_VERSION,
@@ -392,13 +393,10 @@ def save_configuration(
     repo_rel = (project_prefix / rel_to_checkout).as_posix()
 
     def git(*args: str, cwd: Path = repo_root, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(cwd), *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=dict(env) if env is not None else None,
-        )
+        try:
+            return run_git(*args, cwd=cwd, env=env, check_cancelled=check_cancelled)
+        except GitPublishError as error:
+            raise BuildError(str(error)) from error
 
     def output(*args: str, cwd: Path = repo_root) -> str:
         result = git(*args, cwd=cwd)
