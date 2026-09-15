@@ -7,11 +7,16 @@ one is safe to restore, which is where a silent mistake costs data.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import prism_backup
 
@@ -232,6 +237,104 @@ class DeploymentDiscoveryTests(unittest.TestCase):
             self.assertEqual(values["SESSION_SECRET"], "a=b=c")
             self.assertEqual(values["BLANK"], "")
             self.assertNotIn("# comment", values)
+
+
+class RestoreStageTests(unittest.TestCase):
+    """Restore drives Docker through `run` and `subprocess.run`; both are faked here.
+
+    The fake records every Compose command so a test can assert which stages
+    ran, and returns the exit code configured for a command's verb.
+    """
+
+    def _deployment(self, tmp: str) -> tuple[Path, Path]:
+        root = Path(tmp) / "deploy"
+        root.mkdir()
+        (root / "compose.yml").write_text("services: {}", encoding="utf-8")
+        (root / ".env").write_text("POSTGRES_DB=kicad_prism\nPOSTGRES_USER=kicad_prism\n", encoding="utf-8")
+        (root / "data/projects").mkdir(parents=True)
+        (root / "data/projects/live.txt").write_text("live", encoding="utf-8")
+        (root / "data/ssh").mkdir()
+        (root / "data/ssh/id_ed25519").write_text("live-key", encoding="utf-8")
+
+        staging = Path(tmp) / "staging"
+        staging.mkdir()
+        (staging / "postgres.dump").write_bytes(b"dump")
+        for name in ("projects", "ssh"):
+            source = Path(tmp) / f"src-{name}"
+            source.mkdir()
+            (source / "restored.txt").write_text("restored", encoding="utf-8")
+            prism_backup.archive_directory(source, staging / f"{name}.tar.gz", prune_regenerable=False)
+        (staging / "env").write_text("POSTGRES_DB=kicad_prism\n", encoding="utf-8")
+        checksums = {path.name: prism_backup.sha256_file(path) for path in staging.iterdir()}
+        manifest = {"schema": prism_backup.MANIFEST_SCHEMA, "created_at": "now", "checksums": checksums}
+        (staging / prism_backup.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        archive = Path(tmp) / "backup.tar.gz"
+        with tarfile.open(archive, "w:gz") as handle:
+            for path in sorted(staging.iterdir()):
+                handle.add(path, arcname=path.name)
+        return root, archive
+
+    def _restore(self, root: Path, archive: Path, *, failing: set[str]) -> tuple[int, list[list[str]], list[list[str]], str]:
+        compose_calls: list[list[str]] = []
+        pg_calls: list[list[str]] = []
+
+        def fake_run(command, cwd, *, capture=False):
+            verb = command[command.index("-f") + 2] if "-f" in command else command[-1]
+            compose_calls.append(command)
+            if verb == "config":
+                return subprocess.CompletedProcess(command, 0, stdout=b"backend\nfrontend\npostgres\n", stderr=b"")
+            if verb == "exec":
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+            return subprocess.CompletedProcess(command, 1 if verb in failing else 0)
+
+        def fake_subprocess_run(command, **kwargs):
+            pg_calls.append(command)
+            return subprocess.CompletedProcess(command, 1 if "pg_restore" in failing else 0)
+
+        args = argparse.Namespace(root=root, archive=archive, env_file=None, compose_file=None, yes=True)
+        output = io.StringIO()
+        with patch.object(prism_backup, "run", fake_run), patch.object(
+            prism_backup.subprocess, "run", fake_subprocess_run
+        ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            code = prism_backup.restore(args)
+        return code, compose_calls, pg_calls, output.getvalue()
+
+    def test_a_failed_stop_does_nothing_destructive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, archive = self._deployment(tmp)
+            code, compose_calls, pg_calls, output = self._restore(root, archive, failing={"stop"})
+
+            self.assertEqual(code, 1)
+            self.assertEqual(pg_calls, [], "pg_restore must not run after a failed stop")
+            self.assertEqual((root / "data/projects/live.txt").read_text(encoding="utf-8"), "live")
+            self.assertEqual((root / "data/ssh/id_ed25519").read_text(encoding="utf-8"), "live-key")
+            self.assertFalse((root / "data/.projects.incoming").exists())
+            self.assertNotIn("Restore complete", output)
+            self.assertIn("Nothing was changed", output)
+            verbs = [call[call.index("-f") + 2] for call in compose_calls]
+            self.assertNotIn("up", verbs[1:], "no startup after an aborted restore")
+
+    def test_a_failed_startup_is_a_failure_after_the_data_was_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, archive = self._deployment(tmp)
+            code, compose_calls, pg_calls, output = self._restore(root, archive, failing={"up"})
+
+            self.assertEqual(code, 1)
+            self.assertEqual(len(pg_calls), 1)
+            self.assertEqual((root / "data/projects/restored.txt").read_text(encoding="utf-8"), "restored")
+            self.assertFalse((root / "data/projects/live.txt").exists())
+            self.assertNotIn("Restore complete", output)
+            self.assertIn("did not start healthy", output)
+
+    def test_a_clean_run_reports_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, archive = self._deployment(tmp)
+            code, _, pg_calls, output = self._restore(root, archive, failing=set())
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(pg_calls), 1)
+            self.assertIn("Restore complete", output)
+            self.assertEqual((root / "data/ssh/restored.txt").read_text(encoding="utf-8"), "restored")
 
 
 if __name__ == "__main__":
