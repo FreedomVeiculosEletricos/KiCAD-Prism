@@ -17,12 +17,20 @@ import { throwIfJobFailed, watchPrismJob } from "@/lib/jobs";
 import { canWriteCatalog } from "@/lib/roles";
 import { crossProbeRequestForSelection, normalizeEcadSelection } from "@/lib/prism-selection";
 import { selectionFromDesignSearchHit, type DesignSearchHit } from "@/lib/design-search";
+import {
+    commentIdFromOverlayHit,
+    commentLocationFromArea,
+    commentOverlaySet,
+    commentScreenPosition,
+    normalizeComment,
+    worldToViewportScreen,
+    type ActiveSchematicPage,
+} from "@/lib/comment-overlays";
 import { DesignSearchField } from "./design-search-field";
 import { usePrismCrossProbe } from "@/hooks/use-prism-cross-probe";
 import type { User } from "@/types/auth";
 import type {
     ECadViewerElement,
-    EcadCommentAnchor,
     EcadCommentAreaDetail,
     EcadCommentOverlayHitDetail,
     EcadSemanticSelectionDetail,
@@ -30,10 +38,6 @@ import type {
 } from "@/types/ecad-viewer";
 import type { PrismSelection, PrismSelectionContext, PrismSemanticIndex } from "@/types/prism-selection";
 import type { Comment, CommentContext, CommentLocation, CommentsFile, MentionCandidate } from "@/types/comments";
-import {
-    DEFAULT_COMMENT_CLASS,
-    DEFAULT_COMMENT_SEVERITY,
-} from "@/types/comments";
 
 interface VisualizerProps {
     projectId: string;
@@ -68,16 +72,6 @@ function selectionContextForTab(tab: VisualizerTab): PrismSelectionContext {
 const isAbortError = (error: unknown): boolean =>
     error instanceof DOMException && error.name === "AbortError";
 
-function normalizeComment(raw: Comment): Comment {
-    return {
-        ...raw,
-        commentClass: raw.commentClass ?? DEFAULT_COMMENT_CLASS,
-        severity: raw.severity ?? DEFAULT_COMMENT_SEVERITY,
-        mentions: raw.mentions ?? [],
-        replies: raw.replies ?? [],
-    };
-}
-
 type ViewerBlobSource = {
     filename: string;
     content: string;
@@ -105,63 +99,15 @@ function applyCommentMode(viewer: ECadViewerElement | null, enabled: boolean): v
     }
 }
 
-function worldToViewportScreen(
-    viewer: ECadViewerElement | null,
-    x: number,
-    y: number,
-): { x: number; y: number } | null {
-    if (!viewer) return null;
-    const local = viewer.getScreenLocation(x, y);
-    if (!local) return null;
-    const rect = viewer.getBoundingClientRect();
-    return { x: rect.left + local.x, y: rect.top + local.y };
-}
-
+/** Attach the overlay set for one view to its viewer; overlays are a separate render pass. */
 function publishCommentsOverlay(
     viewer: ECadViewerElement | null,
     context: CommentContext,
     comments: Comment[],
-    activePage?: {
-        projectPath: string;
-        filename: string;
-        page?: string;
-    } | null,
+    activePage?: ActiveSchematicPage | null,
 ): void {
     if (!viewer) return;
-
-    const filtered = comments.filter((comment) => {
-        if (comment.context !== context) return false;
-        if (context === "SCH" && activePage && comment.location.page) {
-            // New comments use the unique instance path. Continue accepting
-            // filename/page identifiers so existing comment files still show.
-            return [activePage.projectPath, activePage.filename, activePage.page]
-                .filter(Boolean)
-                .includes(comment.location.page);
-        }
-        return true;
-    });
-
-    viewer.setCommentOverlays({
-        context,
-        comments: filtered.map((comment) => {
-            const page = comment.location.page;
-            const anchor: EcadCommentAnchor = comment.elementId
-                ? { kind: "source-item", uuid: comment.elementId, page }
-                : {
-                      kind: "world",
-                      x: comment.location.x,
-                      y: comment.location.y,
-                      page,
-                  };
-            return {
-                id: comment.id,
-                anchor,
-                areaBounds: comment.location.bounds,
-                metadata: { commentId: comment.id },
-                accessibilityLabel: comment.content.slice(0, 80),
-            };
-        }),
-    });
+    viewer.setCommentOverlays(commentOverlaySet(comments, context, activePage));
 }
 
 type EcadViewerHostProps = {
@@ -401,11 +347,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
     const [componentImportPending, setComponentImportPending] = useState(false);
     const [labelInstances, setLabelInstances] = useState<LabelInstanceRef[]>([]);
     const [navigatingLabelInstance, setNavigatingLabelInstance] = useState(false);
-    const [activeSchematicPage, setActiveSchematicPage] = useState<{
-        projectPath: string;
-        filename: string;
-        page?: string;
-    } | null>(null);
+    const [activeSchematicPage, setActiveSchematicPage] = useState<ActiveSchematicPage | null>(null);
 
     // Comment collaboration state
     const [comments, setComments] = useState<Comment[]>([]);
@@ -1030,8 +972,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
 
     const openCommentCardForOverlayHit = useCallback((event: Event) => {
         const detail = (event as CustomEvent<EcadCommentOverlayHitDetail>).detail;
-        const metadata = detail.metadata as { commentId?: string } | null | undefined;
-        const commentId = metadata?.commentId ?? detail.commentId;
+        const commentId = commentIdFromOverlayHit(detail);
         if (!commentId) return;
         const viewer = detail.context === "SCH" ? schematicViewerRef.current : pcbViewerRef.current;
         setSelectedCommentId(commentId);
@@ -1044,13 +985,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         const detail = (event as CustomEvent<EcadCommentAreaDetail>).detail;
         setCommentMode(false);
         setPendingContext(detail.context);
-        setPendingLocation({
-            x: detail.x,
-            y: detail.y,
-            layer: detail.layer ?? "",
-            page: detail.page,
-            bounds: detail.bounds,
-        });
+        setPendingLocation(commentLocationFromArea(detail));
         pendingElementRef.current = null;
         setShowCommentForm(true);
     }, []);
@@ -1156,9 +1091,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
             viewer.zoomToLocation(comment.location.x, comment.location.y);
         }
         setSelectedCommentId(comment.id);
-        setCommentCardScreenPosition(
-            worldToViewportScreen(viewer, comment.location.x, comment.location.y),
-        );
+        setCommentCardScreenPosition(commentScreenPosition(viewer, comment));
     }, []);
 
     const selectedComment = useMemo(

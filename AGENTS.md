@@ -100,7 +100,8 @@ then `run_project_import_job_v3`) → `backend/app/services/git_service.py` ·
 `backend/app/services/comments_store_service.py` ·
 `backend/app/services/comments_url_service.py` →
 `frontend/src/components/comment-panel.tsx` →
-`frontend/src/components/visualizer.tsx` (overlay anchoring)
+`frontend/src/lib/comment-overlays.ts` (overlay shaping) →
+`frontend/src/components/visualizer.tsx` (overlay attachment)
 
 **Place a symbol from desktop KiCad**
 `backend/app/api/remote_provider.py` · `backend/app/api/provider_oauth.py` →
