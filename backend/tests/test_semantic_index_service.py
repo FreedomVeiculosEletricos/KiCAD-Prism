@@ -146,10 +146,10 @@ class SemanticIndexServiceTests(unittest.TestCase):
 
     def test_upstream_to_json_detaches_the_board_for_a_schematic_build(self) -> None:
         # The default production build is the pip kicad-monkey, whose to_json has
-        # no include_pcb switch. Model that: the first call raises TypeError, the
-        # fallback must detach the board so its PnP projection does not lazily
-        # parse the whole .kicad_pcb. Pin that the board is dropped and pcb_path
-        # cleared, so design.pcb returns None instead of re-parsing.
+        # no include_pcb switch. Model that shape: the adapter must detach the
+        # board so the PnP projection does not lazily parse the whole
+        # .kicad_pcb. Pin that the board is dropped and pcb_path cleared, so
+        # design.pcb returns None instead of re-parsing.
         class UpstreamDesign:
             def __init__(self):
                 self._pcb = "a-parsed-board"
@@ -163,10 +163,8 @@ class SemanticIndexServiceTests(unittest.TestCase):
             def pcb(self):
                 raise AssertionError("the schematic build re-parsed the PCB")
 
-            def to_json(self, include_indexes=True, **kwargs):
-                # Upstream signature: no include_pcb keyword.
-                if "include_pcb" in kwargs:
-                    raise TypeError("to_json() got an unexpected keyword argument 'include_pcb'")
+            def to_json(self, include_indexes=True, *, compiled_schematic_graph=None):
+                # Pinned upstream signature: no include_pcb keyword.
                 self.calls.append("fallback")
                 return {"components": [], "nets": []}
 
@@ -209,9 +207,7 @@ class SemanticIndexServiceTests(unittest.TestCase):
             def pcb(self):
                 return self._pcb
 
-            def to_json(self, include_indexes=True, **kwargs):
-                if "include_pcb" in kwargs:
-                    raise TypeError("to_json() got an unexpected keyword argument 'include_pcb'")
+            def to_json(self, include_indexes=True, *, compiled_schematic_graph=None):
                 return {"components": [], "nets": []}
 
         design = UpstreamDesign()
