@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
@@ -376,7 +377,8 @@ async def upload_folder_snapshot_file(
     user: AuthenticatedUser = Depends(require_catalog_writer),
 ):
     _folder_snapshot_for_user(snapshot_id, user)
-    try:
+
+    def store() -> dict[str, Any]:
         artifact = artifact_store.put_stream(
             file.file,
             media_type=file.content_type or "application/octet-stream",
@@ -385,6 +387,9 @@ async def upload_folder_snapshot_file(
         )
         artifact_store.add_snapshot_file(snapshot_id, relative_path, artifact)
         return {"relative_path": relative_path, "sha256": artifact.sha256, "size_bytes": artifact.size_bytes}
+
+    try:
+        return await asyncio.to_thread(store)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -1056,8 +1061,10 @@ async def import_symbol_library(
     if not payload:
         raise HTTPException(status_code=400, detail="Uploaded symbol library was empty")
 
+    # Runs kicad-cli; a slow upgrade must not stall the event loop.
     try:
-        return catalog_service.import_symbol_library(
+        return await asyncio.to_thread(
+            catalog_service.import_symbol_library,
             component_id,
             upload_name=file.filename or "uploaded.kicad_sym",
             payload=payload,
@@ -1084,7 +1091,8 @@ async def import_footprint(
         raise HTTPException(status_code=400, detail="Uploaded footprint payload was empty")
 
     try:
-        return catalog_service.import_footprint(
+        return await asyncio.to_thread(
+            catalog_service.import_footprint,
             component_id,
             upload_name=file.filename or "uploaded.kicad_mod",
             payload=payload,
@@ -1110,7 +1118,8 @@ async def import_auxiliary_asset(
         raise HTTPException(status_code=400, detail="Uploaded asset payload was empty")
 
     try:
-        return catalog_service.attach_auxiliary_asset(
+        return await asyncio.to_thread(
+            catalog_service.attach_auxiliary_asset,
             component_id,
             asset_type=asset_type,
             upload_name=file.filename or f"{asset_type}.bin",

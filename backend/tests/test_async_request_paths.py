@@ -9,6 +9,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app.api import _helpers as api_helpers
+from app.api import catalog_admin as catalog_admin_api
 from app.api import comments as comments_api
 from app.core import security, session
 from app.core.config import settings
@@ -158,6 +159,48 @@ class CommentReadsDoNotBlockTheLoopTests(unittest.TestCase):
                 asyncio.run(comments_api.get_comments("prj", user))
         self.assertEqual(ctx.exception.status_code, 404)
         lookup.assert_called_once_with("prj", "viewer")
+
+
+class _Upload:
+    """The parts of an UploadFile the catalog import endpoints read."""
+
+    filename = "parts.kicad_sym"
+
+    async def read(self) -> bytes:
+        return b"(kicad_symbol_lib)"
+
+
+class CatalogUploadsDoNotBlockTheLoopTests(unittest.TestCase):
+    """Symbol import shells out to kicad-cli; a slow run must not stall other requests."""
+
+    def test_blocked_symbol_import_does_not_stall_an_unrelated_request(self) -> None:
+        blocked = _BlockedStore(result={"asset_id": "sym-1"})
+        user = security.AuthenticatedUser(email="d@example.com", name="D", role="designer")
+
+        async def scenario() -> tuple[bool, dict]:
+            upload = asyncio.create_task(
+                catalog_admin_api.import_symbol_library("cmp", _Upload(), "", "", "", "", user)
+            )
+            await asyncio.get_running_loop().run_in_executor(None, blocked.entered.wait, 2)
+            probe_finished = await _lightweight_probe_completes_while(upload)
+            blocked.gate.set()
+            return probe_finished, await upload
+
+        with patch.object(catalog_admin_api.catalog_service, "import_symbol_library", blocked):
+            probe_finished, result = asyncio.run(scenario())
+
+        self.assertTrue(probe_finished, "the event loop was blocked by the symbol import")
+        self.assertEqual(result, {"asset_id": "sym-1"})
+
+    def test_import_errors_still_map_to_catalog_responses(self) -> None:
+        user = security.AuthenticatedUser(email="d@example.com", name="D", role="designer")
+        with patch.object(
+            catalog_admin_api.catalog_service, "import_symbol_library", side_effect=ValueError("Uploaded library has no symbols")
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(catalog_admin_api.import_symbol_library("cmp", _Upload(), "", "", "", "", user))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.detail, "Uploaded library has no symbols")
 
 
 if __name__ == "__main__":
