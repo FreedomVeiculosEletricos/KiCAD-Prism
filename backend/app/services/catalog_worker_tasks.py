@@ -13,8 +13,10 @@ from app.services.job_runtime import (
     JobContext,
     JobResult,
     LostJobLease,
+    PermanentJobError,
     RetryableJobError,
 )
+from app.services.catalog.conflicts import CatalogConflict
 from app.services.project_component_import_service import run_project_import_session
 from app.services.library_folder_import_service import run_folder_import_session
 from app.services.local_artifact_store import artifact_store
@@ -199,12 +201,17 @@ def run_metadata_batch(job: dict[str, Any], progress: Progress) -> dict[str, Any
             result={"batch_id": batch_id, **counts},
         )
 
-    result = catalog_service.apply_metadata_batch(
-        batch_id,
-        actor=actor,
-        item_ids=[str(value) for value in job["payload"].get("item_ids") or []],
-        progress_callback=callback,
-    )
+    try:
+        result = catalog_service.apply_metadata_batch(
+            batch_id,
+            actor=actor,
+            item_ids=[str(value) for value in job["payload"].get("item_ids") or []],
+            progress_callback=callback,
+        )
+    except CatalogConflict:
+        raise
+    except ValueError as error:
+        raise PermanentJobError(str(error), code="catalog_invalid_input") from error
     progress(progress=100, message="Metadata batch applied", result=result)
     return result
 
@@ -231,7 +238,10 @@ def run_catalog_job_v3(context: JobContext) -> JobResult:
     job_type = str(context.job["kind"])
     handler = HANDLERS.get(job_type)
     if handler is None:
-        raise RuntimeError(f"Unsupported catalog job type: {job_type}")
+        raise PermanentJobError(
+            f"Unsupported catalog job type: {job_type}",
+            code="unsupported_catalog_job",
+        )
 
     catalog_service.initialize()
     artifact_store.initialize()
@@ -274,8 +284,10 @@ def run_catalog_job_v3(context: JobContext) -> JobResult:
 
     try:
         result = handler(legacy_job, progress)
-    except (JobCancelled, LostJobLease, RetryableJobError):
+    except (JobCancelled, LostJobLease, RetryableJobError, PermanentJobError):
         raise
+    except CatalogConflict as error:
+        raise PermanentJobError(str(error), code=error.code) from error
     except Exception as error:
         raise RetryableJobError(
             str(error),
