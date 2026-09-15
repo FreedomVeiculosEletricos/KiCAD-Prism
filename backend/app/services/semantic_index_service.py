@@ -16,18 +16,27 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator
 
 from app.core.config import settings
-from app.services import path_config_service, semantic_visualizer_service
+from app.services import (
+    kicad_monkey_design_adapter,
+    path_config_service,
+    semantic_visualizer_service,
+)
+from app.services.kicad_monkey_design_adapter import KiCadMonkeyDesign
 
 
 SCHEMA = "prism.semantic_index_a0"
 GENERATOR_NAME = "kicad-prism-semantic-index"
 GENERATOR_VERSION = "0.1.0"
 _GENERATOR_INPUTS = ("semantic-index", SCHEMA, GENERATOR_VERSION)
+# The build identity covers every module whose logic shapes the payload, so a
+# change to the kicad-monkey adapter invalidates cached indexes like a change
+# to this file does.
 GENERATOR_BUILD = hashlib.sha256(
     b"\0".join(
         (
             "|".join(_GENERATOR_INPUTS).encode("utf-8"),
             Path(__file__).read_bytes(),
+            Path(kicad_monkey_design_adapter.__file__).read_bytes(),
         )
     )
 ).hexdigest()[:12]
@@ -824,59 +833,26 @@ def build_semantic_index(
             "KICAD_MONKEY_PYTHONPATH or install the package in the backend runtime"
         ) from exc
 
-    design = timed("load-project", lambda: KiCadDesign.from_project_file(project_file))
-    # Whether the caller handed us an already-parsed board. Captured before `pcb`
-    # is reassigned below, so the detach on the upstream fallback can tell an
-    # injected board (keep it) from one it would otherwise lazily parse (drop it).
-    board_was_injected = pcb is not None
-    if pcb is not None:
-        # The Release Studio projections already parsed this board. Re-parsing
-        # it here is the single largest avoidable cost on a large `.kicad_pcb`.
-        design._pcb = pcb
-    compile_netlist = getattr(design, "to_netlist", None)
-    netlist = timed("compile-netlist", compile_netlist) if callable(compile_netlist) else None
+    design = timed(
+        "load-project",
+        lambda: KiCadMonkeyDesign(KiCadDesign.from_project_file(project_file), board=pcb),
+    )
+    netlist = timed("compile-netlist", design.netlist)
     # kicad_design_to_json materializes PnP data and therefore accesses the
     # lazily parsed board. Resolve it explicitly so benchmark output separates
     # the parser cost from the much smaller JSON projection cost.
-    pcb = timed("load-pcb", lambda: design.pcb) if include_pcb else None
-
-    def materialize_design_json() -> dict[str, Any]:
-        try:
-            return design.to_json(
-                include_indexes=True,
-                include_pcb=include_pcb,
-            )
-        except TypeError as exc:
-            # Compatibility with an older installed kicad-monkey. The local
-            # optimized tree supports include_pcb=False; upstream releases
-            # without it remain functional.
-            if "include_pcb" not in str(exc):
-                raise
-            if not include_pcb and not board_was_injected:
-                # The upstream to_json has no include_pcb switch, so its PnP
-                # projection would lazily parse the whole `.kicad_pcb` even
-                # though this caller does not want board data. That board parse
-                # is the single largest cost of a schematic-only build (~25s on
-                # a 9MB board). Detach the board so the projection skips it; the
-                # PCB is parsed once, separately, by the stages that need it.
-                # An already-injected board is left in place: the caller paid to
-                # parse it, so dropping it here (and clearing pcb_path, which
-                # makes design.pcb return None instead of re-parsing) would throw
-                # that work away.
-                design._pcb = None
-                design.pcb_path = None
-            return design.to_json(include_indexes=True)
+    pcb = timed("load-pcb", design.board) if include_pcb else None
 
     design_payload = timed(
         "materialize-design-json",
-        materialize_design_json,
+        lambda: design.to_json(include_indexes=True, include_pcb=include_pcb),
         components=len(getattr(netlist, "components", ()) or ()),
         nets=len(getattr(netlist, "nets", ()) or ()),
         includePcb=include_pcb,
     )
     sheet_instances, buses, schematic_placements = timed(
         "project-schematic-instances",
-        lambda: _schematic_semantic_projection(design, project_file),
+        lambda: _schematic_semantic_projection(design.native, project_file),
     )
     source_fields_by_uuid = (
         timed(
