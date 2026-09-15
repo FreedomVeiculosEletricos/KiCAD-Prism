@@ -305,6 +305,27 @@ def archive_directory(source: Path, target: Path, *, prune_regenerable: bool) ->
         archive.add(source, arcname=".", filter=keep)
 
 
+def swap_directory(incoming: Path, destination: Path) -> None:
+    """Put ``incoming`` at ``destination``, keeping the live copy until the swap succeeds.
+
+    The live directory is moved aside rather than removed first, so a rename
+    that fails leaves it exactly where it was and the incoming copy intact.
+    """
+    previous = destination.parent / f".{destination.name}.previous"
+    if previous.exists():
+        shutil.rmtree(previous)
+    if destination.is_dir():
+        destination.replace(previous)
+    try:
+        incoming.replace(destination)
+    except OSError:
+        if previous.exists():
+            previous.replace(destination)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -551,6 +572,11 @@ def restore(args: argparse.Namespace) -> int:
                 extract_all(handle, unpacked)
             incoming.append((destination, unpacked, relative))
 
+        # Stage 1: the database, as one transaction. Without
+        # --single-transaction pg_restore keeps going past a failed object and
+        # leaves a database that is neither the old one nor the archive's;
+        # with it, the first error rolls everything back and the live
+        # database is exactly what it was.
         user = env.get("POSTGRES_USER", "kicad_prism")
         database = env.get("POSTGRES_DB", "kicad_prism")
         tui.note("Restoring PostgreSQL")
@@ -559,7 +585,8 @@ def restore(args: argparse.Namespace) -> int:
                 compose
                 + [
                     "exec", "-T", "postgres",
-                    "pg_restore", "-U", user, "-d", database, "--clean", "--if-exists",
+                    "pg_restore", "-U", user, "-d", database,
+                    "--clean", "--if-exists", "--single-transaction",
                 ],
                 cwd=root,
                 stdin=handle,
@@ -570,16 +597,33 @@ def restore(args: argparse.Namespace) -> int:
                 shutil.rmtree(unpacked, ignore_errors=True)
             tui.fail("pg_restore reported errors.", "Inspect the output above before starting.")
             tui.write()
-            tui.info("Project storage and SSH keys were left as they were, so this")
-            tui.info("deployment is no worse off than before the restore began.")
+            tui.info("The restore ran as one transaction and was rolled back, so the")
+            tui.info("database, project storage and SSH keys are as they were before.")
             return result.returncode
         tui.ok("database restored")
 
-        for destination, unpacked, relative in incoming:
-            if destination.is_dir():
-                shutil.rmtree(destination)
-            unpacked.replace(destination)
-            tui.ok(relative)
+        # Stage 2: swap the files in. The database is already the archive's,
+        # so a failure here is reported as a half-applied restore, and the
+        # unpacked payloads that did not get swapped are left in place to
+        # finish by hand rather than deleted.
+        swapped: list[str] = []
+        try:
+            for destination, unpacked, relative in incoming:
+                swap_directory(unpacked, destination)
+                swapped.append(relative)
+                tui.ok(relative)
+        except OSError as error:
+            tui.fail("Could not replace project storage.", str(error))
+            tui.write()
+            tui.info("The database holds the archive's content. Replaced so far:")
+            for relative in swapped:
+                tui.ok(relative)
+            for destination, unpacked, relative in incoming:
+                if relative not in swapped:
+                    tui.warn(f"{relative} not replaced; the archive's copy is at {unpacked}")
+            tui.info("Move each remaining .incoming directory over its destination,")
+            tui.info("then start the application.")
+            return 1
 
     tui.write()
     tui.note("Starting the application")

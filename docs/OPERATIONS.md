@@ -94,12 +94,14 @@ Example database restore into a fresh configured database:
 ```bash
 docker compose up -d postgres
 docker compose exec -T postgres \
-  pg_restore -U kicad_prism -d kicad_prism --clean --if-exists \
+  pg_restore -U kicad_prism -d kicad_prism --clean --if-exists --single-transaction \
   < prism-postgres.dump
 ```
 
 Run `--clean` only against the isolated restore target; it replaces objects in
-that database.
+that database. Keep `--single-transaction`: without it `pg_restore` continues
+past a failed object and leaves a database that is neither the old one nor the
+archive's, whereas with it the first error rolls the whole restore back.
 
 ## Upgrade a release bundle
 

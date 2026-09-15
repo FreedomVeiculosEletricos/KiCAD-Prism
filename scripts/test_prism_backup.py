@@ -326,6 +326,40 @@ class RestoreStageTests(unittest.TestCase):
             self.assertNotIn("Restore complete", output)
             self.assertIn("did not start healthy", output)
 
+    def test_database_restore_is_one_transaction_and_a_failure_leaves_files_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, archive = self._deployment(tmp)
+            code, _, pg_calls, output = self._restore(root, archive, failing={"pg_restore"})
+
+            self.assertEqual(code, 1)
+            self.assertIn("--single-transaction", pg_calls[0])
+            self.assertIn("--clean", pg_calls[0])
+            self.assertEqual((root / "data/projects/live.txt").read_text(encoding="utf-8"), "live")
+            self.assertFalse((root / "data/.projects.incoming").exists())
+            self.assertIn("rolled back", output)
+            self.assertNotIn("Restore complete", output)
+
+    def test_a_failed_file_swap_reports_the_half_applied_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, archive = self._deployment(tmp)
+            real_replace = Path.replace
+
+            def failing_replace(self_path, target):
+                if self_path.name == ".ssh.incoming":
+                    raise OSError("device busy")
+                return real_replace(self_path, target)
+
+            with patch.object(Path, "replace", failing_replace):
+                code, _, pg_calls, output = self._restore(root, archive, failing=set())
+
+            self.assertEqual(code, 1)
+            self.assertEqual(len(pg_calls), 1)
+            self.assertEqual((root / "data/projects/restored.txt").read_text(encoding="utf-8"), "restored")
+            self.assertEqual((root / "data/ssh/id_ed25519").read_text(encoding="utf-8"), "live-key")
+            self.assertTrue((root / "data/.ssh.incoming/restored.txt").is_file(), "staged copy retained")
+            self.assertIn("data/ssh not replaced", output)
+            self.assertNotIn("Restore complete", output)
+
     def test_a_clean_run_reports_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, archive = self._deployment(tmp)
