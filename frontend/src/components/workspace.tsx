@@ -7,7 +7,7 @@ import type { User } from "@/types/auth";
 import type { FolderTreeItem, Project } from "@/types/project";
 import { Button } from "@/components/ui/button";
 import { ErrorBoundary } from "@/components/error-boundary";
-import { useWorkspaceData } from "@/hooks/use-workspace-data";
+import { useWorkspaceData, workspaceSessionKey } from "@/hooks/use-workspace-data";
 import { useWorkspaceSearch } from "@/hooks/use-workspace-search";
 import { canManageProjects as roleCanManageProjects, canOpenLibraryManager } from "@/lib/roles";
 import { registerPaletteCommands, type PaletteCommand } from "@/lib/command-registry";
@@ -62,7 +62,7 @@ export function Workspace({ searchQuery, user }: WorkspaceProps) {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const { projects, folders, loading, error, folderById, refresh, createFolder, renameFolder, deleteFolder, moveProjects, deleteProject } =
-    useWorkspaceData();
+    useWorkspaceData({ sessionKey: workspaceSessionKey(user) });
 
   const requestedSection = searchParams.get("section") === "library-manager" ? "library-manager" : "projects";
   const [section, setSection] = useState<WorkspaceSection>(requestedSection);
@@ -74,7 +74,10 @@ export function Workspace({ searchQuery, user }: WorkspaceProps) {
 
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  // The project the user asked to inspect. It only counts as selected while
+  // that project is still in the workspace, so a project removed by a refresh
+  // (or another session's data) deselects itself without an adjustment effect.
+  const [requestedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [rawBulkSelection, setBulkSelectedProjectIds] = useState<Set<string>>(() => new Set());
 
   const [folderToRename, setFolderToRename] = useState<FolderTreeItem | null>(null);
@@ -261,15 +264,10 @@ export function Workspace({ searchQuery, user }: WorkspaceProps) {
   };
 
   const selectedProject = useMemo(
-    () => projects.find((project) => project.id === selectedProjectId) ?? null,
-    [projects, selectedProjectId]
+    () => projects.find((project) => project.id === requestedProjectId) ?? null,
+    [projects, requestedProjectId]
   );
-
-  useEffect(() => {
-    if (selectedProjectId && !projects.some((project) => project.id === selectedProjectId)) {
-      setSelectedProjectId(null);
-    }
-  }, [projects, selectedProjectId]);
+  const selectedProjectId = selectedProject?.id ?? null;
 
 
   const handleCreateFolder = async (name: string) => {
