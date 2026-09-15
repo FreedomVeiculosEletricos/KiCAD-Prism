@@ -1194,15 +1194,10 @@ def _stored_project_metadata(
     fields for one job's duration, never a request that blocks on kicad-cli.
     """
     anchor = project_service.project_anchor(project)
-    schematic_path = project_service.find_schematic_file(project.path, anchor)
-    pcb_path = project_service.find_pcb_file(project.path, anchor)
     repo_path, _relative_path = _repo_context(project)
-    # The sidecar project file is an input: the stored title block is expanded
-    # from its text variables, so a variable edit has to make the row stale.
-    project_file = project_metadata_service.locate_project_file(project.path, anchor)
 
     record, current = project_metadata_service.stored_metadata_is_current(
-        project.id, schematic_path, pcb_path, repo_path, project_file=project_file
+        project.id, project.path, anchor, repo_path
     )
     if not current:
         try:

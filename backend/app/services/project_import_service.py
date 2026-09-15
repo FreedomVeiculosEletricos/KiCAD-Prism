@@ -1306,8 +1306,7 @@ def run_project_metadata_job_v3(context: JobContext) -> JobResult:
         schematic_path,
         pcb_path,
         repo_path=repo_path,
-        relative_path=relative_path,
-        anchor=anchor,
+        relative_path=relative_path, anchor=anchor,
     )
     pcb = computed.get("pcb") or {}
     return JobResult(

@@ -596,7 +596,7 @@ class RefreshReusesExpensiveWorkTests(unittest.TestCase):
             ):
                 ws.get_project_metadata.return_value = record
                 _, current = project_metadata_service.stored_metadata_is_current(
-                    "prj-1", None, pcb, "/repo"
+                    "prj-1", str(root), None, "/repo"
                 )
 
         self.assertFalse(current)
@@ -696,10 +696,33 @@ class RefreshReusesExpensiveWorkTests(unittest.TestCase):
             with patch.object(project_metadata_service, "workspace") as ws:
                 ws.get_project_metadata.return_value = record
                 _, current = project_metadata_service.stored_metadata_is_current(
-                    "prj-1", None, pcb, None, project_file=pro
+                    "prj-1", str(root), "board.kicad_pro"
                 )
 
         self.assertFalse(current)
+
+    def test_a_row_written_by_the_job_reads_back_current(self) -> None:
+        """The checker must resolve the same inputs the job fingerprinted.
+
+        If it located the documents or the sidecar differently, the panel
+        would queue a refresh on every open and never settle.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pro = _write_project(root, {"text_variables": {"TITLE": "Cynthion"}})
+            pcb = _write(root, "board.kicad_pcb", VARIABLE_BOARD_HEADER)
+            record = {
+                "source_fingerprint": project_metadata_service.source_fingerprint(None, pcb, pro),
+                "repo_fingerprint": "",
+            }
+
+            with patch.object(project_metadata_service, "workspace") as ws:
+                ws.get_project_metadata.return_value = record
+                _, current = project_metadata_service.stored_metadata_is_current(
+                    "prj-1", str(root)
+                )
+
+        self.assertTrue(current)
 
 
 class ProjectFileLocationTests(unittest.TestCase):

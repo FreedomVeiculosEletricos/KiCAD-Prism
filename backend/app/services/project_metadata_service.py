@@ -267,21 +267,38 @@ def refresh_project_metadata(
 
 def stored_metadata_is_current(
     project_id: str,
-    schematic_path: Optional[str],
-    pcb_path: Optional[str],
+    project_path: str,
+    anchor: Optional[str] = None,
     repo_path: Optional[str] = None,
-    project_file: Optional[str] = None,
 ) -> tuple[Optional[dict[str, Any]], bool]:
     """Return the stored row and whether it still describes the project.
 
     Stale on either axis: the files may have changed, or the repository may
     have moved. Both are cheap to check -- three ``stat`` calls and a HEAD
     read.
+
+    The document paths are resolved here, with the same anchor the metadata
+    job stored the row with. A caller passing its own pair could disagree with
+    that job's locator and leave the row looking stale on every read.
+
+    The sidecar ``.kicad_pro`` is part of the file fingerprint because the
+    stored title block was expanded from its text variables: editing one
+    changes the card without touching either design file.
     """
+    from app.services import project_service
+    from app.services.project_import_service import infer_project_anchor
+
     record = workspace.get_project_metadata(project_id)
     if not record:
         return None, False
 
+    # The same anchor the job stored the row with: an exact path when the row
+    # has one, otherwise the directory's only project. A plain locator could
+    # pick a different file than the job did and leave the row stale forever.
+    anchor = anchor or infer_project_anchor(project_path)
+    schematic_path = project_service.find_schematic_file(project_path, anchor)
+    pcb_path = project_service.find_pcb_file(project_path, anchor)
+    project_file = locate_project_file(project_path, anchor)
     files_current = str(record.get("source_fingerprint") or "") == source_fingerprint(
         schematic_path, pcb_path, project_file
     )
