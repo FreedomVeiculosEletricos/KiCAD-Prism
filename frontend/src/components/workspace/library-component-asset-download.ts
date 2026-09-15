@@ -197,7 +197,7 @@ export function useReleasedAssetDownload(
       requestRef.current?.abort();
       requestRef.current = null;
     };
-  }, []);
+  }, [componentId]);
 
   return useCallback(
     async (

@@ -176,6 +176,39 @@ describe("watchCatalogValidationJob", () => {
 });
 
 describe("useLibraryComponentValidation", () => {
+  it("does not revive an aborted spinner when navigating A to B to A", async () => {
+    vi.mocked(fetchJson).mockResolvedValue({ job_id: "job-1" });
+    vi.mocked(fetchApi).mockImplementation((_url, init) => abortAwareHang(init?.signal));
+    const { result, rerender } = renderHook(
+      ({ componentId }) => useLibraryComponentValidation({ componentId, onRefresh: vi.fn() }),
+      { initialProps: { componentId: "comp-a" } },
+    );
+    await act(async () => { void result.current.runValidation(); });
+    expect(result.current.validationBusy).toBe(true);
+    rerender({ componentId: "comp-b" });
+    await act(async () => { await Promise.resolve(); });
+    rerender({ componentId: "comp-a" });
+    expect(result.current.validationBusy).toBe(false);
+  });
+
+  it("queues once for rapid clicks and ignores a late queue response after navigation", async () => {
+    let finish!: (value: { job_id: string }) => void;
+    vi.mocked(fetchJson).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const { result, rerender } = renderHook(
+      ({ componentId }) => useLibraryComponentValidation({ componentId, onRefresh: vi.fn() }),
+      { initialProps: { componentId: "comp-a" } },
+    );
+    await act(async () => {
+      void result.current.runValidation();
+      void result.current.runValidation();
+    });
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+    rerender({ componentId: "comp-b" });
+    await act(async () => { finish({ job_id: "job-1" }); });
+    expect(fetchApi).not.toHaveBeenCalled();
+    expect(toast.message).not.toHaveBeenCalled();
+  });
+
   it("aborts polling on unmount and does not refresh or toast success", async () => {
     const signals: AbortSignal[] = [];
     vi.mocked(fetchJson).mockResolvedValue({ job_id: "job-1" });
