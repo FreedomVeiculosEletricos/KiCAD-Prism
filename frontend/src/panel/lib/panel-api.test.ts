@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { loadAssetText } from "@/lib/ecad-renderer";
+
 import {
   getComponent,
   getComponentsByCategory,
   getInlineBundle,
   getPartManifest,
+  loadPanelAssetText,
   primaryLocalSource,
   searchComponents,
+  setApiToken,
   type PanelComponent,
   type PanelSupplySource,
 } from "./panel-api";
@@ -171,5 +175,78 @@ describe("panel page fetches", () => {
     const pending = searchComponents("cap", { signal: controller.signal });
     controller.abort();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+describe("panel preview asset fetches", () => {
+  afterEach(() => {
+    setApiToken(null);
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("attaches the bearer token only to remote-provider asset urls", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve("(kicad_symbol_lib)"),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    setApiToken("panel-secret");
+
+    await loadPanelAssetText("/api/remote-provider/assets/sym-1/content");
+    await loadPanelAssetText("/api/catalog/assets/sym-1/content");
+
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual({
+      credentials: "include",
+      headers: { Authorization: "Bearer panel-secret" },
+    });
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual({
+      credentials: "include",
+      headers: {},
+    });
+  });
+
+  it("refetches the same url after the panel token changes", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        text: () => Promise.resolve("first-token"),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        text: () => Promise.resolve("second-token"),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const url = "/api/remote-provider/assets/token-change/content";
+    setApiToken("token-a");
+    await expect(loadPanelAssetText(url)).resolves.toBe("first-token");
+    setApiToken("token-b");
+    await expect(loadPanelAssetText(url)).resolves.toBe("second-token");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      (fetchMock.mock.calls[1]?.[1] as RequestInit | undefined)?.headers,
+    ).toEqual({ Authorization: "Bearer token-b" });
+  });
+
+  it("does not reuse a cookie-scoped catalog body for a panel token fetch", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        text: () => Promise.resolve("cookie-body"),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        text: () => Promise.resolve("panel-body"),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const url = "/api/remote-provider/assets/shared-url/content";
+    await expect(loadAssetText(url)).resolves.toBe("cookie-body");
+    setApiToken("panel-secret");
+    await expect(loadPanelAssetText(url)).resolves.toBe("panel-body");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

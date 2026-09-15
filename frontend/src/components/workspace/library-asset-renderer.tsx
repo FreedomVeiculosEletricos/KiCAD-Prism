@@ -63,6 +63,7 @@ export function LibraryAssetRenderer({
   unit = 1,
   navigation = EMBEDDED_PREVIEW_NAVIGATION,
   onControllerChange,
+  loadAsset = loadAssetText,
 }: {
   assetId: string;
   kind: "symbol" | "footprint";
@@ -75,6 +76,7 @@ export function LibraryAssetRenderer({
   unit?: number;
   navigation?: RenderNavigationOptions;
   onControllerChange?: (controller: RenderController | null) => void;
+  loadAsset?: (url: string) => Promise<string>;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const renderedRef = useRef<RenderHandle | null>(null);
@@ -102,7 +104,7 @@ export function LibraryAssetRenderer({
       try {
         const [renderer, text] = await Promise.all([
           loadEcadRenderer(),
-          loadAssetText(url),
+          loadAsset(url),
         ]);
         if (cancelled) return;
         const canvas = canvasRef.current;
@@ -167,6 +169,7 @@ export function LibraryAssetRenderer({
     registerProbe,
     onUnitsChange,
     onControllerChange,
+    loadAsset,
   ]);
 
   // Unmount is the only place the last render is torn down; the effect above
