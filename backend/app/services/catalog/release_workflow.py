@@ -29,16 +29,7 @@ from app.services.catalog.revision_kernel import (
     normalize_workflow_stage,
 )
 from app.services.catalog.runtime import CatalogRuntime
-
-
-WORKFLOW_TRANSITIONS: dict[str, frozenset[str]] = {
-    "open": frozenset({"in_progress", "archived"}),
-    "in_progress": frozenset({"qa_review", "open", "archived"}),
-    "qa_review": frozenset({"done", "in_progress", "archived"}),
-    "done": frozenset({"released", "qa_review", "archived"}),
-    "released": frozenset({"archived", "open"}),
-    "archived": frozenset({"open"}),
-}
+from app.services.catalog.workflow_policy import WORKFLOW_TRANSITIONS
 
 _RELEASE_BLOCKING_VALIDATION = frozenset(
     {VALIDATION_STATUS_FAILED, VALIDATION_STATUS_SKIPPED, VALIDATION_STATUS_NOT_RUN}
@@ -118,7 +109,7 @@ class CatalogReleaseWorkflow:
             current_status = normalize_workflow_stage(str(revision["release_status"]))
 
         if release_status != current_status and release_status not in WORKFLOW_TRANSITIONS.get(
-            current_status, frozenset()
+            current_status, ()
         ):
             raise ValueError(f"Cannot transition revision from {current_status} to {release_status}")
         if actor and current_status == "qa_review" and release_status == "in_progress" and not review_note.strip():
