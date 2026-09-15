@@ -41,10 +41,17 @@ Keep this record with every backup.
 A recoverable backup contains one consistent set of:
 
 1. the `prism-postgres-data` PostgreSQL volume;
-2. `data/projects`;
-3. `data/ssh`;
+2. the directory the backend mounts at `/app/projects` (`data/projects` by
+   default);
+3. the directory the backend mounts at `/root/.ssh` (`data/ssh` by default);
 4. the deployed `.env`;
 5. the release bundle or source revision record.
+
+`scripts/prism_backup.py` reads the two directories from the selected Compose
+configuration and records them in the archive manifest, so an overlay that
+moves storage is archived from where it actually lives. Only bind mounts inside
+the deployment directory are supported; a named volume or a mount elsewhere
+stops the backup instead of archiving the default path.
 
 PostgreSQL alone cannot restore component assets or imported repositories.
 Project storage alone cannot restore users, roles, comments, catalog metadata,
