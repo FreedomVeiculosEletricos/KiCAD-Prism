@@ -288,7 +288,8 @@ class Settings(BaseSettings):
         default="",
         description=(
             "Extra GitLab hosts allowed for Release publishing, as comma-separated "
-            "host=gitlab pairs. github.com and gitlab.com are always included. "
+            "host=gitlab pairs or a structured JSON array with per-host api_root "
+            "and token_name values. github.com and gitlab.com are always included. "
             "A hostname that merely contains 'gitlab' is not treated as GitLab."
         ),
     )
