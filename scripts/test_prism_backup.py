@@ -239,6 +239,89 @@ class DeploymentDiscoveryTests(unittest.TestCase):
             self.assertNotIn("# comment", values)
 
 
+def compose_config_json(root: Path, *, projects: str = "data/projects", ssh: str = "data/ssh", extra=None) -> bytes:
+    """What `docker compose config --format json` reports for the backend's mounts."""
+    volumes = [
+        {"type": "bind", "source": str(root / projects), "target": "/app/projects", "bind": {}},
+        {"type": "bind", "source": str(root / ssh), "target": "/root/.ssh", "bind": {}},
+    ]
+    if extra is not None:
+        volumes = extra
+    return json.dumps({"services": {"backend": {"volumes": volumes}, "postgres": {}}}).encode("utf-8")
+
+
+class PayloadResolutionTests(unittest.TestCase):
+    """Backup archives what the running services actually mount."""
+
+    def _resolve(self, root: Path, stdout: bytes, returncode: int = 0):
+        def fake_run(command, cwd, *, capture=False):
+            return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=b"boom")
+
+        with patch.object(prism_backup, "run", fake_run):
+            return prism_backup.resolve_payloads(["docker", "compose"], root)
+
+    def test_default_layout_resolves_to_the_default_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(
+                self._resolve(root, compose_config_json(root)),
+                [("projects", "data/projects"), ("ssh", "data/ssh")],
+            )
+
+    def test_an_overlay_that_moves_storage_is_honoured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(
+                self._resolve(root, compose_config_json(root, projects="storage/projects", ssh="secrets/ssh")),
+                [("projects", "storage/projects"), ("ssh", "secrets/ssh")],
+            )
+
+    def test_a_named_volume_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            volumes = [
+                {"type": "volume", "source": "prism-projects", "target": "/app/projects"},
+                {"type": "bind", "source": str(root / "data/ssh"), "target": "/root/.ssh"},
+            ]
+            with self.assertRaisesRegex(prism_backup.BackupError, "volume mount"):
+                self._resolve(root, compose_config_json(root, extra=volumes))
+
+    def test_a_mount_outside_the_deployment_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as elsewhere:
+            root = Path(tmp)
+            volumes = [
+                {"type": "bind", "source": str(Path(elsewhere) / "projects"), "target": "/app/projects"},
+                {"type": "bind", "source": str(root / "data/ssh"), "target": "/root/.ssh"},
+            ]
+            with self.assertRaisesRegex(prism_backup.BackupError, "outside"):
+                self._resolve(root, compose_config_json(root, extra=volumes))
+
+    def test_a_missing_mount_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            volumes = [{"type": "bind", "source": str(root / "data/projects"), "target": "/app/projects"}]
+            with self.assertRaisesRegex(prism_backup.BackupError, "mounts nothing at /root/.ssh"):
+                self._resolve(root, compose_config_json(root, extra=volumes))
+
+    def test_an_unreadable_configuration_is_an_error_not_a_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(prism_backup.BackupError, "Could not read the Compose configuration"):
+                self._resolve(Path(tmp), b"", returncode=1)
+
+    def test_manifest_records_where_each_payload_came_from(self) -> None:
+        manifest = prism_backup.build_manifest(
+            created_at="now", root=Path("/deploy"), env={}, versions={}, entries={}, hot=False,
+            payloads=[("projects", "storage/projects"), ("ssh", "data/ssh")],
+        )
+        self.assertEqual(
+            manifest["payloads"],
+            {
+                "projects": {"source": "storage/projects", "target": "/app/projects"},
+                "ssh": {"source": "data/ssh", "target": "/root/.ssh"},
+            },
+        )
+
+
 class RestoreStageTests(unittest.TestCase):
     """Restore drives Docker through `run` and `subprocess.run`; both are faked here.
 
@@ -281,6 +364,8 @@ class RestoreStageTests(unittest.TestCase):
         def fake_run(command, cwd, *, capture=False):
             verb = command[command.index("-f") + 2] if "-f" in command else command[-1]
             compose_calls.append(command)
+            if verb == "config" and "--format" in command:
+                return subprocess.CompletedProcess(command, 0, stdout=compose_config_json(root), stderr=b"")
             if verb == "config":
                 return subprocess.CompletedProcess(command, 0, stdout=b"backend\nfrontend\npostgres\n", stderr=b"")
             if verb == "exec":
@@ -311,8 +396,7 @@ class RestoreStageTests(unittest.TestCase):
             self.assertFalse((root / "data/.projects.incoming").exists())
             self.assertNotIn("Restore complete", output)
             self.assertIn("Nothing was changed", output)
-            verbs = [call[call.index("-f") + 2] for call in compose_calls]
-            self.assertNotIn("up", verbs[1:], "no startup after an aborted restore")
+            self.assertFalse(any("--wait" in call for call in compose_calls), "no startup after an aborted restore")
 
     def test_a_failed_startup_is_a_failure_after_the_data_was_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
