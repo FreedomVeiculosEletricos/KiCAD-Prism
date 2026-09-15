@@ -12,6 +12,7 @@ import {
 } from "@/panel/lib/kicad-bridge";
 import { getCategories, isAuthError, setApiToken } from "@/panel/lib/panel-api";
 import type { PanelComponent } from "@/panel/lib/panel-api";
+import { appendPanelLog, emptyPanelLog } from "@/panel/lib/panel-log";
 import {
   emptyCategoryBrowse,
   emptyFinderView,
@@ -44,17 +45,17 @@ export function PanelApp() {
   const [categoryView, setCategoryView] = useState<CategoryBrowseState>(
     () => emptyCategoryBrowse(""),
   );
-  const [logEntries, setLogEntries] = useState<string[]>([]);
+  const [log, setLog] = useState(emptyPanelLog);
   const [sessionReady, setSessionReady] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
 
   const appendLog = useCallback((msg: string) => {
     const stamp = new Date().toLocaleTimeString();
-    setLogEntries((prev) => [...prev, `[${stamp}] ${msg}`]);
+    setLog((prev) => appendPanelLog(prev, `[${stamp}] ${msg}`));
   }, []);
 
-  const clearLog = useCallback(() => setLogEntries([]), []);
+  const clearLog = useCallback(() => setLog(emptyPanelLog()), []);
 
   const testAuthAndRoute = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -261,7 +262,7 @@ export function PanelApp() {
 
       {/* Log terminal — always at bottom */}
       <div className="px-3 pb-3">
-        <LogTerminal entries={logEntries} onClear={clearLog} />
+        <LogTerminal entries={log.entries} dropped={log.dropped} onClear={clearLog} />
       </div>
     </div>
   );
