@@ -15,6 +15,7 @@ from app.api.catalog_errors import raise_catalog_value_error
 from app.core.config import settings
 from app.core.security import AuthenticatedUser, require_catalog_reader, require_catalog_writer
 from app.services.component_catalog_service import catalog_service
+from app.services.catalog import workflow_policy
 from app.services.catalog_job_service import catalog_jobs
 from app.services.local_artifact_store import artifact_store
 from app.services.library_folder_import_service import configured_import_roots, resolve_server_import_path
@@ -24,40 +25,12 @@ from app.services.workspace_service import workspace
 
 router = APIRouter(prefix="/api/catalog", tags=["catalog"])
 
-WORKFLOW_TRANSITIONS: dict[str, set[str]] = {
-    "open": {"in_progress", "archived"},
-    "in_progress": {"qa_review", "open", "archived"},
-    "qa_review": {"done", "in_progress", "archived"},
-    "done": {"released", "qa_review", "archived"},
-    "released": {"archived", "open"},
-    "archived": {"open"},
-}
-
-LEGACY_WORKFLOW_STAGE_MAP = {
-    "draft": "open",
-    "in_review": "qa_review",
-    "qa_approved": "done",
-    "deprecated": "archived",
-}
-
-
 def _normalize_workflow_stage(value: str) -> str:
-    normalized = value.strip().lower()
-    return LEGACY_WORKFLOW_STAGE_MAP.get(normalized, normalized)
+    return workflow_policy.normalize_workflow_stage(value)
 
 
 def _can_transition_workflow(user: AuthenticatedUser, current_stage: str, next_stage: str) -> bool:
-    if current_stage == next_stage:
-        return user.role in {"admin", "designer"} or (user.role == "qa" and current_stage == "qa_review")
-    if next_stage not in WORKFLOW_TRANSITIONS.get(current_stage, set()):
-        return False
-    if user.role == "admin":
-        return True
-    if user.role == "designer":
-        return not (current_stage == "qa_review" and next_stage == "done")
-    if user.role == "qa":
-        return current_stage == "qa_review" and next_stage in {"done", "in_progress", "archived"}
-    return False
+    return workflow_policy.can_transition(user.role, current_stage, next_stage)
 
 
 def _enqueue_catalog_job(
