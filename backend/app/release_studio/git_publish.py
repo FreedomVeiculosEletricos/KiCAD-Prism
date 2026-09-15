@@ -17,10 +17,9 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from app.services.job_runtime import JobCancelled, LostJobLease
-
 GIT_COMMAND_TIMEOUT_SECONDS = 60
 _POLL_SECONDS = 0.1
+_CLEANUP_TIMEOUT_SECONDS = 2
 
 
 class GitPublishError(RuntimeError):
@@ -39,6 +38,10 @@ def run_git(
     command = ["git", "-C", str(cwd), *args]
     environment = dict(env) if env is not None else None
     limit = GIT_COMMAND_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+
+    if check_cancelled is not None:
+        check_cancelled()
+
     try:
         process = subprocess.Popen(
             command,
@@ -52,14 +55,13 @@ def run_git(
     except OSError as error:
         raise GitPublishError(f"git could not be executed: {error}") from error
 
-    deadline = time.monotonic() + max(limit, 0.0)
     try:
+        deadline = time.monotonic() + max(limit, 0.0)
         while True:
             if check_cancelled is not None:
                 check_cancelled()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _terminate(process)
                 raise GitPublishError(
                     f"git {' '.join(args)} timed out after {limit}s"
                 )
@@ -70,17 +72,47 @@ def run_git(
                 )
             except subprocess.TimeoutExpired:
                 continue
-    except (JobCancelled, LostJobLease):
-        _terminate(process)
+    except BaseException:
+        try:
+            _terminate(process)
+        except BaseException:
+            # Cleanup must never replace the exception that caused the
+            # command to unwind.
+            pass
         raise
 
 
 def _terminate(process: subprocess.Popen[str]) -> None:
+    """Terminate the command group and reap it without masking its exception."""
+
+    _kill_process_group(process)
+    try:
+        process.communicate(timeout=_CLEANUP_TIMEOUT_SECONDS)
+        return
+    except BaseException:
+        # A failed communicate can leave the child's pipes unusable. Wait
+        # directly below so the process is still reaped.
+        pass
+
+    _kill_process_group(process)
+    try:
+        process.wait(timeout=_CLEANUP_TIMEOUT_SECONDS)
+    except BaseException:
+        # A process that outlives the first bounded wait gets one final
+        # bounded kill-and-reap attempt. Any cleanup failure is handled by the
+        # caller's exception-preserving guard.
+        _kill_process_group(process)
+        try:
+            process.wait(timeout=_CLEANUP_TIMEOUT_SECONDS)
+        except BaseException:
+            pass
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        process.kill()
-    try:
-        process.communicate(timeout=2)
-    except (subprocess.TimeoutExpired, OSError):
-        process.kill()
+    except BaseException:
+        try:
+            process.kill()
+        except BaseException:
+            pass
