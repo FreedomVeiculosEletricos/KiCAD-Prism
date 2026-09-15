@@ -299,3 +299,186 @@ describe("search pagination", () => {
     expect(screen.getByText("New match")).toBeInTheDocument();
   });
 });
+
+function deferredPage() {
+  let finish!: (value: PanelPageResult) => void;
+  const pending = new Promise<PanelPageResult>((resolve) => {
+    finish = resolve;
+  });
+  return { pending, finish: (value: PanelPageResult) => finish(value) };
+}
+
+describe("search cancellation", () => {
+  beforeEach(() => {
+    vi.mocked(getCategories).mockResolvedValue([{ name: "ICs", count: 3 }]);
+  });
+
+  it("does not restore a cleared query when the first page resolves after abort", async () => {
+    const first = deferredPage();
+    vi.mocked(searchComponents).mockReturnValue(first.pending);
+
+    render(<FinderHarness initial={{ ...emptyFinderView(), query: "old" }} />);
+    await waitFor(() => expect(searchComponents).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "" } });
+    expect(await screen.findByText("ICs")).toBeInTheDocument();
+
+    await act(async () => {
+      first.finish(pageOf([component({ id: "stale", name: "Stale match" })]));
+    });
+
+    expect(screen.queryByText("Stale match")).not.toBeInTheDocument();
+    expect(screen.getByText("ICs")).toBeInTheDocument();
+  });
+
+  it("does not publish a late first page after the finder unmounts", async () => {
+    const first = deferredPage();
+    vi.mocked(searchComponents).mockReturnValue(first.pending);
+    const onViewStateChange = vi.fn();
+    const { unmount } = render(
+      <SymbolFinderScreen
+        viewState={{ ...emptyFinderView(), query: "old" }}
+        onViewStateChange={onViewStateChange}
+        onSelectCategory={noop}
+        onSelectComponent={noop}
+        onAuthRequired={noop}
+        appendLog={noop}
+      />,
+    );
+    await waitFor(() => expect(searchComponents).toHaveBeenCalledTimes(1));
+    unmount();
+
+    await act(async () => {
+      first.finish(pageOf([component({ id: "stale", name: "Stale match" })]));
+    });
+
+    expect(onViewStateChange).not.toHaveBeenCalled();
+    expect(screen.queryByText("Stale match")).not.toBeInTheDocument();
+  });
+
+  it("keeps the newer query when the older page resolves after abort", async () => {
+    const older = deferredPage();
+    vi.mocked(searchComponents).mockImplementation((query) => {
+      if (query === "old") return older.pending;
+      return Promise.resolve(pageOf([component({ id: "new", name: "New match" })]));
+    });
+
+    render(<FinderHarness initial={{ ...emptyFinderView(), query: "old" }} />);
+    await waitFor(() => expect(searchComponents).toHaveBeenCalledWith(
+      "old",
+      expect.objectContaining({ page: 1 }),
+    ));
+
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "new" } });
+    expect(await screen.findByText("New match")).toBeInTheDocument();
+
+    await act(async () => {
+      older.finish(pageOf([component({ id: "stale", name: "Stale match" })]));
+    });
+
+    expect(screen.queryByText("Stale match")).not.toBeInTheDocument();
+    expect(screen.getByText("New match")).toBeInTheDocument();
+  });
+
+  it("does not apply a late retry after the finder unmounts", async () => {
+    const retry = deferredPage();
+    vi.mocked(searchComponents)
+      .mockRejectedValueOnce(new Error("Network error: 502"))
+      .mockReturnValueOnce(retry.pending);
+
+    const { unmount } = render(
+      <FinderHarness initial={{ ...emptyFinderView(), query: "LM358" }} />,
+    );
+    expect(await screen.findByText("Search failed")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(searchComponents).toHaveBeenCalledTimes(2));
+    unmount();
+
+    await act(async () => {
+      retry.finish(pageOf([component({ id: "late", name: "Late retry match" })]));
+    });
+
+    expect(screen.queryByText("Late retry match")).not.toBeInTheDocument();
+  });
+
+  it("does not append a late Load more page after the query is cleared", async () => {
+    const extra = deferredPage();
+    vi.mocked(searchComponents)
+      .mockResolvedValueOnce(pageOf([component({ id: "a", name: "First match" })], { has_more: true }))
+      .mockReturnValueOnce(extra.pending);
+
+    render(<FinderHarness initial={{ ...emptyFinderView(), query: "res" }} />);
+    expect(await screen.findByText("First match")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /load more/i }));
+    await waitFor(() => expect(searchComponents).toHaveBeenCalledTimes(2));
+
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "" } });
+    expect(await screen.findByText("ICs")).toBeInTheDocument();
+
+    await act(async () => {
+      extra.finish(pageOf([component({ id: "b", name: "Late extra match" })], { page: 2 }));
+    });
+
+    expect(screen.queryByText("Late extra match")).not.toBeInTheDocument();
+    expect(screen.queryByText("First match")).not.toBeInTheDocument();
+  });
+
+  it("does not append a late Load more page after unmount", async () => {
+    const extra = deferredPage();
+    vi.mocked(searchComponents).mockReturnValue(extra.pending);
+    const onViewStateChange = vi.fn();
+    const { unmount } = render(
+      <SymbolFinderScreen
+        viewState={{
+          query: "res",
+          fetchedQuery: "res",
+          search: {
+            items: [component({ id: "a", name: "First match" })],
+            page: 1,
+            hasMore: true,
+            total: null,
+          },
+        }}
+        onViewStateChange={onViewStateChange}
+        onSelectCategory={noop}
+        onSelectComponent={noop}
+        onAuthRequired={noop}
+        appendLog={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /load more/i }));
+    await waitFor(() => expect(searchComponents).toHaveBeenCalledTimes(1));
+    unmount();
+
+    await act(async () => {
+      extra.finish(pageOf([component({ id: "b", name: "Late extra match" })], { page: 2 }));
+    });
+
+    expect(onViewStateChange).not.toHaveBeenCalled();
+  });
+
+  it("keeps restored finder results when remounting after detail", async () => {
+    const preserved = {
+      query: "res",
+      fetchedQuery: "res",
+      search: {
+        items: [component({ id: "kept", name: "Kept match" })],
+        page: 2,
+        hasMore: true,
+        total: null,
+      },
+    };
+
+    const { unmount } = render(<FinderHarness initial={preserved} />);
+    expect(await screen.findByText("Kept match")).toBeInTheDocument();
+    expect(searchComponents).not.toHaveBeenCalled();
+    unmount();
+
+    render(<FinderHarness initial={preserved} />);
+    expect(await screen.findByText("Kept match")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /load more/i })).toBeInTheDocument();
+    expect(searchComponents).not.toHaveBeenCalled();
+  });
+});
+
