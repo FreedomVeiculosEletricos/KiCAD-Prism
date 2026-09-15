@@ -133,6 +133,10 @@ branch pushes never publish images. See [Release process](docs/RELEASES.md).
 - Preserve compatibility intentionally and document any break.
 - Avoid new direct `fetch` patterns when an existing API helper or domain client
   applies.
+- Change catalog workflow stages, aliases, transitions, or role rights only in
+  `backend/app/services/catalog/workflow_policy.py`, then regenerate the
+  frontend contract with `python3 scripts/export_workflow_policy.py`; the
+  backend suite fails while the generated module is stale.
 - Keep generated assets, secrets, local databases, and private certificates out
   of Git.
 - Update documentation in the same pull request when behavior or configuration
