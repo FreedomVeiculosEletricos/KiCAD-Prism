@@ -10,7 +10,7 @@ import subprocess
 import shutil
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 from dataclasses import dataclass
 from git import Git, Repo, RemoteProgress
 from app.core.config import settings
@@ -1174,23 +1174,14 @@ def run_project_import_job_v3(context: JobContext) -> JobResult:
             percent=97,
             force=True,
         )
-        thumbnail_job_ids: list[str] = []
-        for imported_id in imported_ids:
-            # Queued before the render: the card shows a size and a title block
-            # before it shows a picture, and this job is the cheaper of the two.
-            try:
-                start_project_metadata_job(imported_id, requested_by="project-import")
-            except Exception as error:
-                print(f"Could not queue metadata for {imported_id}: {error}", flush=True)
-            try:
-                job_id = start_thumbnail_job(imported_id, requested_by="project-import")
-            except Exception as error:
-                # A thumbnail is cosmetic; failing to queue one must not undo an
-                # otherwise complete import.
-                print(f"Could not queue thumbnail for {imported_id}: {error}", flush=True)
-                continue
-            if job_id:
-                thumbnail_job_ids.append(job_id)
+        follow_ups = schedule_import_follow_ups(
+            imported_ids, requested_by="project-import"
+        )
+        thumbnail_job_ids = [
+            str(item["job_id"])
+            for item in follow_ups
+            if item.get("operation") == "thumbnail" and item.get("job_id")
+        ]
 
         return JobResult(
             message=f"Imported {len(imported_ids)} project(s)",
@@ -1200,6 +1191,7 @@ def run_project_import_job_v3(context: JobContext) -> JobResult:
                 "repo_url": repo_url,
                 "import_type": import_type,
                 "thumbnail_job_ids": thumbnail_job_ids,
+                "follow_ups": follow_ups,
             },
         )
     except Exception:
@@ -1274,6 +1266,83 @@ def start_project_metadata_job(project_id: str, *, requested_by: str = "") -> Op
         ),
     )
     return str(queued["job_id"])
+
+
+def schedule_import_follow_up(
+    project_id: str,
+    operation: str,
+    start: Callable[..., Optional[str]],
+    *,
+    requested_by: str = "",
+) -> dict[str, str]:
+    """Queue one derived job and record whether it actually started.
+
+    Import must not roll back because metadata or a thumbnail could not be
+    queued. The outcome is stored on the import job so a later retry can see
+    which operation failed.
+    """
+    try:
+        job_id = start(project_id, requested_by=requested_by)
+    except Exception as error:
+        return {
+            "project_id": project_id,
+            "operation": operation,
+            "status": "failed",
+            "error": str(error),
+        }
+    if not job_id:
+        return {
+            "project_id": project_id,
+            "operation": operation,
+            "status": "skipped",
+            "error": "Project not found",
+        }
+    return {
+        "project_id": project_id,
+        "operation": operation,
+        "status": "queued",
+        "job_id": str(job_id),
+    }
+
+
+def schedule_import_follow_ups(
+    project_ids: Sequence[str],
+    *,
+    requested_by: str = "",
+) -> list[dict[str, str]]:
+    outcomes: list[dict[str, str]] = []
+    for project_id in project_ids:
+        outcomes.append(
+            schedule_import_follow_up(
+                project_id,
+                "metadata",
+                start_project_metadata_job,
+                requested_by=requested_by,
+            )
+        )
+        outcomes.append(
+            schedule_import_follow_up(
+                project_id,
+                "thumbnail",
+                start_thumbnail_job,
+                requested_by=requested_by,
+            )
+        )
+    return outcomes
+
+
+def retry_import_follow_ups(
+    project_id: str,
+    *,
+    requested_by: str = "",
+) -> list[dict[str, str]]:
+    """Re-queue derived jobs for one imported project.
+
+    Active metadata/thumbnail jobs are reused via their artifact keys, so a
+    retry does not start a second render or metadata pass. The registered
+    project row is left untouched.
+    """
+    return schedule_import_follow_ups([project_id], requested_by=requested_by)
 
 
 def run_project_metadata_job_v3(context: JobContext) -> JobResult:
