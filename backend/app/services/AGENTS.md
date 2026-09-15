@@ -53,8 +53,10 @@ not duplicate completed work after a lease is reclaimed.
 ## Design comparison
 
 `design_compare_service.py` orchestrates; `design_compare_nodes.py` parses;
-`design_compare_semantics.py` groups; `design_compare_artifacts.py` persists
-output; `design_compare_sources.py` resolves revisions. The correctness rules
+`design_compare_net_pairing.py` decides which nets correspond across
+revisions; `design_compare_semantics.py` classifies and groups;
+`design_compare_artifacts.py` persists output; `design_compare_sources.py`
+resolves revisions. The correctness rules
 for this pipeline are in
 `frontend/src/components/design-comparison/AGENTS.md`, because most of the ways
 to get it wrong are visible on the frontend side.
