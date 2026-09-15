@@ -3,11 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadAssetText } from "@/lib/ecad-renderer";
 
 import {
+  classifyPanelLoadFailure,
   getComponent,
   getComponentsByCategory,
   getInlineBundle,
   getPartManifest,
   loadPanelAssetText,
+  PanelApiError,
   primaryLocalSource,
   searchComponents,
   setApiToken,
@@ -63,6 +65,16 @@ describe("primaryLocalSource", () => {
       stock: 0,
     });
     expect(primaryLocalSource(componentWithSources([vendor]))).toBeNull();
+  });
+});
+
+describe("classifyPanelLoadFailure", () => {
+  it("sends 401 and 403 back to login, 404 to not-found, and the rest to retry", () => {
+    expect(classifyPanelLoadFailure(new PanelApiError(401, "Unauthorized"))).toBe("auth");
+    expect(classifyPanelLoadFailure(new PanelApiError(403, "Forbidden"))).toBe("auth");
+    expect(classifyPanelLoadFailure(new PanelApiError(404, "Missing"))).toBe("not_found");
+    expect(classifyPanelLoadFailure(new PanelApiError(0, "Network error"))).toBe("failed");
+    expect(classifyPanelLoadFailure(new Error("boom"))).toBe("failed");
   });
 });
 

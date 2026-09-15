@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronUp,
+  CircleAlert,
   ExternalLink,
   FileText,
   Loader2,
@@ -29,6 +30,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 
 import type { PanelComponent, PanelSupplySource } from "@/panel/lib/panel-api";
 import {
+  classifyPanelLoadFailure,
   getComponent,
   getInlineBundle,
   getPartManifest,
@@ -42,10 +44,28 @@ import { inventoryWarnings } from "@/lib/inventory-presentation";
 
 interface PartDetailScreenProps {
   componentId: string;
-  /** If the component was already loaded (from a list), pass it to avoid re-fetch */
+  /** Slim list row used as a labeled preview while full detail loads. */
   prefetched?: PanelComponent | null;
   onBack: () => void;
+  onAuthRequired: () => void;
   appendLog: (msg: string) => void;
+}
+
+type DetailLoad =
+  | { phase: "loading"; preview: PanelComponent | null }
+  | { phase: "ready"; component: PanelComponent }
+  | {
+      phase: "error";
+      preview: PanelComponent | null;
+      kind: "not_found" | "failed";
+      message: string;
+    };
+
+function previewFor(
+  componentId: string,
+  prefetched?: PanelComponent | null,
+): PanelComponent | null {
+  return prefetched?.id === componentId ? prefetched : null;
 }
 
 const CORE_PARAMETERS = [
@@ -90,12 +110,14 @@ export function PartDetailScreen({
   componentId,
   prefetched,
   onBack,
+  onAuthRequired,
   appendLog,
 }: PartDetailScreenProps) {
-  const [component, setComponent] = useState<PanelComponent | null>(
-    prefetched ?? null
-  );
-  const [loading, setLoading] = useState(!prefetched);
+  const [load, setLoad] = useState<DetailLoad>(() => ({
+    phase: "loading",
+    preview: previewFor(componentId, prefetched),
+  }));
+  const [retryNonce, setRetryNonce] = useState(0);
   const [showAllParams, setShowAllParams] = useState(false);
   const [placing, setPlacing] = useState(false);
   const [placementError, setPlacementError] = useState<string | null>(null);
@@ -105,33 +127,48 @@ export function PartDetailScreen({
 
   useEffect(() => () => placementControllerRef.current?.abort(), [componentId]);
 
-  // Fetch full component details. List screens pass a slim payload, so detail
-  // refreshes the component before previews/assets are shown.
+  // List rows are slim (empty representations). Only a successful detail
+  // response is authoritative; prefetch is labeled loading, never Place-ready.
   useEffect(() => {
+    const preview = previewFor(componentId, prefetched);
+    setLoad({ phase: "loading", preview });
+    setRepresentationId("");
+    setShowAllParams(false);
+    setPlacementError(null);
     const controller = new AbortController();
     getComponent(componentId, controller.signal)
-      .then((c) => {
-        if (!controller.signal.aborted) {
-          setComponent(c);
-          setRepresentationId(c.default_representation_id || c.representations[0]?.id || "");
-          setLoading(false);
-        }
+      .then((detail) => {
+        if (controller.signal.aborted) return;
+        setLoad({ phase: "ready", component: detail });
+        setRepresentationId(
+          detail.default_representation_id || detail.representations[0]?.id || "",
+        );
       })
       .catch((err) => {
-        if (!controller.signal.aborted) {
-          appendLog(`Failed to load component: ${(err as Error).message}`);
-          setLoading(false);
+        if (controller.signal.aborted) return;
+        const kind = classifyPanelLoadFailure(err);
+        if (kind === "auth") {
+          onAuthRequired();
+          return;
         }
+        appendLog(`Failed to load component: ${(err as Error).message}`);
+        setLoad({
+          phase: "error",
+          preview,
+          kind,
+          message: err instanceof Error ? err.message : String(err),
+        });
       });
     return () => controller.abort();
-  }, [componentId, prefetched, appendLog]);
+  }, [componentId, retryNonce, prefetched, appendLog, onAuthRequired]);
 
   async function runPlacement(path: "manifest" | "inline") {
     const sessionId = getSessionId();
-    if (!component || !sessionId) {
+    if (load.phase !== "ready" || !sessionId) {
       appendLog("Cannot place: no session or component.");
       return;
     }
+    const component = load.component;
     if (placingRef.current) return;
     placingRef.current = true;
     const controller = new AbortController();
@@ -175,26 +212,58 @@ export function PartDetailScreen({
     }
   }
 
-  // ─── Loading state ─────────────────────────────────────────────
-
-  if (loading || !component) {
+  if (load.phase !== "ready") {
+    const preview = load.preview;
     return (
       <div className="flex flex-col gap-3">
         <div className="flex items-center gap-2">
-          <Button variant="ghost" size="icon-xs" onClick={onBack}>
+          <Button variant="ghost" size="icon-xs" onClick={onBack} aria-label="Back">
             <ArrowLeft className="h-3.5 w-3.5" />
           </Button>
-          <Skeleton className="h-4 w-32" />
+          {preview ? (
+            <span className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+              Details
+            </span>
+          ) : (
+            <Skeleton className="h-4 w-32" />
+          )}
         </div>
-        <Skeleton className="h-6 w-48" />
-        <Skeleton className="h-3 w-36" />
-        <Skeleton className="h-3 w-64" />
-        <Skeleton className="h-32 w-full" />
-        <Skeleton className="h-40 w-full" />
+        {preview ? (
+          <div className="px-0.5">
+            <h2 className="break-all text-base font-bold leading-tight text-primary">
+              {preview.name}
+            </h2>
+            <p className="mt-0.5 text-xs text-foreground/80">
+              {preview.manufacturer || "Unknown Manufacturer"}
+            </p>
+            {load.phase === "loading" ? (
+              <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Loading details…
+              </p>
+            ) : null}
+          </div>
+        ) : load.phase === "loading" ? (
+          <>
+            <Skeleton className="h-6 w-48" />
+            <Skeleton className="h-3 w-36" />
+            <Skeleton className="h-3 w-64" />
+            <Skeleton className="h-32 w-full" />
+            <Skeleton className="h-40 w-full" />
+          </>
+        ) : null}
+        {load.phase === "error" ? (
+          <DetailErrorState
+            kind={load.kind}
+            message={load.message}
+            onRetry={() => setRetryNonce((nonce) => nonce + 1)}
+          />
+        ) : null}
       </div>
     );
   }
 
+  const component = load.component;
   const selectedRepresentation =
     component.representations.find((r) => r.id === representationId) ||
     component.representations.find((r) => r.is_default) ||
@@ -418,6 +487,29 @@ export function PartDetailScreen({
         ) : null}
       </div>
 
+    </div>
+  );
+}
+
+function DetailErrorState({
+  kind,
+  message,
+  onRetry,
+}: {
+  kind: "not_found" | "failed";
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="rounded border border-destructive bg-destructive/10 px-3 py-6 text-center">
+      <CircleAlert className="mx-auto h-4 w-4 text-destructive" />
+      <p className="mt-2 text-xs font-medium">
+        {kind === "not_found" ? "Part not found" : "Couldn't load this part"}
+      </p>
+      <p className="mt-1 text-[10px] text-muted-foreground">{message}</p>
+      <Button className="mt-3" size="sm" variant="outline" onClick={onRetry}>
+        <RefreshCw className="h-3 w-3" /> Retry
+      </Button>
     </div>
   );
 }
