@@ -86,7 +86,7 @@
     "backend/app/services/design_compare_service.py": 2185,
     "backend/app/services/fabrication_compare_service.py": 1543,
     "backend/app/services/job_service.py": 1916,
-    "backend/app/services/project_import_service.py": 1607,
+    "backend/app/services/project_import_service.py": 1547,
     "backend/app/services/release_studio_build_service.py": 2007,
     "backend/app/services/release_studio_service.py": 1313,
     "backend/app/services/semantic_index_service.py": 1201,

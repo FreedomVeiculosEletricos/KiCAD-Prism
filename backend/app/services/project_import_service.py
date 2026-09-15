@@ -19,6 +19,10 @@ from app.services.git_failures import GitAccessError, as_access_error
 from app.services.git_remote_url import ParsedRemote, RemoteUrlPolicy, parse_remote_url
 from app.services.job_runtime import JobContext, JobResult
 from app.services.job_service import jobs as v3_jobs
+from app.services.project_import_followups import (
+    retry_import_follow_ups,
+    schedule_import_follow_ups,
+)
 from app.services.project_import_plan import (
     ProjectImportPlan,
     build_project_import_plan,
@@ -1174,23 +1178,14 @@ def run_project_import_job_v3(context: JobContext) -> JobResult:
             percent=97,
             force=True,
         )
-        thumbnail_job_ids: list[str] = []
-        for imported_id in imported_ids:
-            # Queued before the render: the card shows a size and a title block
-            # before it shows a picture, and this job is the cheaper of the two.
-            try:
-                start_project_metadata_job(imported_id, requested_by="project-import")
-            except Exception as error:
-                print(f"Could not queue metadata for {imported_id}: {error}", flush=True)
-            try:
-                job_id = start_thumbnail_job(imported_id, requested_by="project-import")
-            except Exception as error:
-                # A thumbnail is cosmetic; failing to queue one must not undo an
-                # otherwise complete import.
-                print(f"Could not queue thumbnail for {imported_id}: {error}", flush=True)
-                continue
-            if job_id:
-                thumbnail_job_ids.append(job_id)
+        follow_ups = schedule_import_follow_ups(
+            imported_ids, requested_by="project-import"
+        )
+        thumbnail_job_ids = [
+            str(item["job_id"])
+            for item in follow_ups
+            if item.get("operation") == "thumbnail" and item.get("job_id")
+        ]
 
         return JobResult(
             message=f"Imported {len(imported_ids)} project(s)",
@@ -1200,6 +1195,7 @@ def run_project_import_job_v3(context: JobContext) -> JobResult:
                 "repo_url": repo_url,
                 "import_type": import_type,
                 "thumbnail_job_ids": thumbnail_job_ids,
+                "follow_ups": follow_ups,
             },
         )
     except Exception:
