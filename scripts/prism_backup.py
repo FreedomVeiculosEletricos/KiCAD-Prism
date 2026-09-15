@@ -525,11 +525,15 @@ def restore(args: argparse.Namespace) -> int:
             return 1
         tui.ok("archive is intact")
 
+        # Nothing destructive happens while the application can still write.
+        # A stop that fails leaves writers alive, so the restore ends here with
+        # the deployment exactly as it was.
         tui.write()
         tui.note("Stopping the application")
         services = present_application_services(compose, root)
-        if services:
-            run(compose + ["stop", *services], root)
+        if services and run(compose + ["stop", *services], root).returncode != 0:
+            tui.fail("Could not stop the application services. Nothing was changed.")
+            return 1
 
         # Unpack beside each destination first, so a failure here leaves the
         # live directory untouched, and swap only once the database is in.
@@ -580,7 +584,16 @@ def restore(args: argparse.Namespace) -> int:
     tui.write()
     tui.note("Starting the application")
     tui.info("Schema migrations run at startup; watch the backend log.")
-    run(compose + ["up", "-d", "--wait"], root)
+    if run(compose + ["up", "-d", "--wait"], root).returncode != 0:
+        # The data is restored; only the startup afterwards failed. Say so
+        # rather than reporting success, and do not undo the restore: the
+        # archive's content is now the deployment's content.
+        tui.write()
+        tui.fail("Restored, but the application did not start healthy.")
+        tui.info("The database, project storage and SSH keys now hold the archive's")
+        tui.info("content. Inspect the service logs, then start the application again:")
+        tui.hint(f"{' '.join(compose)} up -d --wait")
+        return 1
     tui.write()
     tui.ok("Restore complete")
     tui.info("Verify: login, a project, the catalog, and one 3D view.")
