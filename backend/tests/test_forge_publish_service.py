@@ -62,6 +62,21 @@ class ForgeDescribeTests(unittest.TestCase):
         self.assertEqual(target.kind, "unsupported")
         self.assertIn("GitHub and GitLab", target.token_hint)
 
+    def test_a_hostname_that_contains_gitlab_is_not_auto_enabled(self) -> None:
+        with patch.object(forge.settings, "PRISM_FORGE_HOSTS", ""):
+            target = forge.describe_forge("https://notgitlab.example.com/org/board.git")
+        self.assertEqual(target.kind, "unsupported")
+
+    def test_configured_self_hosted_gitlab_resolves(self) -> None:
+        with (
+            patch.object(forge.settings, "PRISM_FORGE_HOSTS", "git.acme.test=gitlab"),
+            patch.object(forge.settings, "GITLAB_TOKEN", "glpat-example"),
+        ):
+            target = forge.describe_forge("https://git.acme.test/group/board.git")
+        self.assertEqual(target.kind, "gitlab")
+        self.assertEqual(target.api_root, "https://git.acme.test/api/v4")
+        self.assertTrue(target.token_configured)
+
 
 class ForgeZipTests(unittest.TestCase):
     def test_dossier_tar_is_repacked_as_zip(self) -> None:

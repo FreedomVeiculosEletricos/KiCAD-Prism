@@ -19,6 +19,7 @@ import requests
 
 from app.core.config import settings
 from app.release_studio.canonical import write_deterministic_zip
+from app.services.forge_hosts import ForgeHostConfigError, resolve_forge_host
 from app.services.git_remote_url import ParsedRemote, RemoteUrlError, parse_remote_url
 
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -215,45 +216,42 @@ def release_zip_filename(project_name: str, tag: str) -> str:
 def _target_from_parsed(parsed: ParsedRemote) -> ForgeTarget:
     host = parsed.host.casefold()
     owner_repo = parsed.path.strip("/").removesuffix(".git")
-    if host == "github.com":
-        token = settings.GITHUB_TOKEN.strip()
+    try:
+        registered = resolve_forge_host(host, settings.PRISM_FORGE_HOSTS)
+    except ForgeHostConfigError as error:
+        raise ForgePublishError(str(error)) from error
+    if registered is None:
         return ForgeTarget(
-            kind="github",
-            name="GitHub",
+            kind="unsupported",
+            name=parsed.host,
             host=parsed.host,
             owner_repo=owner_repo,
-            api_root="https://api.github.com",
-            token_configured=bool(token),
+            api_root="",
+            token_configured=False,
             token_hint=(
-                "Set GITHUB_TOKEN with contents:write to create a GitHub Release. "
-                "The workspace SSH key can clone but cannot publish."
+                f"Publishing is only implemented for GitHub and GitLab remotes, not {parsed.host}."
             ),
         )
-    if host == "gitlab.com" or "gitlab" in host:
-        token = settings.GITLAB_TOKEN.strip()
-        api_root = f"https://{parsed.host}/api/v4"
-        return ForgeTarget(
-            kind="gitlab",
-            name="GitLab",
-            host=parsed.host,
-            owner_repo=owner_repo,
-            api_root=api_root,
-            token_configured=bool(token),
-            token_hint=(
-                "Set GITLAB_TOKEN with api scope to create a GitLab Release. "
-                "The workspace SSH key can clone but cannot publish."
-            ),
-        )
+    token = (
+        settings.GITHUB_TOKEN.strip()
+        if registered.kind == "github"
+        else settings.GITLAB_TOKEN.strip()
+    )
+    hint = (
+        "Set GITHUB_TOKEN with contents:write to create a GitHub Release. "
+        "The workspace SSH key can clone but cannot publish."
+        if registered.kind == "github"
+        else "Set GITLAB_TOKEN with api scope to create a GitLab Release. "
+        "The workspace SSH key can clone but cannot publish."
+    )
     return ForgeTarget(
-        kind="unsupported",
-        name=parsed.host,
+        kind=registered.kind,
+        name=registered.display_name,
         host=parsed.host,
         owner_repo=owner_repo,
-        api_root="",
-        token_configured=False,
-        token_hint=(
-            f"Publishing is only implemented for GitHub and GitLab remotes, not {parsed.host}."
-        ),
+        api_root=registered.api_root,
+        token_configured=bool(token),
+        token_hint=hint,
     )
 
 

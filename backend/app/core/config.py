@@ -284,6 +284,14 @@ class Settings(BaseSettings):
             "the workspace SSH key can clone but cannot publish."
         ),
     )
+    PRISM_FORGE_HOSTS: str = Field(
+        default="",
+        description=(
+            "Extra GitLab hosts allowed for Release publishing, as comma-separated "
+            "host=gitlab pairs. github.com and gitlab.com are always included. "
+            "A hostname that merely contains 'gitlab' is not treated as GitLab."
+        ),
+    )
 
     COMMENTS_API_BASE_URL: str = Field(
         default="",
