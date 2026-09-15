@@ -82,7 +82,8 @@ then `run_project_import_job_v3`) → `backend/app/services/git_service.py` ·
 `backend/app/services/release_studio_build_service.py`
 (`run_release_studio_build_job`) → `backend/app/release_studio/pipeline.py` →
 `backend/app/release_studio/steps.py` · `backend/app/release_studio/jobset.py`
-→ `backend/app/release_studio/documents/` →
+→ `backend/app/release_studio/document_pipeline.py` ·
+`backend/app/release_studio/documents/` →
 `frontend/src/components/release-studio/ReleaseStudioPanel.tsx`
 
 **Author and release a component**
