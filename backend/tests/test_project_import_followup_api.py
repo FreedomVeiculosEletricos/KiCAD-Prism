@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
 
-from app.api import projects
+from app.api import project_import_followups as followups
 from app.core.security import AuthenticatedUser, get_current_user, require_designer
 
 
@@ -69,11 +69,11 @@ async def _post(app, path: str) -> tuple[int, bytes]:
 class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_viewer_is_rejected_before_scheduler(self) -> None:
         app = FastAPI()
-        app.include_router(projects.router, prefix="/api/projects")
+        app.include_router(followups.router, prefix="/api/projects")
         app.dependency_overrides[get_current_user] = lambda: VIEWER
         try:
             with patch.object(
-                projects.project_import_followups,
+                followups.project_import_followups,
                 "retry_import_follow_ups",
             ) as retry:
                 status, _body = await _post(
@@ -88,7 +88,7 @@ class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
 
         route = next(
             route
-            for route in projects.router.routes
+            for route in followups.router.routes
             if getattr(route, "path", "") == "/{project_id}/import-follow-ups/retry"
         )
         self.assertTrue(
@@ -100,7 +100,7 @@ class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_designer_request_reaches_scheduler_with_actor(self) -> None:
         app = FastAPI()
-        app.include_router(projects.router, prefix="/api/projects")
+        app.include_router(followups.router, prefix="/api/projects")
         outcomes = [
             {
                 "project_id": "project-1",
@@ -118,9 +118,9 @@ class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
         app.dependency_overrides[get_current_user] = lambda: DESIGNER
         try:
             with (
-                patch.object(projects, "get_project_for_role_or_404"),
+                patch.object(followups, "get_project_for_role_or_404"),
                 patch.object(
-                    projects.project_import_followups,
+                    followups.project_import_followups,
                     "retry_import_follow_ups",
                     return_value=outcomes,
                 ) as retry,
@@ -141,17 +141,17 @@ class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(detail=detail):
                 with (
                     patch.object(
-                        projects,
+                        followups,
                         "get_project_for_role_or_404",
                         side_effect=HTTPException(status_code=404, detail=detail),
                     ),
                     patch.object(
-                        projects.project_import_followups,
+                        followups.project_import_followups,
                         "retry_import_follow_ups",
                     ) as retry,
                 ):
                     with self.assertRaises(HTTPException) as caught:
-                        await projects.retry_project_import_follow_ups(
+                        await followups.retry_project_import_follow_ups(
                             "project-1",
                             user=DESIGNER,
                         )
@@ -175,14 +175,14 @@ class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
             },
         ]
         with (
-            patch.object(projects, "get_project_for_role_or_404"),
+            patch.object(followups, "get_project_for_role_or_404"),
             patch.object(
-                projects.project_import_followups,
+                followups.project_import_followups,
                 "retry_import_follow_ups",
                 return_value=outcomes,
             ) as retry,
         ):
-            response = await projects.retry_project_import_follow_ups(
+            response = await followups.retry_project_import_follow_ups(
                 "project-1",
                 user=DESIGNER,
             )
@@ -210,14 +210,14 @@ class ProjectImportFollowUpApiTests(unittest.IsolatedAsyncioTestCase):
             },
         ]
         with (
-            patch.object(projects, "get_project_for_role_or_404"),
+            patch.object(followups, "get_project_for_role_or_404"),
             patch.object(
-                projects.project_import_followups,
+                followups.project_import_followups,
                 "retry_import_follow_ups",
                 return_value=outcomes,
             ),
         ):
-            response = await projects.retry_project_import_follow_ups(
+            response = await followups.retry_project_import_follow_ups(
                 "project-1",
                 user=DESIGNER,
             )
