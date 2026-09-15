@@ -249,9 +249,11 @@ export function PanelApp() {
 
         {screen.kind === "detail" && (
           <PartDetailScreen
+            key={screen.componentId}
             componentId={screen.componentId}
             prefetched={screen.prefetched}
             onBack={goBackFromDetail}
+            onAuthRequired={goToLogin}
             appendLog={appendLog}
           />
         )}

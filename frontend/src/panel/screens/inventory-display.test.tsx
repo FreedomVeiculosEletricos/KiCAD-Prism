@@ -82,7 +82,7 @@ describe("inventory presentation", () => {
     vi.mocked(getComponent).mockResolvedValue(component(source({
       fetch_status: "error", mixed_fetch: true, mixed_status: true, mixed_freshness: true,
     })));
-    render(<PartDetailScreen componentId="part" onBack={noop} appendLog={noop} />);
+    render(<PartDetailScreen componentId="part" onBack={noop} onAuthRequired={noop} appendLog={noop} />);
     expect(await screen.findByText("Last known on hand")).toBeInTheDocument();
     expect(screen.getByText(/Latest location update/)).toBeInTheDocument();
     const badge = screen.getByText("Sync failed · Mixed status");
@@ -93,7 +93,7 @@ describe("inventory presentation", () => {
 
   it("detail suppresses numeric zero for mixed units", async () => {
     vi.mocked(getComponent).mockResolvedValue(component(source({ stock: 0, mixed_units: true })));
-    render(<PartDetailScreen componentId="part" onBack={noop} appendLog={noop} />);
+    render(<PartDetailScreen componentId="part" onBack={noop} onAuthRequired={noop} appendLog={noop} />);
     expect(await screen.findAllByText("Mixed units")).toHaveLength(2);
     expect(screen.queryByText("0")).not.toBeInTheDocument();
   });

@@ -163,6 +163,14 @@ export function isAuthError(err: unknown): boolean {
   return err instanceof PanelApiError && (err.status === 401 || err.status === 403);
 }
 
+export type PanelLoadFailureKind = "auth" | "not_found" | "failed";
+
+export function classifyPanelLoadFailure(err: unknown): PanelLoadFailureKind {
+  if (isAuthError(err)) return "auth";
+  if (err instanceof PanelApiError && err.status === 404) return "not_found";
+  return "failed";
+}
+
 export interface PanelPageResult {
   items: PanelComponent[];
   total: number | null;
