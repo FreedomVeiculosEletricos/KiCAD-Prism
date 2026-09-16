@@ -194,7 +194,7 @@ export function DesignSearchField({
     const showHits = open && !loading && hits.length > 0;
 
     return createPortal(
-        <div ref={rootRef} className="relative mx-auto w-full max-w-xl">
+        <div ref={rootRef} className="relative w-full">
             <div className="relative">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <input
