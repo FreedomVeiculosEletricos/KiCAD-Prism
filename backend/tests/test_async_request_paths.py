@@ -4,11 +4,13 @@ import asyncio
 import threading
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
+from starlette.requests import Request
 
 from app.api import _helpers as api_helpers
+from app.api import auth as auth_api
 from app.api import catalog_admin as catalog_admin_api
 from app.api import comments as comments_api
 from app.core import security, session
@@ -132,6 +134,78 @@ class AuthenticationDoesNotBlockTheLoopTests(unittest.TestCase):
         self.assertEqual(revoked.exception.status_code, 401)
         self.assertEqual(unassigned.exception.status_code, 403)
         self.assertEqual((user.email, user.role, user.session_id), ("qa@example.com", "qa", "session-a"))
+
+
+def _http_request() -> Request:
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "headers": [(b"user-agent", b"unit-test")],
+        "client": ("127.0.0.1", 12345),
+        "query_string": b"",
+    })
+
+
+class LoginRateLimiterDoesNotBlockTheLoopTests(unittest.TestCase):
+    """The limiter writes to PostgreSQL before any login work; it must not hold the loop."""
+
+    def setUp(self) -> None:
+        for name, value in (("AUTH_ENABLED_OVERRIDE", True), ("PASSWORD_AUTH_ENABLED", True)):
+            patcher = patch.object(settings, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _entry_points(self):
+        start = lambda: auth_api.start_login(_http_request(), Response())
+        callback = lambda: auth_api.login(
+            auth_api.LoginRequest(code="c", state="s", redirectUri="https://app/auth/callback"),
+            _http_request(),
+            Response(),
+        )
+        password = lambda: auth_api.login_with_password(
+            auth_api.PasswordLoginRequest(email="u@example.com", password="pw"), _http_request(), Response()
+        )
+        return (("start", start), ("callback", callback), ("password", password))
+
+    def test_blocked_limiter_does_not_stall_an_unrelated_request(self) -> None:
+        for action, entry in self._entry_points():
+            with self.subTest(action=action):
+                blocked = _BlockedStore(error=HTTPException(status_code=429, detail="Too many attempts"))
+
+                async def scenario() -> bool:
+                    login = asyncio.create_task(entry())
+                    await asyncio.get_running_loop().run_in_executor(None, blocked.entered.wait, 2)
+                    probe_finished = await _lightweight_probe_completes_while(login)
+                    blocked.gate.set()
+                    with self.assertRaises(HTTPException) as ctx:
+                        await login
+                    self.assertEqual(ctx.exception.status_code, 429)
+                    return probe_finished
+
+                with patch.object(auth_api, "oidc_enabled", return_value=True), patch.object(
+                    auth_api.rate_limit_service, "enforce", blocked
+                ):
+                    self.assertTrue(asyncio.run(scenario()), f"the event loop was blocked by the {action} limiter")
+
+    def test_a_limited_request_attempts_no_authentication(self) -> None:
+        provider_calls = {
+            "build_oidc_authorization_url": MagicMock(),
+            "authenticate_oidc_auth_code": MagicMock(),
+            "authenticate_password": MagicMock(),
+            "_issue_session": MagicMock(),
+        }
+        limited = MagicMock(side_effect=HTTPException(status_code=429, detail="Too many attempts"))
+        for action, entry in self._entry_points():
+            with self.subTest(action=action):
+                with patch.object(auth_api, "oidc_enabled", return_value=True), patch.object(
+                    auth_api.rate_limit_service, "enforce", limited
+                ), patch.multiple(auth_api, **provider_calls):
+                    with self.assertRaises(HTTPException) as ctx:
+                        asyncio.run(entry())
+                self.assertEqual(ctx.exception.status_code, 429)
+        for name, call in provider_calls.items():
+            call.assert_not_called()
+        self.assertEqual(limited.call_count, 3)
 
 
 class CommentReadsDoNotBlockTheLoopTests(unittest.TestCase):
