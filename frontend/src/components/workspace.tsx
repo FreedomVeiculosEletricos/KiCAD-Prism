@@ -19,6 +19,7 @@ import { WorkspaceListView } from "./workspace/workspace-list-view";
 import { LibraryManagerWorkspace } from "./workspace/library-manager-workspace";
 import { WorkspaceAppsPlaceholder } from "./workspace/workspace-apps-placeholder";
 import { WorkspaceLoadingState } from "./workspace/workspace-loading-state";
+import { WorkspaceRefreshNotice } from "./workspace/workspace-refresh-notice";
 import { WorkspaceProjectPropertiesSheet } from "./workspace/workspace-project-properties-sheet";
 import { WorkspaceProjectToolbar } from "./workspace/workspace-project-toolbar";
 import { WorkspaceSidebar } from "./workspace/workspace-sidebar";
@@ -61,7 +62,7 @@ export function Workspace({ searchQuery, user }: WorkspaceProps) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const { projects, folders, loading, error, folderById, refresh, createFolder, renameFolder, deleteFolder, moveProjects, deleteProject } =
+  const { projects, folders, loading, error, refreshError, folderById, refresh, createFolder, renameFolder, deleteFolder, moveProjects, deleteProject } =
     useWorkspaceData({ sessionKey: workspaceSessionKey(user) });
 
   const requestedSection = searchParams.get("section") === "library-manager" ? "library-manager" : "projects";
@@ -555,7 +556,9 @@ export function Workspace({ searchQuery, user }: WorkspaceProps) {
               the section switcher alive — the reviewer can navigate out of a
               broken section instead of reloading. Keyed to the section so
               switching away and back retries rather than staying broken. */}
-          <main className="min-h-0 flex-1 overflow-hidden">
+          <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <WorkspaceRefreshNotice refreshError={refreshError} refresh={refresh} />
+            <div className="min-h-0 flex-1 overflow-hidden">
             <ErrorBoundary label="this section" resetKeys={[section]}>
               {loading ? (
                 <WorkspaceLoadingState />
@@ -718,6 +721,7 @@ export function Workspace({ searchQuery, user }: WorkspaceProps) {
                 </div>
               )}
             </ErrorBoundary>
+            </div>
           </main>
         </div>
       </div>
