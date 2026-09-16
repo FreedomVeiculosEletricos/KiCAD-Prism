@@ -286,6 +286,35 @@ class PayloadResolutionTests(unittest.TestCase):
             with self.assertRaisesRegex(prism_backup.BackupError, "volume mount"):
                 self._resolve(root, compose_config_json(root, extra=volumes))
 
+    def test_nested_mounts_are_refused_in_either_order(self) -> None:
+        # Restore swaps projects first; SSH staged under it would be deleted.
+        for projects, ssh in (("data/projects", "data/projects/ssh"), ("data/keys/projects", "data/keys")):
+            with self.subTest(projects=projects, ssh=ssh), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaisesRegex(prism_backup.BackupError, "overlap"):
+                    self._resolve(root, compose_config_json(root, projects=projects, ssh=ssh))
+
+    def test_identical_mounts_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(prism_backup.BackupError, "overlap"):
+                self._resolve(root, compose_config_json(root, projects="data/shared", ssh="data/shared"))
+
+    def test_the_deployment_root_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(prism_backup.BackupError, "deployment directory itself"):
+                self._resolve(root, compose_config_json(root, projects=".", ssh="data/ssh"))
+
+    def test_disjoint_relocated_mounts_with_a_shared_prefix_are_accepted(self) -> None:
+        # "data/projects" vs "data/projects-ssh" share a string prefix, not a directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(
+                self._resolve(root, compose_config_json(root, projects="data/projects", ssh="data/projects-ssh")),
+                [("projects", "data/projects"), ("ssh", "data/projects-ssh")],
+            )
+
     def test_a_mount_outside_the_deployment_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as elsewhere:
             root = Path(tmp)
