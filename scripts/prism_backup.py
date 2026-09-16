@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -278,7 +279,19 @@ def resolve_payloads(compose: list[str], root: Path) -> list[tuple[str, str]]:
             relative = source.resolve().relative_to(resolved_root)
         except ValueError:
             raise BackupError(f"{target} is mounted from {source}, outside {root}; refusing to archive it.")
+        if relative == Path("."):
+            raise BackupError(f"{target} is mounted from the deployment directory itself; refusing to archive it.")
         payloads.append((name, relative.as_posix()))
+    # Restore stages each payload beside its destination and swaps them in
+    # one at a time, so two payloads whose directories nest would have the
+    # first swap delete the second one's staging. Refuse that layout up front.
+    for (name, relative), (other_name, other_relative) in itertools.combinations(payloads, 2):
+        path, other = Path(relative), Path(other_relative)
+        if path == other or path in other.parents or other in path.parents:
+            raise BackupError(
+                f"The {name} storage ({relative}) and the {other_name} storage ({other_relative}) overlap; "
+                "each must be a separate directory."
+            )
     return payloads
 
 
