@@ -170,9 +170,12 @@ def _login_redirect_uri(request: Request) -> str:
     return f"{base}/auth/callback"
 
 
-def _enforce_login_rate_limit(request: Request, action: str) -> str:
+async def _enforce_login_rate_limit(request: Request, action: str) -> str:
     bucket = f"login:{action}:{rate_limit_service.client_fingerprint(request)}"
-    rate_limit_service.enforce(
+    # The limiter records the attempt in PostgreSQL; a slow store must not
+    # stall the loop, and it must run before any authentication work.
+    await asyncio.to_thread(
+        rate_limit_service.enforce,
         bucket,
         limit=settings.AUTH_LOGIN_RATE_LIMIT,
         window_seconds=settings.AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS,
@@ -210,7 +213,7 @@ async def start_login(request: Request, response: Response):
     if not oidc_enabled():
         raise HTTPException(status_code=400, detail="OIDC login is not enabled on this deployment")
 
-    _enforce_login_rate_limit(request, "start")
+    await _enforce_login_rate_limit(request, "start")
 
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
@@ -249,7 +252,7 @@ async def login(request: LoginRequest, http_request: Request, response: Response
     if not settings.AUTH_ENABLED:
         return _guest_user_session()
 
-    bucket = _enforce_login_rate_limit(http_request, "callback")
+    bucket = await _enforce_login_rate_limit(http_request, "callback")
 
     transaction = decode_oidc_transaction_token(
         http_request.cookies.get(OIDC_TRANSACTION_COOKIE_NAME) or ""
@@ -290,7 +293,7 @@ async def login_with_password(
     if not password_auth_enabled():
         raise HTTPException(status_code=400, detail="Password login is not enabled on this deployment")
 
-    bucket = _enforce_login_rate_limit(http_request, "password")
+    bucket = await _enforce_login_rate_limit(http_request, "password")
 
     # Password verification is deliberately slow hashing plus database reads.
     def complete_login() -> PasswordAuthResult:

@@ -50,8 +50,10 @@ A recoverable backup contains one consistent set of:
 `scripts/prism_backup.py` reads the two directories from the selected Compose
 configuration and records them in the archive manifest, so an overlay that
 moves storage is archived from where it actually lives. Only bind mounts inside
-the deployment directory are supported; a named volume or a mount elsewhere
-stops the backup instead of archiving the default path.
+the deployment directory are supported, and the two directories must be
+separate: a named volume, a mount elsewhere, the deployment directory itself,
+or one directory nested inside the other stops the backup (and a restore,
+before anything is touched) instead of archiving the default path.
 
 PostgreSQL alone cannot restore component assets or imported repositories.
 Project storage alone cannot restore users, roles, comments, catalog metadata,
