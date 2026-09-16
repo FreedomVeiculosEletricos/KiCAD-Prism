@@ -177,6 +177,96 @@ describe("useWorkspaceData", () => {
     expect(result.current).toBe(snapshot);
   });
 
+  it("a load that ignores its abort cannot repopulate a cleared cache", async () => {
+    // Transports do not always honour the signal; the cache must not depend on it.
+    const loads = queueLoads();
+    const first = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    first.unmount();
+    clearWorkspaceDataCache();
+    await act(async () => loads[0].resolve(bootstrap("before-logout")));
+
+    const next = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    expect(next.result.current.projects).toEqual([]);
+    expect(next.result.current.loading).toBe(true);
+  });
+
+  it("clearing the cache invalidates a refresh that was already in flight", async () => {
+    const loads = queueLoads();
+    const { result } = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    await act(async () => loads[0].resolve(bootstrap("initial")));
+
+    let pending!: Promise<void>;
+    act(() => {
+      pending = result.current.refresh();
+    });
+    clearWorkspaceDataCache();
+    await act(async () => {
+      loads[1].resolve(bootstrap("stale-writer"));
+      await pending;
+    });
+
+    // The mounted hook still shows what it received, but a fresh mount for the
+    // same session starts from nothing rather than from the stale writer.
+    const remounted = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    expect(remounted.result.current.projects).toEqual([]);
+    expect(remounted.result.current.loading).toBe(true);
+  });
+
+  it("a mutation started under one session does not refresh or cache after the session changes", async () => {
+    const loads = queueLoads();
+    const mutation = deferred<Response>();
+    api.fetchApi.mockReturnValue(mutation.promise);
+    const { result, rerender, unmount } = renderHook(({ sessionKey }) => useWorkspaceData({ sessionKey }), {
+      initialProps: { sessionKey: alice },
+    });
+    await act(async () => loads[0].resolve(bootstrap("alice")));
+
+    let pending!: Promise<unknown>;
+    act(() => {
+      pending = result.current.renameFolder("folder-alice", "renamed");
+    });
+    rerender({ sessionKey: bob });
+    await flush();
+    await act(async () => loads[1].resolve(bootstrap("bob")));
+    expect(loads).toHaveLength(2);
+
+    // The server-side rename succeeded, but its refresh belongs to a session
+    // this hook no longer serves: no request is started for it.
+    await act(async () => {
+      mutation.resolve({ ok: true } as Response);
+      await expect(pending).resolves.toEqual({ ok: true });
+    });
+    expect(loads).toHaveLength(2);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["project-bob"]);
+
+    unmount();
+    const aliceAgain = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    expect(aliceAgain.result.current.projects).toEqual([]);
+    expect(aliceAgain.result.current.loading).toBe(true);
+  });
+
+  it("a mutation that completes after unmount publishes nothing", async () => {
+    const loads = queueLoads();
+    const mutation = deferred<Response>();
+    api.fetchApi.mockReturnValue(mutation.promise);
+    const { result, unmount } = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    await act(async () => loads[0].resolve(bootstrap("alice")));
+
+    let pending!: Promise<unknown>;
+    act(() => {
+      pending = result.current.deleteProject("project-alice");
+    });
+    unmount();
+    clearWorkspaceDataCache();
+    await act(async () => {
+      mutation.resolve({ ok: true } as Response);
+      await expect(pending).resolves.toEqual({ ok: true });
+    });
+    expect(loads).toHaveLength(1);
+    const remounted = renderHook(() => useWorkspaceData({ sessionKey: alice }));
+    expect(remounted.result.current.projects).toEqual([]);
+  });
+
   it("keeps shown data and reports a refresh error when a later load fails", async () => {
     const loads = queueLoads();
     const { result } = renderHook(() => useWorkspaceData({ sessionKey: alice }));
