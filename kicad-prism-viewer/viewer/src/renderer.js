@@ -1,3 +1,11 @@
+import {
+  FEATURE_MASK_WGSL,
+  MIN_FEATURE_MASK_CAPACITY,
+  featureMaskCapacityFor,
+  normalizeHiddenFeatureIds,
+  packFeatureVisibility,
+} from "./feature-visibility.js";
+
 const VERTEX_STRIDE = 40;
 // WebGPU dynamic uniform offsets require 256-byte alignment; each draw buffer is padded to that size.
 const DRAW_UNIFORM_SIZE = 256;
@@ -24,6 +32,8 @@ struct Draw {
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<uniform> draw: Draw;
+@group(0) @binding(3) var<storage, read> hiddenMask: array<u32>;
+${FEATURE_MASK_WGSL}
 
 struct VertexInput {
   @location(0) position: vec3f,
@@ -61,6 +71,7 @@ fn aces(color: vec3f) -> vec3f {
   let kind = u32(draw.flags.x);
   let copper = kind == 1u;
   let component = kind == 2u;
+  if (component && featureHidden(input.objectId)) { discard; }
   let selected = globals.activeNet != 0u && input.netId == globals.activeNet;
   let selectedComponent = component && globals.selectedFeature != 0u && input.objectId == globals.selectedFeature;
   var base = draw.color.rgb;
@@ -109,6 +120,8 @@ struct Globals {
 struct Draw { color: vec4f, material: vec4f, offset: vec4f, flags: vec4f };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<uniform> draw: Draw;
+@group(0) @binding(3) var<storage, read> hiddenMask: array<u32>;
+${FEATURE_MASK_WGSL}
 struct Input {
   @location(0) position: vec3f,
   @location(1) normal: vec3f,
@@ -127,7 +140,10 @@ struct Output {
   output.objectId = input.objectId;
   return output;
 }
-@fragment fn fs(input: Output) -> @location(0) u32 { return input.objectId; }
+@fragment fn fs(input: Output) -> @location(0) u32 {
+  if (u32(draw.flags.x) == 2u && featureHidden(input.objectId)) { discard; }
+  return input.objectId;
+}
 `;
 
 const BARREL_SHADER = `
@@ -282,6 +298,7 @@ export class Renderer {
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     });
     const layout = device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] });
@@ -310,6 +327,69 @@ export class Renderer {
     this.drawScratch = new Float32Array(DRAW_UNIFORM_SIZE / 4);
     this.barrelDrawScratch = new Float32Array(DRAW_UNIFORM_SIZE / 4);
     this.nextEntryId = 1;
+    // Feature-visibility mask: default-visible, indexed by component feature
+    // id. It always exists so every bind group is valid before any hide call.
+    this.hiddenFeatureIds = new Set();
+    this.featureMaskCapacity = MIN_FEATURE_MASK_CAPACITY;
+    this.featureMaskBuffer = this.createFeatureMaskBuffer(
+      this.featureMaskCapacity,
+    );
+    this.uploadFeatureMask();
+  }
+
+  createFeatureMaskBuffer(capacity) {
+    return this.device.createBuffer({
+      label: "feature-visibility-mask",
+      size: capacity * Uint32Array.BYTES_PER_ELEMENT,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  makeBindGroup(drawBuffer) {
+    return this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.globalBuffer } },
+        { binding: 1, resource: { buffer: drawBuffer } },
+        { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
+        { binding: 3, resource: { buffer: this.featureMaskBuffer } },
+      ],
+    });
+  }
+
+  uploadFeatureMask() {
+    const data = packFeatureVisibility(
+      this.hiddenFeatureIds,
+      this.featureMaskCapacity,
+    );
+    this.device.queue.writeBuffer(this.featureMaskBuffer, 0, data);
+  }
+
+  /**
+   * Replace the hidden feature set (component feature ids). Idempotent; safe
+   * before any primitives exist. Invalid ids are dropped, the mask is rebuilt
+   * from scratch so no stale zeros survive, and the buffer only grows — a
+   * growth recreates the buffer and rebinds every draw.
+   */
+  setHiddenFeatureIds(ids) {
+    this.hiddenFeatureIds = normalizeHiddenFeatureIds(ids);
+    const capacity = featureMaskCapacityFor(
+      this.hiddenFeatureIds,
+      this.featureMaskCapacity,
+    );
+    if (capacity !== this.featureMaskCapacity) {
+      this.featureMaskBuffer?.destroy?.();
+      this.featureMaskCapacity = capacity;
+      this.featureMaskBuffer = this.createFeatureMaskBuffer(capacity);
+      for (const entry of this.entries) {
+        entry.bindGroup = this.makeBindGroup(entry.drawBuffer);
+      }
+      if (this.barrels) {
+        this.barrels.bindGroup = this.makeBindGroup(this.barrels.drawBuffer);
+      }
+    }
+    this.uploadFeatureMask();
+    this.bundleCache.clear();
   }
 
   makePipeline(layout, code, format, buffers, label) {
@@ -433,14 +513,7 @@ export class Renderer {
     const indexBuffer = this.device.createBuffer({ size: indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
     this.device.queue.writeBuffer(indexBuffer, 0, indices);
     const drawBuffer = this.device.createBuffer({ size: DRAW_UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const bindGroup = this.device.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.globalBuffer } },
-        { binding: 1, resource: { buffer: drawBuffer } },
-        { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
-      ],
-    });
+    const bindGroup = this.makeBindGroup(drawBuffer);
     const entry = {
       ...metadata,
       bounds: primitive.bounds || metadata.bounds || null,
@@ -479,8 +552,10 @@ export class Renderer {
     }
     this.depth?.destroy();
     this.pickTexture?.destroy();
+    this.featureMaskBuffer?.destroy?.();
     this.depth = null;
     this.pickTexture = null;
+    this.featureMaskBuffer = null;
     this.bundleCache.clear();
   }
 
@@ -528,14 +603,7 @@ export class Renderer {
     this.device.queue.writeBuffer(indexBuffer, 0, indexArray);
     this.device.queue.writeBuffer(instanceBuffer, 0, instances);
     const drawBuffer = this.device.createBuffer({ size: DRAW_UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const bindGroup = this.device.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.globalBuffer } },
-        { binding: 1, resource: { buffer: drawBuffer } },
-        { binding: 2, resource: { buffer: this.layerOffsetBuffer } },
-      ],
-    });
+    const bindGroup = this.makeBindGroup(drawBuffer);
     this.barrels = { records, vertexBuffer, indexBuffer, instanceBuffer, indexCount: indexArray.length, instanceCount: records.length, drawBuffer, bindGroup };
   }
 
