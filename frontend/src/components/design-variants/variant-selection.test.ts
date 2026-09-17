@@ -6,7 +6,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-    DESIGN_VARIANT_SELECTOR_ENABLED,
     requestedVariantFromSearchParams,
     resolveVariantSelection,
     variantSearchParams,
@@ -200,9 +199,5 @@ describe("selector presentation helpers", () => {
             variantSelectorDisabled({ effective: null, state: "missing" }),
         ).toBe(false);
         expect(variantSelectorDisabled({ effective: null, state: "failed" })).toBe(false);
-    });
-
-    it("keeps the exposure gate closed until VAR-21 removes it", () => {
-        expect(DESIGN_VARIANT_SELECTOR_ENABLED).toBe(false);
     });
 });

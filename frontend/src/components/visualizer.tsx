@@ -28,7 +28,6 @@ import {
 } from "@/lib/comment-overlays";
 import { DesignSearchField } from "./design-search-field";
 import {
-    DESIGN_VARIANT_SELECTOR_ENABLED,
     requestedVariantFromSearchParams,
     resolveVariantSelection,
     variantSearchParams,
@@ -1367,7 +1366,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                     );
                 })}
                 <div className="flex-1" />
-                {DESIGN_VARIANT_SELECTOR_ENABLED && activeTab !== "assembly" && (
+                {activeTab !== "assembly" && (
                     <DesignVariantSelector
                         resolution={variantSelection}
                         variants={variantCatalog.catalog}
