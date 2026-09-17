@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from app.services import semantic_index_service
@@ -901,3 +902,172 @@ def build_assembly_state(
         "variants": variants,
         "diagnostics": diagnostics,
     }
+
+
+def _translate_component_keys(
+    states: Mapping[str, dict[str, Any]],
+    component_uids: Mapping[str, str],
+) -> dict[str, dict[str, Any]]:
+    translated: dict[str, dict[str, Any]] = {}
+    for reference, state in states.items():
+        translated[component_uids.get(reference, reference)] = state
+    return translated
+
+
+def _occurrence_id_for_ref(
+    schematic_ref: Mapping[str, Any],
+    placements: Mapping[str, Sequence[Mapping[str, str]]],
+) -> Optional[str]:
+    """The full occurrence id behind an index schematicRef, when identifiable.
+
+    ``schematicRefs`` carry the human sheet path, while the assembly identifies
+    occurrences by KiCad's UUID instance path. The placement projection has
+    both; prefer the exact (symbol, human path) match so repeated sheets keep
+    their own occurrence.
+    """
+
+    symbol_uuid = semantic_index_service._string(schematic_ref.get("symbolUuid"))
+    if not symbol_uuid:
+        return None
+    human_path = semantic_index_service._string(
+        schematic_ref.get("sheetInstancePath")
+    )
+    for placement in placements.get(symbol_uuid) or ():
+        instance_path = semantic_index_service._string(
+            placement.get("sheetInstancePath")
+        )
+        if not instance_path:
+            continue
+        if human_path and semantic_index_service._string(
+            placement.get("sheetPath")
+        ) not in ("", human_path):
+            continue
+        return f"{instance_path}/{symbol_uuid}"
+    return None
+
+
+def _project_onto_components(
+    block: dict[str, Any],
+    components: Sequence[Mapping[str, Any]],
+    schematic_placements: Mapping[str, Sequence[Mapping[str, str]]],
+) -> None:
+    """Join the reference-keyed assembly state onto existing componentUids.
+
+    The assembly builder keys components by reference because that is the
+    fixture form and the only identity the schematic side shares with the index
+    join; the index publishes componentUid. A reference that resolves to
+    exactly one index component is rewritten; a reference the index carries
+    more than once is never guessed at — it keeps the reference key and gets a
+    ``reference-collision`` diagnostic naming every candidate.
+    """
+
+    references: dict[str, list[Mapping[str, Any]]] = {}
+    for component in components:
+        reference = semantic_index_service._string(component.get("reference"))
+        if reference:
+            references.setdefault(reference, []).append(component)
+
+    ambiguous = {
+        reference for reference, entries in references.items() if len(entries) > 1
+    }
+    unique_uids = {
+        reference: entries[0]["componentUid"]
+        for reference, entries in references.items()
+        if len(entries) == 1
+    }
+
+    default_states = block.get("default", {}).get("components", {})
+    block.setdefault("default", {})["components"] = _translate_component_keys(
+        default_states, unique_uids
+    )
+    for variant in block.get("variants", ()):
+        variant["components"] = _translate_component_keys(
+            variant.get("components", {}), unique_uids
+        )
+
+    occurrences = block.get("default", {}).get("occurrences", {})
+    for entry in occurrences.values():
+        uid = unique_uids.get(semantic_index_service._string(entry.get("reference")))
+        if uid:
+            entry["componentUid"] = uid
+    for entry in block.get("default", {}).get("footprints", {}).values():
+        entry["componentUid"] = unique_uids.get(
+            semantic_index_service._string(entry.get("reference"))
+        )
+
+    for reference, entries in references.items():
+        state = default_states.get(reference)
+        for component in entries:
+            if state is not None:
+                fields = component.setdefault("fields", {})
+                fields["DNP"] = "Yes" if state.get("dnp") else "No"
+                fields["In BOM"] = "No" if state.get("excludeFromBom") else "Yes"
+            for schematic_ref in component.get("schematicRefs") or ():
+                occurrence_id = _occurrence_id_for_ref(
+                    schematic_ref, schematic_placements
+                )
+                if occurrence_id:
+                    schematic_ref["occurrenceId"] = occurrence_id
+
+    diagnosed = {
+        (diagnostic.get("code"), diagnostic.get("reference"))
+        for diagnostic in block.get("diagnostics", ())
+    }
+    for reference in sorted(ambiguous):
+        if ("reference-collision", reference) in diagnosed:
+            continue
+        block.setdefault("diagnostics", []).append(
+            {
+                "code": "reference-collision",
+                "severity": "warning",
+                "reference": reference,
+                "message": "Several index components share this reference; no single join exists.",
+                "detail": {
+                    "componentUids": [
+                        entry["componentUid"] for entry in references[reference]
+                    ]
+                },
+            }
+        )
+    for diagnostic in block.get("diagnostics", ()):
+        reference = semantic_index_service._string(diagnostic.get("reference"))
+        if not reference or reference in ambiguous:
+            continue
+        uid = unique_uids.get(reference)
+        if uid and "componentUid" not in diagnostic:
+            diagnostic["componentUid"] = uid
+
+
+def assemble_semantic_index(
+    design: Any,
+    project_file: Path,
+    components: Sequence[Mapping[str, Any]],
+    schematic_placements: Mapping[str, Sequence[Mapping[str, str]]],
+) -> dict[str, Any]:
+    """Build the packet-3.2 block and join it onto the index's componentUids.
+
+    ``build_semantic_index`` runs against a working tree or a commit checkout,
+    so the catalog's configured anchor is the project file it was handed and
+    the source snapshot is that same directory: the endpoint and the index see
+    one discovery rule. Catalog diagnostics precede resolver diagnostics, and
+    the join never invents a component identity (see ``_project_onto_components``).
+    """
+
+    from app.services import variant_catalog_service
+
+    project = SimpleNamespace(
+        id="",
+        path=str(project_file.parent),
+        project_file=project_file.name,
+    )
+    catalog_result = variant_catalog_service.discover_variant_catalog(project)
+    block = build_assembly_state(
+        design,
+        project_file=project_file,
+        catalog=catalog_result.get("variants", ()),
+    )
+    block["diagnostics"] = list(catalog_result.get("diagnostics", ())) + list(
+        block.get("diagnostics", ())
+    )
+    _project_onto_components(block, components, schematic_placements)
+    return block

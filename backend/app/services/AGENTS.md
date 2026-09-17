@@ -50,6 +50,18 @@ not duplicate completed work after a lease is reclaimed.
   `AGENTS.md`.
 - **Audit identity comes from the session**, never from the request payload.
 
+## Design variants
+
+`project_source_snapshot.py` resolves a working tree or an exact commit and
+keys it by the configured anchor; `variant_catalog_service.py` discovers the
+ordered catalog from source text; `semantic_index_variants.py` resolves
+effective default and per-variant occurrence/component/footprint state through
+the pinned kicad-monkey helpers (applying the sheet fold and version gate the
+resolver leaves to the caller); `semantic_index_service.py` publishes the
+`assembly` block, joins it onto existing `componentUid`s, and hashes the three
+modules into `GENERATOR_BUILD`. Resolver semantics belong to the frozen
+design-variant contract packet (issue #169), not to this file.
+
 ## Design comparison
 
 `design_compare_service.py` orchestrates; `design_compare_nodes.py` parses;
