@@ -36,7 +36,11 @@ import {
 import { DesignVariantSelector } from "./design-variants/variant-selector";
 import { usePrismCrossProbe } from "@/hooks/use-prism-cross-probe";
 import { useProjectVariants } from "@/hooks/use-project-variants";
-import { projectAssemblyState } from "@/lib/design-variants";
+import {
+    projectAssemblyState,
+    physicalVisibility,
+} from "@/lib/design-variants";
+import { dnpVisibilityPlan, EMPTY_DNP_PLAN } from "./design-variants/dnp-visibility";
 import {
     syncViewerVariant,
     viewerVariantNotice,
@@ -436,6 +440,19 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
     // stable while the projection changes.
     const effectiveComponents =
         effectiveAssembly?.components ?? semanticIndex?.components ?? null;
+    // VAR-19: the 3D workspace hides unambiguous DNP models unless the local
+    // Show DNP override is on. The plan is derived, never stored.
+    const [showDnp, setShowDnp] = useState(false);
+    const dnpPlan = useMemo(
+        () =>
+            semanticIndex
+                ? dnpVisibilityPlan(
+                    physicalVisibility(semanticIndex, variantSelection.effective),
+                    showDnp,
+                )
+                : EMPTY_DNP_PLAN,
+        [semanticIndex, showDnp, variantSelection.effective],
+    );
     const handleVariantSelect = useCallback(
         (name: string | null) => {
             setSearchParams(variantSearchParams(searchParams, name), {
@@ -1489,6 +1506,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                                 selection={globalSelection}
                                 onSelection={crossProbeGlobal}
                                 onClearSelection={clearGlobalSelection}
+                                hiddenComponents={dnpPlan.hidden}
+                                ambiguousComponents={dnpPlan.ambiguous}
+                                showDnp={showDnp}
+                                onShowDnpChange={setShowDnp}
                             />
                         </div>
                     )}
