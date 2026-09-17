@@ -27,7 +27,23 @@ import {
     type ActiveSchematicPage,
 } from "@/lib/comment-overlays";
 import { DesignSearchField } from "./design-search-field";
+import {
+    requestedVariantFromSearchParams,
+    resolveVariantSelection,
+    variantSearchParams,
+} from "./design-variants/variant-selection";
+import { DesignVariantSelector } from "./design-variants/variant-selector";
 import { usePrismCrossProbe } from "@/hooks/use-prism-cross-probe";
+import {
+    projectAssemblyState,
+    physicalVisibility,
+} from "@/lib/design-variants";
+import { dnpVisibilityPlan, EMPTY_DNP_PLAN } from "./design-variants/dnp-visibility";
+import {
+    syncViewerVariant,
+    viewerVariantNotice,
+    type ViewerVariantTarget,
+} from "@/lib/ecad-viewer-variant";
 import type { User } from "@/types/auth";
 import type {
     ECadViewerElement,
@@ -305,7 +321,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
 
     // Open on the tab a caller asked for (e.g. clicking a changed .kicad_pcb in
     // the history file list), read once on mount; defaults to the schematic.
-    const [searchParams] = useSearchParams();
+    const [searchParams, setSearchParams] = useSearchParams();
     const [activeTab, setActiveTab] = useState<VisualizerTab>(() => {
         const requested = searchParams.get("tab");
         return requested === "pcb"
@@ -348,6 +364,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
     const [labelInstances, setLabelInstances] = useState<LabelInstanceRef[]>([]);
     const [navigatingLabelInstance, setNavigatingLabelInstance] = useState(false);
     const [activeSchematicPage, setActiveSchematicPage] = useState<ActiveSchematicPage | null>(null);
+    // Bumped every time a host reports ready; the variant sync effect keys on
+    // it so a ready arriving after the selection still converges.
+    const [schematicReadyGeneration, setSchematicReadyGeneration] = useState(0);
+    const [pcbReadyGeneration, setPcbReadyGeneration] = useState(0);
 
     // Comment collaboration state
     const [comments, setComments] = useState<Comment[]>([]);
@@ -374,13 +394,113 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         notifyClientReady,
     } = usePrismCrossProbe(semanticIndex);
     const notifySchematicViewerReady = useCallback(
-        () => notifyClientReady("visualizer-schematic"),
+        () => {
+            setSchematicReadyGeneration((generation) => generation + 1);
+            notifyClientReady("visualizer-schematic");
+        },
         [notifyClientReady],
     );
     const notifyPcbViewerReady = useCallback(
-        () => notifyClientReady("visualizer-pcb"),
+        () => {
+            setPcbReadyGeneration((generation) => generation + 1);
+            notifyClientReady("visualizer-pcb");
+        },
         [notifyClientReady],
     );
+
+    // The index supplies the catalog and overlays atomically; there is no
+    // independent catalog fetch or revision-reconciliation state.
+    const requestedVariant = requestedVariantFromSearchParams(searchParams);
+    const variantSelection = resolveVariantSelection(
+        requestedVariant,
+        semanticIndex,
+        semanticIndexError,
+    );
+    const effectiveAssembly = useMemo(
+        () =>
+            semanticIndex
+                ? projectAssemblyState(semanticIndex, variantSelection.effective)
+                : null,
+        [semanticIndex, variantSelection.effective],
+    );
+    // Presentation consumers read the effective projection; cross-probe
+    // registration below keeps the base index so selection identities stay
+    // stable while the projection changes.
+    const effectiveComponents =
+        effectiveAssembly?.components ?? semanticIndex?.components ?? null;
+    // VAR-19: the 3D workspace hides unambiguous DNP models unless the local
+    // Show DNP override is on. The plan is derived, never stored.
+    const [showDnp, setShowDnp] = useState(false);
+    const dnpPlan = useMemo(
+        () =>
+            semanticIndex
+                ? dnpVisibilityPlan(
+                    physicalVisibility(semanticIndex, variantSelection.effective),
+                    showDnp,
+                )
+                : EMPTY_DNP_PLAN,
+        [semanticIndex, showDnp, variantSelection.effective],
+    );
+    const handleVariantSelect = useCallback(
+        (name: string | null) => {
+            setSearchParams(variantSearchParams(searchParams, name), {
+                replace: true,
+            });
+        },
+        [searchParams, setSearchParams],
+    );
+
+    // The ecad-viewer elements own replay across source replacement and page
+    // switches (the reflected `variant` attribute is durable). These effects
+    // cover what they cannot: a freshly mounted element, and a ready arriving
+    // after the selection. A bundle older than the vendored API is reported,
+    // never skipped silently.
+    const reportedViewerVariantIssues = useRef(new Set<string>());
+    const reportViewerVariantSync = useCallback(
+        (target: ViewerVariantTarget, result: ReturnType<typeof syncViewerVariant>) => {
+            const notice = viewerVariantNotice(target, result);
+            if (!notice) return;
+            const key = `${target}:${result.state}:${result.requested ?? ""}`;
+            if (reportedViewerVariantIssues.current.has(key)) return;
+            reportedViewerVariantIssues.current.add(key);
+            console.error(`[Visualizer] ${notice}`);
+            toast.error(notice);
+        },
+        [],
+    );
+    useEffect(() => {
+        let cancelled = false;
+        void customElements.whenDefined("ecad-viewer").then(() => {
+            if (cancelled) return;
+            reportViewerVariantSync(
+                "schematic",
+                syncViewerVariant(schematicViewerElement, variantSelection.effective),
+            );
+        });
+        return () => { cancelled = true; };
+    }, [
+        reportViewerVariantSync,
+        schematicReadyGeneration,
+        schematicViewerElement,
+        variantSelection.effective,
+    ]);
+    useEffect(() => {
+        let cancelled = false;
+        void customElements.whenDefined("ecad-viewer").then(() => {
+            if (cancelled) return;
+            reportViewerVariantSync(
+                "pcb",
+                syncViewerVariant(pcbViewerElement, variantSelection.effective),
+            );
+        });
+        return () => { cancelled = true; };
+    }, [
+        pcbReadyGeneration,
+        pcbViewerElement,
+        reportViewerVariantSync,
+        variantSelection.effective,
+    ]);
+
     const canImportLibraryComponent = canWriteCatalog(user?.role);
     const canModifyComments = user?.role === "admin" || user?.role === "designer";
 
@@ -1209,6 +1329,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         <div className="relative flex h-full min-h-0 flex-col bg-background">
             <DesignSearchField
                 semanticIndex={semanticIndex}
+                components={effectiveComponents}
                 currentPage={activeSchematicPage?.filename || activeSchematicPage?.page || activeSchematicPage?.projectPath}
                 loading={semanticIndexLoading}
                 active={viewerActive}
@@ -1234,6 +1355,15 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                     );
                 })}
                 <div className="flex-1" />
+                {activeTab !== "assembly" && (
+                    <DesignVariantSelector
+                        resolution={variantSelection}
+                        variants={semanticIndex?.assembly?.catalog ?? []}
+                        requested={requestedVariant}
+                        onSelect={handleVariantSelect}
+                        onRetry={() => { void generateSemanticIdentity(); }}
+                    />
+                )}
                 {(activeTab === "sch" || activeTab === "pcb") && canModifyComments && (
                     <Button
                         variant={commentMode ? "default" : "ghost"}
@@ -1364,6 +1494,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                                 selection={globalSelection}
                                 onSelection={crossProbeGlobal}
                                 onClearSelection={clearGlobalSelection}
+                                hiddenComponents={dnpPlan.hidden}
+                                ambiguousComponents={dnpPlan.ambiguous}
+                                showDnp={showDnp}
+                                onShowDnpChange={setShowDnp}
                             />
                         </div>
                     )}
@@ -1372,6 +1506,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                         <div className="absolute inset-0 z-20 bg-background">
                             <EngineeringBomTable
                                 semanticIndex={semanticIndex}
+                                components={effectiveComponents}
                                 loading={semanticIndexLoading}
                                 error={semanticIndexError}
                                 selection={globalSelection}
@@ -1382,26 +1517,34 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                     )}
 
                     {activeTab === "assembly" && (
-                        <div className="absolute inset-0 z-20 bg-background">
-                            {ibomUrl ? (
-                                <iframe
-                                    title="Assembly Assistant"
-                                    src={ibomUrl}
-                                    className="h-full w-full border-0 bg-background"
-                                    // InteractiveHtmlBom needs scripts plus
-                                    // same-origin to run, and downloads for
-                                    // its exports. Content is generated by
-                                    // our backend from the repo's own design
-                                    // files, so the scripts+same-origin pair
-                                    // is accepted by design here.
-                                    // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox
-                                    sandbox="allow-scripts allow-same-origin allow-downloads"
-                                />
-                            ) : (
-                                <div className="flex h-full items-center justify-center p-8 text-center text-muted-foreground">
-                                    No interactive assembly HTML was found for this revision.
+                        <div className="absolute inset-0 z-20 flex flex-col bg-background">
+                            {requestedVariant && (
+                                <div className="shrink-0 border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                                    This committed assembly artifact does not
+                                    follow the selected design variant.
                                 </div>
                             )}
+                            <div className="min-h-0 flex-1">
+                                {ibomUrl ? (
+                                    <iframe
+                                        title="Assembly Assistant"
+                                        src={ibomUrl}
+                                        className="h-full w-full border-0 bg-background"
+                                        // InteractiveHtmlBom needs scripts plus
+                                        // same-origin to run, and downloads for
+                                        // its exports. Content is generated by
+                                        // our backend from the repo's own design
+                                        // files, so the scripts+same-origin pair
+                                        // is accepted by design here.
+                                        // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox
+                                        sandbox="allow-scripts allow-same-origin allow-downloads"
+                                    />
+                                ) : (
+                                    <div className="flex h-full items-center justify-center p-8 text-center text-muted-foreground">
+                                        No interactive assembly HTML was found for this revision.
+                                    </div>
+                                )}
+                            </div>
                         </div>
                     )}
 
@@ -1450,6 +1593,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                                 open
                                 selection={globalSelection}
                                 semanticIndex={semanticIndex}
+                                components={effectiveComponents}
                                 layerColors={layerColors}
                                 viewContext={activeViewContext ?? undefined}
                                 onOpenChange={(open) => {

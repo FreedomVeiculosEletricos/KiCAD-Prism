@@ -8,6 +8,7 @@ from app.core.gzip_config import (
 )
 from app.api.auth import router as auth_router
 from app.api.projects import router as projects_router
+from app.api.project_variants import router as project_variants_router
 from app.api.project_import_followups import router as project_import_followups_router
 from app.api.comments import router as comments_router
 from app.api.design_compare import router as design_compare_router
@@ -230,6 +231,7 @@ app.include_router(
     project_import_followups_router, prefix="/api/projects", tags=["projects"]
 )
 app.include_router(comments_router, prefix="/api/projects", tags=["comments"])
+app.include_router(project_variants_router, prefix="/api/projects", tags=["variants"])
 app.include_router(design_compare_router, prefix="/api/projects", tags=["design-compare"])
 app.include_router(release_studio_router, prefix="/api/projects", tags=["release-studio"])
 app.include_router(settings_router, prefix="/api/settings", tags=["settings"])

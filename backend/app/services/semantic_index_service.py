@@ -19,24 +19,35 @@ from app.core.config import settings
 from app.services import (
     kicad_monkey_design_adapter,
     path_config_service,
+    project_source_snapshot,
+    semantic_index_variants,
     semantic_visualizer_service,
+    variant_catalog_service,
+    variant_source_scan,
 )
 from app.services.kicad_monkey_design_adapter import KiCadMonkeyDesign
 
 
 SCHEMA = "prism.semantic_index_a0"
 GENERATOR_NAME = "kicad-prism-semantic-index"
-GENERATOR_VERSION = "0.1.0"
+GENERATOR_VERSION = "0.2.0"
 _GENERATOR_INPUTS = ("semantic-index", SCHEMA, GENERATOR_VERSION)
 # The build identity covers every module whose logic shapes the payload, so a
-# change to the kicad-monkey adapter invalidates cached indexes like a change
-# to this file does.
+# change to the kicad-monkey adapter, the variant resolver or the catalog
+# discovery invalidates cached indexes like a change to this file does.
+GENERATOR_MODULE_PATHS = (
+    Path(__file__),
+    Path(kicad_monkey_design_adapter.__file__),
+    Path(semantic_index_variants.__file__),
+    Path(variant_catalog_service.__file__),
+    Path(project_source_snapshot.__file__),
+    Path(variant_source_scan.__file__),
+)
 GENERATOR_BUILD = hashlib.sha256(
     b"\0".join(
         (
             "|".join(_GENERATOR_INPUTS).encode("utf-8"),
-            Path(__file__).read_bytes(),
-            Path(kicad_monkey_design_adapter.__file__).read_bytes(),
+            *(path.read_bytes() for path in GENERATOR_MODULE_PATHS),
         )
     )
 ).hexdigest()[:12]
@@ -113,7 +124,7 @@ def _source_entries_on_disk(root: Path) -> list[tuple[str, str]]:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or ".git" in path.parts:
             continue
-        if path.suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES:
+        if path.suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES and path.name != ".prism.json":
             continue
         entries.append((path.relative_to(root).as_posix(), _blob_id(path.read_bytes())))
     return entries
@@ -153,7 +164,7 @@ def _source_entries_in_commit(
         if not path.startswith(prefix):
             continue
         relative = path[len(prefix):]
-        if Path(relative).suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES:
+        if Path(relative).suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES and Path(relative).name != ".prism.json":
             continue
         entries.append((relative, parts[2]))
     return entries
@@ -806,6 +817,7 @@ def build_semantic_index(
     timing_callback: Callable[[dict[str, Any]], None] | None = None,
     include_pcb: bool = True,
     include_components: bool = True,
+    include_assembly: bool = True,
     pcb: Any = None,
 ) -> dict[str, Any]:
     def timed(phase: str, action: Callable[[], Any], **metadata: Any) -> Any:
@@ -1174,4 +1186,11 @@ def build_semantic_index(
         "buses": buses,
         "indexes": indexes,
     }
+    if include_assembly:
+        result["assembly"] = timed(
+            "resolve-variants",
+            lambda: semantic_index_variants.assemble_semantic_index(
+                design, project_file, components, schematic_placements
+            ),
+        )
     return result
