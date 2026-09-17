@@ -168,6 +168,8 @@ export function physicalVisibility(
         groups.set(reference, group);
     };
 
+    for (const entry of assembly?.footprintInventory ?? [])
+        remember(entry.reference, entry.uuid);
     for (const entry of inventory) remember(entry.reference, entry.uuid);
     const inventoryByUuid = new Map(
         inventory.map((item) => [item.uuid, item]),

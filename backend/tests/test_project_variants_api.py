@@ -145,7 +145,7 @@ class VariantCatalogErrorTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 _run(api.get_project_variants("prj", _request(), "nope", _User()))
         self.assertEqual(ctx.exception.status_code, 400)
-        self.assertEqual(ctx.exception.detail, "Commit not found: nope")
+        self.assertEqual(ctx.exception.detail, "Could not read design variants for this revision")
 
     def test_a_runtime_failure_is_503(self) -> None:
         with patch.object(api, "get_project_for_role_or_404"), patch.object(
@@ -175,15 +175,14 @@ class VariantCatalogCachingTests(unittest.TestCase):
             return_value=payload,
         ):
             return _run(
-                api.get_project_variants("prj", _request(headers), None, _User())
+                api.get_project_variants("prj", _request(headers), payload.get("commit"), _User())
             )
 
     def test_commit_responses_are_private_and_cacheable(self) -> None:
         response = self._read(self.PAYLOAD)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "private, max-age=300")
-        expected_etag = f'"key-a-{api.CATALOG_GENERATOR_TAG}"'
-        self.assertEqual(response.headers["etag"], expected_etag)
+        expected_etag = response.headers["etag"]
 
         revalidated = self._read(
             self.PAYLOAD, {"If-None-Match": expected_etag}
@@ -191,6 +190,17 @@ class VariantCatalogCachingTests(unittest.TestCase):
         self.assertEqual(revalidated.status_code, 304)
         self.assertEqual(revalidated.body, b"")
         self.assertEqual(revalidated.headers["etag"], expected_etag)
+
+    def test_identical_sources_at_different_commits_have_distinct_etags(self):
+        first = self._read(self.PAYLOAD)
+        second = self._read({**self.PAYLOAD, "commit": "b" * 40}, {"If-None-Match": first.headers["etag"]})
+        self.assertEqual(second.status_code, 200)
+        self.assertNotEqual(first.headers["etag"], second.headers["etag"])
+
+    def test_moving_ref_must_revalidate(self):
+        with patch.object(api, "get_project_for_role_or_404"), patch.object(api.variant_catalog_service, "discover_variant_catalog", return_value=self.PAYLOAD):
+            response = _run(api.get_project_variants("prj", _request(), "HEAD", _User()))
+        self.assertEqual(response.headers["cache-control"], "private, no-cache")
 
     def test_working_tree_responses_must_revalidate(self) -> None:
         payload = {**self.PAYLOAD, "commit": None}

@@ -102,7 +102,7 @@ def discover_source(
         "board": board or "",
         "schematic": schematic or "",
         "project": project or "",
-        "variants": _variant_options(root, commit_sha, relative_path, project),
+        "variants": _variant_options(root, commit_sha, relative_path, project or board or schematic),
         "bom_presets": presets,
         "default_bom_preset": presets[0] if presets else _CURRENT_SETTINGS,
         "variant": "",

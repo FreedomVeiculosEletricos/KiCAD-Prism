@@ -1529,11 +1529,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
 
                     {activeTab === "assembly" && (
                         <div className="absolute inset-0 z-20 flex flex-col bg-background">
-                            {variantSelection.effective && (
+                            {requestedVariant && (
                                 <div className="shrink-0 border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                                    This assembly artifact was generated for the
-                                    reference assembly and does not follow the
-                                    selected variant.
+                                    This committed assembly artifact does not
+                                    follow the selected design variant.
                                 </div>
                             )}
                             <div className="min-h-0 flex-1">

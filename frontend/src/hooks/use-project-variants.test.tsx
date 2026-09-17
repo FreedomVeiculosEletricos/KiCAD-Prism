@@ -269,3 +269,24 @@ describe("useProjectVariants", () => {
         expect(result.current.identityMismatch).toBe(false);
     });
 });
+
+
+describe("review regression coverage", () => {
+    it("rejects a response from another project", async () => {
+        const loads = queueLoads();
+        const { result } = renderHook(() => useProjectVariants({projectId: "prj", commit: null}));
+        await act(async () => loads[0]!.resolve(catalog("a", {projectId: "other"})));
+        expect(result.current.error).toContain("different project");
+        expect(result.current.catalog).toEqual([]);
+    });
+    it("refreshes discovery when syncing changes the index identity", async () => {
+        const loads = queueLoads();
+        const { result, rerender } = renderHook(({key}) => useProjectVariants({projectId: "prj", commit: null, indexIdentity: {sourceRevisionKey: key}}), {initialProps: {key: "key-a"}});
+        await act(async () => loads[0]!.resolve(catalog("a", {commit: null})));
+        rerender({key: "key-b"});
+        expect(loads).toHaveLength(2);
+        await act(async () => loads[1]!.resolve(catalog("b", {commit: null})));
+        expect(result.current.identityMismatch).toBe(false);
+        expect(result.current.catalog[0]!.name).toBe("Variant-b");
+    });
+});

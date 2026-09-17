@@ -434,3 +434,15 @@ describe("physicalVisibility", () => {
         expect(physicalVisibility(index, null, INVENTORY).R9).toBe("absent");
     });
 });
+
+
+describe("PCB-only physical identity", () => {
+    it("hides an orphan footprint whose default flags are all neutral", () => {
+        const index = oracleLike();
+        index.assembly!.footprintInventory = [{ uuid: "orphan", reference: "H1" }];
+        index.assembly!.variants.push({name: "NoMount", occurrences: {}, components: {}, footprints: {orphan: {dnp: true}}});
+        expect(physicalVisibility(index, null).H1).toBe("visible");
+        expect(physicalVisibility(index, "NoMount").H1).toBe("hidden");
+        expect(physicalVisibility(index, null).H1).toBe("visible");
+    });
+});

@@ -15,7 +15,7 @@ stay distinct (KiCad's schematic variant names are case-sensitive). An
 unreadable or malformed source is skipped with a ``source-unparseable``
 diagnostic: the readable sources still produce a catalog.
 
-Discovery reads text with the semantic index's balanced S-expression scanner,
+Discovery reads text with a structural, quote-aware S-expression scanner,
 so quoted strings and escaped quotes never confuse the form walk, and it reads
 the revision through ``project_source_snapshot`` so a commit never leaks
 working-tree names. No kicad-monkey call and no private ``projects.py`` helper
@@ -25,11 +25,13 @@ is involved; the API layer supplies a role-validated project.
 from __future__ import annotations
 
 import json
-import re
+from copy import deepcopy
+from functools import lru_cache
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
 
-from app.services import semantic_index_service
+from app.services.variant_source_scan import scan_source
 from app.services.project_source_snapshot import (
     ProjectSourceSnapshot,
     project_revision_identity,
@@ -47,38 +49,10 @@ SOURCE_FOOTPRINT = "footprint"
 CASE_MISMATCH_CODE = "catalog-name-case-mismatch"
 SOURCE_UNPARSEABLE_CODE = "source-unparseable"
 
-_VARIANT_START = re.compile(r"\(variant(?=\s|\))")
-_VARIANTS_START = re.compile(r"\(variants(?=\s|\))")
-_NAME_VALUE = re.compile(r'\(name\s+"((?:\\.|[^"\\])*)"')
-_DESCRIPTION_VALUE = re.compile(r'\(description\s+"((?:\\.|[^"\\])*)"')
-_SHEETFILE_VALUE = re.compile(r'\(property\s+"Sheetfile"\s+"((?:\\.|[^"\\])*)"')
-
-
-def _unescape(value: str) -> str:
-    return value.replace(r"\"", '"').replace(r"\\", "\\")
-
-
-def _balanced_file(text: str) -> bool:
-    """True when the whole file is one or more complete forms and nothing else.
-
-    A malformed file can still contain a balanced ``(variant …)`` record; the
-    catalog only trusts records from files that parse as a whole, which is why
-    the malformed fixture contributes no schematic names.
-    """
-
-    start = text.find("(")
-    if start < 0:
-        return False
-    end = semantic_index_service._balanced_s_expression_end(text, start)
-    if end is None:
-        return False
-    return not text[end:].strip()
-
-
 def _read_text(path: Path) -> Optional[str]:
     try:
-        return path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -224,7 +198,7 @@ def _project_registry_entries(project_file: Path) -> tuple[list[dict[str, Any]],
         if not isinstance(item, dict):
             continue
         name = item.get("name")
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or name in ("", "< Default >"):
             continue
         description = item.get("description")
         entries.append(
@@ -241,90 +215,13 @@ def _board_records(
 ) -> tuple[list[tuple[str, Optional[str]]], list[str], bool]:
     """``(header entries, footprint record names, readable)`` for a board."""
 
-    if not _balanced_file(text):
-        return [], [], False
-
-    header_span: Optional[tuple[int, int]] = None
-    header_entries: list[tuple[str, Optional[str]]] = []
-    header = _VARIANTS_START.search(text)
-    if header is not None:
-        end = semantic_index_service._balanced_s_expression_end(text, header.start())
-        if end is None:
-            return [], [], False
-        header_span = (header.start(), end)
-        block = text[header.start() : end]
-        for match in _VARIANT_START.finditer(block):
-            entry_end = semantic_index_service._balanced_s_expression_end(
-                block, match.start()
-            )
-            if entry_end is None:
-                return [], [], False
-            entry = block[match.start() : entry_end]
-            name = _NAME_VALUE.search(entry)
-            if name is None:
-                continue
-            description = _DESCRIPTION_VALUE.search(entry)
-            header_entries.append(
-                (
-                    _unescape(name.group(1)),
-                    _unescape(description.group(1)) if description else None,
-                )
-            )
-
-    footprint_names: list[str] = []
-    for match in _VARIANT_START.finditer(text):
-        if header_span is not None and header_span[0] <= match.start() < header_span[1]:
-            continue
-        end = semantic_index_service._balanced_s_expression_end(text, match.start())
-        if end is None:
-            return [], [], False
-        name = _NAME_VALUE.search(text, match.start(), end)
-        if name is not None:
-            footprint_names.append(_unescape(name.group(1)))
-    return header_entries, footprint_names, True
+    records = scan_source(text, "kicad_pcb")
+    return list(records.header), list(records.names), records.readable
 
 
 def _schematic_record_names(text: str) -> tuple[list[str], bool]:
-    """Names from symbol- and sheet-instance variant records, in file order."""
-
-    if not _balanced_file(text):
-        return [], False
-    names: list[str] = []
-    for match in _VARIANT_START.finditer(text):
-        end = semantic_index_service._balanced_s_expression_end(text, match.start())
-        if end is None:
-            return [], False
-        name = _NAME_VALUE.search(text, match.start(), end)
-        if name is not None:
-            names.append(_unescape(name.group(1)))
-    return names, True
-
-
-def _schematic_hierarchy(root_schematic: Path) -> list[Path]:
-    """The root sheet then every sheet it instantiates, depth-first.
-
-    ``Sheetfile`` references are followed in file order and resolved relative
-    to the sheet that owns them, which is how KiCad writes hierarchical
-    paths. A repeated sheet is visited once; its names are already counted.
-    """
-
-    ordered: list[Path] = []
-    visited: set[Path] = set()
-
-    def visit(path: Path) -> None:
-        resolved = path.resolve()
-        if resolved in visited:
-            return
-        visited.add(resolved)
-        ordered.append(resolved)
-        text = _read_text(resolved)
-        if text is None:
-            return
-        for reference in _SHEETFILE_VALUE.findall(text):
-            visit(resolved.parent / _unescape(reference))
-
-    visit(root_schematic)
-    return ordered
+    records = scan_source(text, "kicad_sch")
+    return list(records.names), records.readable
 
 
 def _relative(snapshot: ProjectSourceSnapshot, path: Path) -> str:
@@ -345,9 +242,19 @@ def discover_variant_catalog(
     """
 
     source_revision_key, resolved_commit = project_revision_identity(project, commit)
+    return deepcopy(_discover_cached(
+        str(project.path), getattr(project, "project_file", None),
+        str(getattr(project, "id", "")), source_revision_key, resolved_commit,
+    ))
+
+
+@lru_cache(maxsize=128)
+def _discover_cached(path: str, anchor: str | None, project_id: str,
+                     source_revision_key: str, resolved_commit: str | None) -> dict[str, Any]:
+    project = SimpleNamespace(path=path, project_file=anchor, id=project_id)
     builder = _CatalogBuilder()
 
-    with project_source_snapshot(project, commit) as snapshot:
+    with project_source_snapshot(project, resolved_commit) as snapshot:
         board, schematic = source_files(project, snapshot)
 
         if snapshot.project_file.suffix.lower() == ".kicad_pro":
@@ -380,24 +287,32 @@ def discover_variant_catalog(
             builder.add_board_name(name, description, SOURCE_PCB, "Board header")
 
         if schematic is not None:
-            for path in _schematic_hierarchy(schematic):
+            pending = [schematic]
+            visited: set[Path] = set()
+            while pending:
+                path = pending.pop().resolve()
+                if path in visited:
+                    continue
+                visited.add(path)
+                # Source files must stay within the project snapshot. Never
+                # follow a file-authored path into the host filesystem.
+                if not path.is_relative_to(snapshot.root):
+                    builder.source_unparseable(SOURCE_SCHEMATIC, path.name)
+                    continue
                 text = _read_text(path)
-                if text is None:
-                    builder.source_unparseable(
-                        SOURCE_SCHEMATIC, _relative(snapshot, path)
-                    )
+                records = scan_source(text, "kicad_sch") if text is not None else None
+                if records is None or not records.readable:
+                    builder.source_unparseable(SOURCE_SCHEMATIC, _relative(snapshot, path))
                     continue
-                names, readable = _schematic_record_names(text)
-                if not readable:
-                    builder.source_unparseable(
-                        SOURCE_SCHEMATIC, _relative(snapshot, path)
-                    )
-                    continue
-                for name in names:
+                for name in records.names:
                     builder.add_schematic_name(name)
+                pending.extend(reversed([path.parent / name for name in records.sheets]))
 
         for name in footprint_names:
             builder.add_board_name(name, None, SOURCE_FOOTPRINT, "Footprint record")
+
+    if resolved_commit is None and project_revision_identity(project)[0] != source_revision_key:
+        raise RuntimeError("Project sources changed during variant discovery; retry")
 
     return {
         "schema": SCHEMA,

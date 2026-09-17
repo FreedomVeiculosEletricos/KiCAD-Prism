@@ -147,6 +147,9 @@ export function useProjectVariants({
                     "Failed to load design variants",
                 );
                 if (!owns()) return;
+                if (response.projectId !== projectId) {
+                    throw new Error("Design variants belong to a different project");
+                }
                 setSnapshot({ scope, response, loading: false, error: null });
             } catch (error) {
                 if (!owns() || isAbortError(error)) return;
@@ -167,7 +170,7 @@ export function useProjectVariants({
             isMounted.current = false;
             controller.abort();
         };
-    }, [commit, projectId, reloadToken, scope]);
+    }, [commit, projectId, reloadToken, scope, indexIdentity?.sourceRevisionKey]);
 
     const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 

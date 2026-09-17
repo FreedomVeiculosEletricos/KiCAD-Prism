@@ -104,7 +104,8 @@ BOARD = """(kicad_pcb
 (at 0 0)
 (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS") (effects (font (size 1 1))))
 (property "Value" "10k" (at 0 0 0) (layer "F.Fab") (effects (font (size 1 1))))
-(attr smd{variant})
+(attr smd)
+{variant}
 )
 (embedded_fonts no)
 )

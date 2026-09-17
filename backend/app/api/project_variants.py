@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +25,7 @@ from fastapi.responses import Response
 
 from app.api._helpers import get_project_for_role_or_404
 from app.core.security import AuthenticatedUser, require_viewer
-from app.services import project_source_snapshot, variant_catalog_service
+from app.services import project_source_snapshot, variant_catalog_service, variant_source_scan
 
 router = APIRouter(dependencies=[Depends(require_viewer)])
 
@@ -40,6 +42,7 @@ def _catalog_generator_tag() -> str:
     for module in (
         variant_catalog_service,
         project_source_snapshot,
+        variant_source_scan,
     ):
         digest.update(Path(module.__file__).read_bytes())
     return f"{variant_catalog_service.SCHEMA}-{digest.hexdigest()[:12]}"
@@ -63,14 +66,15 @@ async def get_project_variants(
             commit,
         )
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail="Could not read design variants for this revision") from error
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        raise HTTPException(status_code=503, detail="Could not read design variants for this revision") from error
 
-    etag = f'"{payload.get("sourceRevisionKey", "")}-{CATALOG_GENERATOR_TAG}"'
+    identity = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
+    etag = f'"{identity}-{CATALOG_GENERATOR_TAG}"'
     # A commit is immutable; a working tree is not, so it must revalidate.
     cache_control = (
-        "private, max-age=300" if payload.get("commit") else "private, no-cache"
+        "private, max-age=300" if commit and re.fullmatch(r"[0-9a-fA-F]{40}", commit) else "private, no-cache"
     )
     headers = {"Cache-Control": cache_control, "ETag": etag}
     if request.headers.get("if-none-match") == etag:

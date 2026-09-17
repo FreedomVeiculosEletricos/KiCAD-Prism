@@ -31,6 +31,7 @@ Semantics follow packet sections 2.2-2.7:
 from __future__ import annotations
 
 import re
+from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -265,13 +266,16 @@ def _ancestor_sheet_flags(
     node = instance
     while node is not None:
         sheet = getattr(node, "sheet_symbol", None)
+        parent_path = getattr(node, "parent_sheet_instance_path", None)
+        parent = graph.by_path.get(parent_path)
+        version = getattr(parent.schematic, "version", graph.version) if parent else graph.version
         if sheet is not None:
             folded.append(
                 _sheet_flags(
                     sheet,
                     getattr(node, "parent_sheet_instance_path", None),
                     variant_name,
-                    graph.version,
+                    version,
                 )
             )
         parent_path = getattr(node, "parent_sheet_instance_path", None)
@@ -284,18 +288,23 @@ def _resolve_occurrence(
     sheet_path: str,
     graph: _SchematicGraph,
     variant_name: Optional[str],
+    version: Optional[int] = None,
 ) -> tuple[str, dict[str, bool], dict[str, str]]:
     from kicad_monkey.kicad_variants import resolve_symbol
 
+    if not _has_symbol_instance(symbol, sheet_path):
+        # The pinned resolver otherwise borrows another occurrence's reference.
+        symbol = copy(symbol)
+        symbol.instances = []
     resolved = resolve_symbol(symbol, variant_name, sheet_path)
     record = (
         _select_symbol_variant(symbol, variant_name, sheet_path)
         if variant_name is not None
         else None
     )
-    return resolved.reference, _symbol_flags(resolved, record, graph.version), dict(
-        resolved.fields
-    )
+    fields = dict(resolved.fields)
+    fields["Reference"] = resolved.reference
+    return resolved.reference, _symbol_flags(resolved, record, version), fields
 
 
 def _occurrence_states(
@@ -314,7 +323,7 @@ def _occurrence_states(
                 ancestors = _ancestor_sheet_flags(instance, graph, None)
                 ancestors_cache[id(instance)] = ancestors
             reference, flags, fields = _resolve_occurrence(
-                symbol, sheet_path, graph, None
+                symbol, sheet_path, graph, None, getattr(instance.schematic, "version", graph.version)
             )
             if not _valid_reference(reference):
                 continue
@@ -356,7 +365,7 @@ def _variant_occurrence_states(
                 ancestors = _ancestor_sheet_flags(instance, graph, variant_name)
                 ancestors_cache[id(instance)] = ancestors
             reference, flags, fields = _resolve_occurrence(
-                symbol, sheet_path, graph, variant_name
+                symbol, sheet_path, graph, variant_name, getattr(instance.schematic, "version", graph.version)
             )
             if not _valid_reference(reference):
                 continue
@@ -811,13 +820,7 @@ def build_assembly_state(
     default_by_uuid = {state.uuid: state for state in footprints}
     variants: list[dict[str, Any]] = []
     alternate_diagnostics: list[dict[str, Any]] = []
-    mismatch_inputs: list[
-        tuple[
-            Mapping[str, _ComponentState],
-            Mapping[str, Sequence[_FootprintState]],
-            Optional[str],
-        ]
-    ] = []
+    mismatch_diagnostics: list[dict[str, Any]] = []
     for variant_name in variant_names:
         occurrence_states = _variant_occurrence_states(graph, variant_name)
         variant_components = _project_components(
@@ -867,9 +870,7 @@ def build_assembly_state(
             variant_footprints_by_reference.setdefault(
                 state.reference, []
             ).append(state)
-        mismatch_inputs.append(
-            (variant_components, variant_footprints_by_reference, variant_name)
-        )
+        _source_state_mismatches(variant_components, variant_footprints_by_reference, variant_name, mismatch_diagnostics)
 
     # Footprint diagnostics follow the component conflicts so the order matches
     # the fixture expectations (multi-unit first, then duplicate references) and
@@ -886,18 +887,16 @@ def build_assembly_state(
             }
         )
     diagnostics.extend(alternate_diagnostics)
-    mismatch_inputs.append((components, footprints_by_reference, None))
-    for component_states, footprint_grouping, variant_name in mismatch_inputs:
-        _source_state_mismatches(
-            component_states,
-            footprint_grouping,
-            variant_name,
-            diagnostics,
-        )
+    _source_state_mismatches(components, footprints_by_reference, None, mismatch_diagnostics)
+    diagnostics.extend(mismatch_diagnostics)
 
     return {
         "schema": SCHEMA,
         "catalog": entries,
+        # Identity must survive sparse flag maps, including PCB-only parts.
+        "footprintInventory": [
+            {"uuid": state.uuid, "reference": state.reference} for state in footprints
+        ],
         "default": default_state,
         "variants": variants,
         "diagnostics": diagnostics,

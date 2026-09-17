@@ -179,7 +179,7 @@ describe("resolveVariantSelection", () => {
             catalog({ identityMismatch: true }),
             indexWith([LITE]),
         );
-        expect(resolution).toEqual({ effective: null, state: "loading" });
+        expect(resolution).toEqual({ effective: null, state: "failed" });
     });
 });
 

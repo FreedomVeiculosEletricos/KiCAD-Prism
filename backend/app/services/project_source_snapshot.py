@@ -6,8 +6,8 @@ project file, the working tree is read in place, and a commit is extracted to
 a temporary checkout that lives for the duration of the context.
 
 This is a narrow public seam over machinery the semantic index already owns.
-It deliberately does not reimplement git or project-file discovery:
-``semantic_visualizer_service`` resolves refs and extracts trees, and
+``semantic_visualizer_service`` resolves refs; this module materializes only
+KiCad source blobs in one batch instead of archiving generated artifacts, and
 ``semantic_index_service`` owns the cache-identity rules. A project whose
 anchor is a board or schematic instead of a ``.kicad_pro`` (PCB-only projects)
 is supported by keying the same source tree to that anchor.
@@ -16,8 +16,12 @@ is supported by keying the same source tree to that anchor.
 from __future__ import annotations
 
 import contextlib
+import re
+import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
+from types import SimpleNamespace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Optional
 
@@ -39,7 +43,7 @@ class ProjectSourceSnapshot:
     commit: Optional[str]
 
 
-def _anchor_source(project: Any) -> Optional[Path]:
+def _anchor_source(project: Any, *, require_file: bool = True) -> Optional[Path]:
     """The anchor itself when it is a board or schematic rather than a project.
 
     PCB-only projects have no ``.kicad_pro``; the anchor that selected them is
@@ -53,7 +57,9 @@ def _anchor_source(project: Any) -> Optional[Path]:
     if not anchor.endswith(PROJECT_SUFFIXES):
         return None
     candidate = (Path(project.path) / anchor).resolve()
-    if not candidate.is_file():
+    if not candidate.is_relative_to(Path(project.path).resolve()):
+        raise ValueError("Configured source is outside the project")
+    if require_file and not candidate.is_file():
         raise ValueError(f"Configured source not found at the anchor: {anchor}")
     return candidate
 
@@ -70,8 +76,23 @@ def project_revision_identity(
     which is the identity rule the index uses for ``project_file_rel``.
     """
 
+    if commit and re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        return _immutable_revision_identity(
+            str(project.path), path_config_service.anchor_for_project(project), commit.lower()
+        )
+    return _revision_identity_uncached(project, commit)
+
+
+@lru_cache(maxsize=512)
+def _immutable_revision_identity(path: str, anchor: str | None, commit: str) -> tuple[str, Optional[str]]:
+    # A full object ID names immutable content; branches and working trees must
+    # still resolve/hash on every request. Cache no authorization decisions.
+    return _revision_identity_uncached(SimpleNamespace(path=path, project_file=anchor), commit)
+
+
+def _revision_identity_uncached(project: Any, commit: Optional[str]) -> tuple[str, Optional[str]]:
     anchor = path_config_service.anchor_for_project(project) or ""
-    source = _anchor_source(project)
+    source = _anchor_source(project, require_file=not commit)
     if source is None:
         return semantic_index_service._revision_identity(project, commit)
 
@@ -111,7 +132,7 @@ def project_source_snapshot(
     """
 
     anchor = path_config_service.anchor_for_project(project)
-    anchor_source = _anchor_source(project)
+    anchor_source = _anchor_source(project, require_file=not commit)
 
     if not commit:
         if anchor_source is not None:
@@ -146,9 +167,7 @@ def project_source_snapshot(
 
     with tempfile.TemporaryDirectory(prefix="variant-catalog-commit-") as tmp:
         checkout = Path(tmp) / "checkout"
-        semantic_visualizer_service._archive_checkout(
-            repo_root, resolved_commit, checkout
-        )
+        _checkout_sources(repo_root, resolved_commit, checkout, project_rel)
         project_file = checkout / project_rel
         if not project_file.is_file():
             raise ValueError(
@@ -172,33 +191,66 @@ def source_files(
     leaking working-tree files.
     """
 
-    anchor = path_config_service.anchor_for_project(project)
-    config = path_config_service.get_path_config(str(project.path), anchor=anchor)
-    stem = path_config_service.anchor_stem(anchor)
-
-    def resolve(pattern: Optional[str], default: str) -> Optional[Path]:
-        value = pattern or default
-        if "*" not in value:
-            candidate = snapshot.root / value
-            return candidate if candidate.is_file() else None
-        matches = sorted(
-            snapshot.root.glob(value), key=lambda item: item.name.casefold()
-        )
-        if not matches:
+    anchor = snapshot.project_file.name
+    # Historical discovery must use the historical configuration. Temporary
+    # paths must not accumulate in the global path-configuration cache.
+    config = path_config_service.get_path_config(str(snapshot.root), anchor=anchor, use_cache=False)
+    path_config_service.clear_config_cache(str(snapshot.root))
+    for value in (config.pcb, config.schematic):
+        if value and (Path(value).is_absolute() or ".." in Path(value).parts):
+            raise ValueError("Configured source is outside the project")
+    paths = path_config_service.resolve_paths(str(snapshot.root), config=config, anchor=anchor)
+    def checked(value: str | None) -> Optional[Path]:
+        if not value:
             return None
-        if stem:
-            anchored = next(
-                (
-                    item
-                    for item in matches
-                    if item.stem.casefold() == stem.casefold()
-                ),
-                None,
-            )
-            if anchored is not None:
-                return anchored
-        return matches[0]
+        candidate = Path(value).resolve()
+        if not candidate.is_relative_to(snapshot.root):
+            raise ValueError("Configured source is outside the project")
+        return candidate
+    return checked(paths.pcb), checked(paths.schematic)
 
-    board = resolve(config.pcb, "*.kicad_pcb")
-    schematic = resolve(config.schematic, "*.kicad_sch")
-    return board, schematic
+
+def _checkout_sources(repo_root: Path, commit: str, destination: Path, project_rel: str) -> None:
+    """Materialize only KiCad inputs, never repository output archives/models.
+
+    One batch read avoids one git process per sheet. Only regular blobs are
+    copied; a repository symlink must not cause reads outside this snapshot.
+    """
+    directory = PurePosixPath(project_rel).parent.as_posix()
+    args = ["git", "-C", str(repo_root), "ls-tree", "-r", "-z", commit]
+    if directory != ".":
+        args += ["--", directory + "/"]
+    listing = subprocess.run(args, capture_output=True, check=True).stdout
+    sources: list[tuple[str, str]] = []
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        metadata, name = record.split(b"\t", 1)
+        mode, kind, blob = metadata.split()
+        path = name.decode("utf-8")
+        if mode not in (b"100644", b"100755") or kind != b"blob":
+            continue
+        if Path(path).suffix not in PROJECT_SUFFIXES and Path(path).name != ".prism.json":
+            continue
+        sources.append((path, blob.decode("ascii")))
+    if not sources:
+        raise ValueError("No KiCad sources found in the selected revision")
+    objects = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "--batch"],
+        input="".join(blob + "\n" for _, blob in sources).encode("ascii"),
+        capture_output=True, check=True,
+    ).stdout
+    offset = 0
+    for path, blob in sources:
+        end = objects.index(b"\n", offset)
+        actual, kind, size = objects[offset:end].split()
+        if actual.decode("ascii") != blob or kind != b"blob":
+            raise ValueError("Could not read a source blob")
+        start = end + 1
+        offset = start + int(size)
+        target = destination / path
+        if not target.resolve().is_relative_to(destination.resolve()):
+            raise ValueError("Invalid repository source path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(objects[start:offset])
+        offset += 1

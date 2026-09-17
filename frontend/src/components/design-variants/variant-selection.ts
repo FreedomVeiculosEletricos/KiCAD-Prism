@@ -78,7 +78,7 @@ export function resolveVariantSelection(
         return { effective: null, state: "failed" };
     }
     if (catalog.identityMismatch) {
-        return { effective: null, state: "loading" };
+        return { effective: null, state: "failed" };
     }
     if (assemblyProjectionState(index, null) === "unavailable") {
         return { effective: null, state: "unavailable" };
