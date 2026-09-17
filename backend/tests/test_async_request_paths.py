@@ -277,5 +277,49 @@ class CatalogUploadsDoNotBlockTheLoopTests(unittest.TestCase):
         self.assertEqual(ctx.exception.detail, "Uploaded library has no symbols")
 
 
+class VariantCatalogReadsDoNotBlockTheLoopTests(unittest.TestCase):
+    """Catalog discovery reads files and runs git; it must not hold the loop."""
+
+    def test_blocked_catalog_discovery_does_not_stall_an_unrelated_request(self) -> None:
+        from app.api import project_variants as variants_api
+
+        blocked = _BlockedStore(
+            result={
+                "schema": "prism.project_variants_a0",
+                "projectId": "prj",
+                "commit": None,
+                "sourceRevisionKey": "key",
+                "variants": [],
+                "diagnostics": [],
+            }
+        )
+        user = security.AuthenticatedUser(email="v@example.com", name="V", role="viewer")
+
+        async def scenario() -> bool:
+            read = asyncio.create_task(
+                variants_api.get_project_variants(
+                    "prj", _http_request(), None, user
+                )
+            )
+            await asyncio.get_running_loop().run_in_executor(None, blocked.entered.wait, 2)
+            probe_finished = await _lightweight_probe_completes_while(read)
+            blocked.gate.set()
+            response = await read
+            self.assertEqual(response.status_code, 200)
+            return probe_finished
+
+        with patch.object(
+            variants_api, "get_project_for_role_or_404"
+        ), patch.object(
+            variants_api.variant_catalog_service,
+            "discover_variant_catalog",
+            blocked,
+        ):
+            self.assertTrue(
+                asyncio.run(scenario()),
+                "the event loop was blocked by catalog discovery",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
