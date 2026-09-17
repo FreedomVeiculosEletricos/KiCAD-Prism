@@ -201,6 +201,7 @@ function oracleLike(): PrismSemanticIndex {
 
     const assembly: AssemblyState = {
         schema: "prism.assembly_state_a0",
+        footprintInventory: INVENTORY,
         catalog: [
             {
                 name: "Lite",
@@ -385,13 +386,13 @@ describe("physicalVisibility", () => {
     };
 
     it("matches the oracle fixture's default classification", () => {
-        expect(physicalVisibility(oracleLike(), null, INVENTORY)).toEqual(
+        expect(physicalVisibility(oracleLike(), null)).toEqual(
             expectedDefault,
         );
     });
 
     it("matches the Lite classification and keeps Q1 ambiguous", () => {
-        const visibility = physicalVisibility(oracleLike(), "Lite", INVENTORY);
+        const visibility = physicalVisibility(oracleLike(), "Lite");
         expect(visibility).toEqual({
             ...expectedDefault,
             R1: "hidden",
@@ -408,18 +409,17 @@ describe("physicalVisibility", () => {
 
     it("matches Pro and the footprint-only PcbOnly variant", () => {
         const index = oracleLike();
-        expect(physicalVisibility(index, "Pro", INVENTORY)).toEqual(
+        expect(physicalVisibility(index, "Pro")).toEqual(
             expectedDefault,
         );
-        expect(physicalVisibility(index, "PcbOnly", INVENTORY)).toEqual({
+        expect(physicalVisibility(index, "PcbOnly")).toEqual({
             ...expectedDefault,
             J9: "hidden",
         });
     });
 
     it("never guesses a reference-level DNP for duplicate footprints", () => {
-        // No inventory: the component's pcbRefs still expose both alternates,
-        // and a two-footprint group is ambiguous in every variant.
+        // The full inventory exposes both alternates, including neutral flags.
         const index = oracleLike();
         for (const name of [null, "Lite", "Pro"]) {
             expect(physicalVisibility(index, name).Q1).toBe("ambiguous");
@@ -428,9 +428,21 @@ describe("physicalVisibility", () => {
 
     it("is stable for unknown names (default classification) and absent components", () => {
         const index = oracleLike();
-        expect(physicalVisibility(index, "Nope", INVENTORY)).toEqual(
+        expect(physicalVisibility(index, "Nope")).toEqual(
             expectedDefault,
         );
-        expect(physicalVisibility(index, null, INVENTORY).R9).toBe("absent");
+        expect(physicalVisibility(index, null).R9).toBe("absent");
+    });
+});
+
+
+describe("PCB-only physical identity", () => {
+    it("hides an orphan footprint whose default flags are all neutral", () => {
+        const index = oracleLike();
+        index.assembly!.footprintInventory = [{ uuid: "orphan", reference: "H1" }];
+        index.assembly!.variants.push({name: "NoMount", occurrences: {}, components: {}, footprints: {orphan: {dnp: true}}});
+        expect(physicalVisibility(index, null).H1).toBe("visible");
+        expect(physicalVisibility(index, "NoMount").H1).toBe("hidden");
+        expect(physicalVisibility(index, null).H1).toBe("visible");
     });
 });

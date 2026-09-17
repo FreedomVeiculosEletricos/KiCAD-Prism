@@ -27,8 +27,7 @@ export interface DesignVariantSelectorProps {
     requested?: string | null;
 }
 
-const NOTICE_CLASS =
-    "max-w-64 truncate text-xs text-muted-foreground";
+const NOTICE_CLASS = "max-w-64 truncate text-xs text-muted-foreground";
 
 export function DesignVariantSelector({
     resolution,
@@ -40,32 +39,46 @@ export function DesignVariantSelector({
     const selectId = useId();
     const noticeId = useId();
     const notice = variantSelectionNotice(resolution, requested);
+    if (resolution.state === "empty") return null;
+    const showControl = variants.length > 0 || resolution.state !== "missing";
 
     return (
         <div className="flex items-center gap-2">
-            <label
-                htmlFor={selectId}
-                className="text-xs text-muted-foreground"
-            >
-                Variant
-            </label>
-            <select
-                id={selectId}
-                className="h-8 max-w-56 rounded-md border border-input bg-background px-2 text-xs"
-                value={resolution.effective ?? ""}
-                disabled={variantSelectorDisabled(resolution)}
-                aria-describedby={notice ? noticeId : undefined}
-                onChange={(event) =>
-                    onSelect(event.target.value === "" ? null : event.target.value)
-                }
-            >
-                <option value="">Default</option>
-                {variants.map((variant) => (
-                    <option key={variant.name} value={variant.name}>
-                        {variant.name}
-                    </option>
-                ))}
-            </select>
+            {showControl && (
+                <>
+                    <label
+                        htmlFor={selectId}
+                        className="text-xs text-muted-foreground"
+                    >
+                        Variant
+                    </label>
+                    <select
+                        id={selectId}
+                        className="h-8 max-w-56 rounded-md border border-input bg-background px-2 text-xs"
+                        value={resolution.effective ?? ""}
+                        disabled={variantSelectorDisabled(resolution)}
+                        aria-describedby={notice ? noticeId : undefined}
+                        onChange={(event) =>
+                            onSelect(
+                                event.target.value === ""
+                                    ? null
+                                    : event.target.value,
+                            )
+                        }
+                    >
+                        <option value="">Default</option>
+                        {variants.map((variant) => (
+                            <option
+                                key={variant.name}
+                                value={variant.name}
+                                title={variant.description ?? undefined}
+                            >
+                                {variant.name}
+                            </option>
+                        ))}
+                    </select>
+                </>
+            )}
             {notice && (
                 <span
                     id={noticeId}

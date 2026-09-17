@@ -23,6 +23,7 @@ from app.services import (
     semantic_index_variants,
     semantic_visualizer_service,
     variant_catalog_service,
+    variant_source_scan,
 )
 from app.services.kicad_monkey_design_adapter import KiCadMonkeyDesign
 
@@ -40,6 +41,7 @@ GENERATOR_MODULE_PATHS = (
     Path(semantic_index_variants.__file__),
     Path(variant_catalog_service.__file__),
     Path(project_source_snapshot.__file__),
+    Path(variant_source_scan.__file__),
 )
 GENERATOR_BUILD = hashlib.sha256(
     b"\0".join(
@@ -122,7 +124,7 @@ def _source_entries_on_disk(root: Path) -> list[tuple[str, str]]:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or ".git" in path.parts:
             continue
-        if path.suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES:
+        if path.suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES and path.name != ".prism.json":
             continue
         entries.append((path.relative_to(root).as_posix(), _blob_id(path.read_bytes())))
     return entries
@@ -162,7 +164,7 @@ def _source_entries_in_commit(
         if not path.startswith(prefix):
             continue
         relative = path[len(prefix):]
-        if Path(relative).suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES:
+        if Path(relative).suffix.lower() not in SEMANTIC_SOURCE_SUFFIXES and Path(relative).name != ".prism.json":
             continue
         entries.append((relative, parts[2]))
     return entries

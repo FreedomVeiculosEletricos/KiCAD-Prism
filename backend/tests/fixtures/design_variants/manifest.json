@@ -18,7 +18,6 @@
         "oracle/antenna.kicad_sch": "f790e757ee289012dfeb03af6114f8e5c5883685d1834e7bf15c25adbdf28def",
         "oracle/channel.kicad_sch": "371a552d3f6b9391ebcbbba32842c71939b65bbd2f2268087cb8e517f353cf4c",
         "oracle/variants_oracle.kicad_pcb": "26ff705f72a045881fe37cc927c429810a51001fe5a8af16dbb17d1e163bfc00",
-        "oracle/variants_oracle.kicad_prl": "cdc51babdbb188bc942f3fdf263b113ca42c0f5edc86642e9366ffde763ebfb5",
         "oracle/variants_oracle.kicad_pro": "5b3fcc1cd07d86465fb20cbcad99bb552a7f9c6deb15487fa2549494e4a83922",
         "oracle/variants_oracle.kicad_sch": "3f5cd2eccb83d6dec9287716d043ab6ab91b67078ba9384753d4443ca4c5a3ef",
         "oracle/wireless.kicad_sch": "0ba8280fd3897ae3f6d8b0e0d4b164ed1d0dbdaeb822a7ebde776471ff36b49a"
@@ -1229,7 +1228,6 @@
         "oracle_rev2/antenna.kicad_sch": "f790e757ee289012dfeb03af6114f8e5c5883685d1834e7bf15c25adbdf28def",
         "oracle_rev2/channel.kicad_sch": "371a552d3f6b9391ebcbbba32842c71939b65bbd2f2268087cb8e517f353cf4c",
         "oracle_rev2/variants_oracle.kicad_pcb": "7ce9fe6172f5c3d03fcbd942336347982e790f8b6bd8ae700d8938fb5c3cadfe",
-        "oracle_rev2/variants_oracle.kicad_prl": "cdc51babdbb188bc942f3fdf263b113ca42c0f5edc86642e9366ffde763ebfb5",
         "oracle_rev2/variants_oracle.kicad_pro": "d8a15191de4b6fa783ac307bdb30fed094a1a423d6231baba9808f14dbdfcc7d",
         "oracle_rev2/variants_oracle.kicad_sch": "c9fc9bd677961b2614c191accfe74aa8b3d392883bcf44a3f609e05a45147834",
         "oracle_rev2/wireless.kicad_sch": "0ba8280fd3897ae3f6d8b0e0d4b164ed1d0dbdaeb822a7ebde776471ff36b49a"
@@ -2438,7 +2436,6 @@
     "no_variants": {
       "files": {
         "no_variants/plain.kicad_pcb": "1290b27b0db4020068be27d3874981e94183c08b6121a4057c103036ad58817e",
-        "no_variants/plain.kicad_prl": "4c82448f6e11292852b32280237def097e7f1f1c973b91dc08b68cbcdb41c722",
         "no_variants/plain.kicad_pro": "134c479e2351c1f02a815cc7457f02e6b889ad02742195a93a3a2cd77fa5cdec",
         "no_variants/plain.kicad_sch": "a73075cd9c76992f9cd8754724a53632548117c10aae6ea3b12cf4e991795ed5"
       },
@@ -2739,7 +2736,6 @@
     },
     "legacy_in_bom": {
       "files": {
-        "legacy_in_bom/legacy.kicad_prl": "583a966f5cc57ffc0e0003237d31f478dbb72ccdb772dead37f22a3ecd202b5c",
         "legacy_in_bom/legacy.kicad_pro": "efd8d0252696474f1476deed48b408711ed8ce3cf768d00ef1ae2083a035caef",
         "legacy_in_bom/legacy.kicad_sch": "ee6a7e16efdba47dd519749764a4e7870e3f9438629b9497aef9ceec8ce68c2e"
       },
@@ -2878,8 +2874,7 @@
     },
     "pcb_only": {
       "files": {
-        "pcb_only/board_only.kicad_pcb": "1c98b16a03b845077fca4230e2d1fab6539a3c0e267114b4e5429a1e01471afe",
-        "pcb_only/board_only.kicad_prl": "bd0cec64195a47a25c44b6e759d2524865522357a5247ee4f124ac4450da1034"
+        "pcb_only/board_only.kicad_pcb": "1c98b16a03b845077fca4230e2d1fab6539a3c0e267114b4e5429a1e01471afe"
       },
       "commands": [
         {
@@ -3218,7 +3213,6 @@
     },
     "sch_only": {
       "files": {
-        "sch_only/sch_only.kicad_prl": "c814e30d184edab6853488ffd9963b6a622db143668d491b94680acaadc8fa5e",
         "sch_only/sch_only.kicad_pro": "7ca1f80149e06cce2932453367fb89b7036cc672925b5e6edd0fa6a532cd5e9e",
         "sch_only/sch_only.kicad_sch": "d26b57563e15db72423d44e76a0059f78dd3b1deb4bbe0ffabc418aa53cf0fd9"
       },
@@ -3424,7 +3418,6 @@
     "kicad11_tokens": {
       "files": {
         "kicad11_tokens/k11.kicad_pcb": "9ca2be3ae6665de134a8fc6e9e614fdd5224ddf674665fabf9cc7064ed63926a",
-        "kicad11_tokens/k11.kicad_prl": "8cac5d5ef7289b35f093aba75f32ce7e7ab1b6b904a31c1b0311996f0e98c665",
         "kicad11_tokens/k11.kicad_pro": "caf5a5d25445369133ebe111e014739e9148ab14c2924a779b4c1e424776dd72",
         "kicad11_tokens/k11.kicad_sch": "f8fddbc98634ddcd98498849c5d3301d42417d72f6048ce51da236ef569158bb"
       },
@@ -3707,7 +3700,6 @@
     },
     "rule_area": {
       "files": {
-        "rule_area/rule_area.kicad_prl": "6ce9ee4f2dd19da2180a4d40ab283ab5e9b9889df4f40d14a17f37b8e3f42f12",
         "rule_area/rule_area.kicad_pro": "a8079787b9506e125d203cdbb15e737490572fd205cf1561bbae059563e7a3c1",
         "rule_area/rule_area.kicad_sch": "bb37936ceb5754eb1bd36b8a5668b16654f5de67ae0fa8cac2bb8929685b5287"
       },
@@ -3847,7 +3839,6 @@
     "malformed": {
       "files": {
         "malformed/broken.kicad_pcb": "1e81b1f4bf86a0b732bd593c46bdcd5202f0a44a59ef517eb464a008979641b0",
-        "malformed/broken.kicad_prl": "e904fa0750c0f5fdf7febf5f6d16b336455c3d0147cad875df5490eab2b40164",
         "malformed/broken.kicad_pro": "41eee78536b07d3ff81dbf62e186402272afbeb12362793965489d50e729eed6",
         "malformed/broken.kicad_sch": "8be1f0272a62ebe5604a0bc442b4652c5ed2b368a64549e9fa9198d47fc13521"
       },
@@ -4141,7 +4132,6 @@
     "case_fold": {
       "files": {
         "case_fold/casefold.kicad_pcb": "330d05a285056613bf40e8ebad8d4994f7d498ccd0401a755c55e7bed0500408",
-        "case_fold/casefold.kicad_prl": "a6b79497ea948afa156818baca2d1b14dc8b11d08ffd97a34e3d9fec6b272827",
         "case_fold/casefold.kicad_pro": "381b80265c38206bfbdc55326c53c6da62085973029576c28f3642da500a666e",
         "case_fold/casefold.kicad_sch": "8eda662c50be36064d4939a5ba06b2f06c6b7ddf3f997484cf38aa780c9bbc15"
       },

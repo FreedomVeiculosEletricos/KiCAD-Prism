@@ -3,13 +3,12 @@
  *
  * The requested variant lives in `?variant=<name>` and nowhere else: these
  * helpers read it, rewrite it while preserving every other query parameter,
- * and decide whether the loaded catalog and index can actually honour it
+ * and decide whether the loaded index can actually honour it
  * before the UI advertises a named selection (packet 3.6, cases E16/E17).
  */
 
 import { assemblyProjectionState } from "@/lib/design-variants";
 import type {
-    AssemblyCatalogEntry,
     PrismSemanticIndex,
 } from "@/types/prism-selection";
 
@@ -25,18 +24,6 @@ export interface VariantSelectionResolution {
     /** The name the index may render, or null for the default assembly. */
     effective: string | null;
     state: VariantSelectionState;
-}
-
-/**
- * The catalog fields the resolution reads. Deliberately structural so the
- * visualizer can pass the hook's state without copying it into its own state.
- */
-export interface VariantCatalogSnapshot {
-    catalog: readonly AssemblyCatalogEntry[];
-    loading: boolean;
-    error: string | null;
-    empty: boolean;
-    identityMismatch: boolean;
 }
 
 export function requestedVariantFromSearchParams(
@@ -60,38 +47,19 @@ export function variantSearchParams(
     return next;
 }
 
-/**
- * Decide what the current revision can render. Catalogue and index identities
- * must agree and the name must exist in both the fetched catalog and the
- * index's own catalog before `applied` is reported; a named request never
- * falls through to a silently rendered default.
- */
+/** The index owns both the catalog and the data that renders its selection. */
 export function resolveVariantSelection(
     requested: string | null,
-    catalog: VariantCatalogSnapshot,
     index: PrismSemanticIndex | null,
+    error: string | null = null,
 ): VariantSelectionResolution {
-    if (index === null || catalog.loading) {
-        return { effective: null, state: "loading" };
-    }
-    if (catalog.error) {
-        return { effective: null, state: "failed" };
-    }
-    if (catalog.identityMismatch) {
-        return { effective: null, state: "loading" };
-    }
-    if (assemblyProjectionState(index, null) === "unavailable") {
-        return { effective: null, state: "unavailable" };
-    }
-    if (!requested) {
-        return { effective: null, state: catalog.empty ? "empty" : "applied" };
-    }
-    const known =
-        catalog.catalog.some((variant) => variant.name === requested) &&
-        assemblyProjectionState(index, requested) === "applied";
-    return known
-        ? { effective: requested, state: "applied" }
-        : { effective: null, state: "missing" };
+    if (!index) return { effective: null, state: error ? "failed" : "loading" };
+    const projection = assemblyProjectionState(index, requested);
+    if (projection === "unavailable" || projection === "missing")
+        return { effective: null, state: projection };
+    if (!requested && index.assembly!.catalog.length === 0)
+        return { effective: null, state: "empty" };
+    return { effective: requested, state: "applied" };
 }
 
 /**

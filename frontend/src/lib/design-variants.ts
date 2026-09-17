@@ -134,74 +134,28 @@ function projectComponent(
 }
 
 /**
- * Packet-2.6 physical classification per reference for a variant.
- *
- * The assembly footprint maps are differential, so a footprint whose flags are
- * all false is absent from them; `inventory` (or the components' `pcbRefs`)
- * supplies the full footprint set when the caller has it. A reference with two
- * or more footprints is always `ambiguous` — never collapsed into one guessed
- * DNP value. A component with no footprints is `absent`.
+ * Classify physical visibility from the complete footprint inventory.
+ * Differential flag maps supply effective DNP values, never membership.
+ * Multiple footprints for a reference remain ambiguous in every variant.
  */
 export function physicalVisibility(
     index: PrismSemanticIndex,
     name: string | null,
-    inventory: readonly FootprintInventoryEntry[] = [],
 ): Record<string, PhysicalVisibility> {
     const assembly = index.assembly;
     const variant = variantFor(index, name);
-    const groups = new Map<string, Array<[string, boolean]>>();
-    const seen = new Set<string>();
-    const references = new Set<string>();
-
-    const effectiveDnp = (uuid: string): boolean => {
-        const override = variant?.footprints[uuid]?.dnp;
-        if (override !== undefined) return override;
-        return assembly?.default.footprints[uuid]?.dnp === true;
-    };
-
-    const remember = (reference: string, uuid: string) => {
-        references.add(reference);
-        if (seen.has(uuid)) return;
-        seen.add(uuid);
-        const group = groups.get(reference) ?? [];
-        group.push([uuid, effectiveDnp(uuid)]);
-        groups.set(reference, group);
-    };
-
-    for (const entry of inventory) remember(entry.reference, entry.uuid);
-    const inventoryByUuid = new Map(
-        inventory.map((item) => [item.uuid, item]),
+    const visibility: Record<string, PhysicalVisibility> = Object.fromEntries(
+        index.components.map(({ reference }) => [reference, "absent"]),
     );
-    for (const component of index.components) {
-        const footprintRefs = component.pcbRefs ?? [];
-        for (const ref of footprintRefs) {
-            if (ref.footprintUuid) {
-                remember(component.reference, ref.footprintUuid);
-            }
+    for (const { reference, uuid } of assembly?.footprintInventory ?? []) {
+        if (visibility[reference] && visibility[reference] !== "absent") {
+            visibility[reference] = "ambiguous";
+            continue;
         }
-        if (footprintRefs.length === 0) references.add(component.reference);
-    }
-    for (const [uuid, entry] of Object.entries(
-        assembly?.default.footprints ?? {},
-    )) {
-        remember(entry.reference, uuid);
-    }
-    for (const uuid of Object.keys(variant?.footprints ?? {})) {
-        if (seen.has(uuid)) continue;
-        const reference =
-            inventoryByUuid.get(uuid)?.reference ??
-            assembly?.default.footprints[uuid]?.reference ??
-            "";
-        if (reference) remember(reference, uuid);
-    }
-
-    const visibility: Record<string, PhysicalVisibility> = {};
-    for (const reference of references) {
-        const footprints = groups.get(reference) ?? [];
-        if (footprints.length === 0) visibility[reference] = "absent";
-        else if (footprints.length === 1)
-            visibility[reference] = footprints[0]![1] ? "hidden" : "visible";
-        else visibility[reference] = "ambiguous";
+        const dnp = variant?.footprints[uuid]?.dnp
+            ?? assembly?.default.footprints[uuid]?.dnp
+            ?? false;
+        visibility[reference] = dnp ? "hidden" : "visible";
     }
     return visibility;
 }

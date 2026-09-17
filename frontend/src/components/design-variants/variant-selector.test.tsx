@@ -78,7 +78,6 @@ describe("DesignVariantSelector", () => {
     it("disables the control while loading, empty or unavailable", () => {
         for (const resolution of [
             { effective: null, state: "loading" },
-            { effective: null, state: "empty" },
             { effective: null, state: "unavailable" },
         ] as VariantSelectionResolution[]) {
             const { unmount } = render(
@@ -102,5 +101,18 @@ describe("DesignVariantSelector", () => {
         expect(screen.getByRole("status").textContent).toContain("could not be loaded");
         fireEvent.click(screen.getByRole("button", { name: "Retry" }));
         expect(onRetry).toHaveBeenCalledTimes(1);
+    });
+});
+
+
+describe("empty projects", () => {
+    it("does not show a selector without variants", () => {
+        renderSelector({effective: null, state: "empty"}, {variants: []});
+        expect(screen.queryByLabelText("Variant")).toBeNull();
+    });
+    it("still explains a missing requested variant without an empty selector", () => {
+        renderSelector({effective: null, state: "missing"}, {variants: [], requested: "Removed"});
+        expect(screen.queryByLabelText("Variant")).toBeNull();
+        expect(screen.getByRole("status").textContent).toContain("Removed");
     });
 });

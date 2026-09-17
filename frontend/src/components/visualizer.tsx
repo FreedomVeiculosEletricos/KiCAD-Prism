@@ -34,7 +34,6 @@ import {
 } from "./design-variants/variant-selection";
 import { DesignVariantSelector } from "./design-variants/variant-selector";
 import { usePrismCrossProbe } from "@/hooks/use-prism-cross-probe";
-import { useProjectVariants } from "@/hooks/use-project-variants";
 import {
     projectAssemblyState,
     physicalVisibility,
@@ -409,23 +408,13 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         [notifyClientReady],
     );
 
-    // The URL owns the requested variant; the catalog hook and the index know
-    // whether this revision can honour it. Nothing here mirrors the request
-    // into state — a selector change rewrites the URL and re-renders.
+    // The index supplies the catalog and overlays atomically; there is no
+    // independent catalog fetch or revision-reconciliation state.
     const requestedVariant = requestedVariantFromSearchParams(searchParams);
-    const variantCatalog = useProjectVariants({
-        projectId,
-        commit: commit ?? null,
-        indexIdentity: {
-            commit: commit ?? null,
-            sourceRevisionKey: semanticIndex?.sourceRevisionKey,
-        },
-        sessionKey: user?.email ?? "",
-    });
     const variantSelection = resolveVariantSelection(
         requestedVariant,
-        variantCatalog,
         semanticIndex,
+        semanticIndexError,
     );
     const effectiveAssembly = useMemo(
         () =>
@@ -1369,10 +1358,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                 {activeTab !== "assembly" && (
                     <DesignVariantSelector
                         resolution={variantSelection}
-                        variants={variantCatalog.catalog}
+                        variants={semanticIndex?.assembly?.catalog ?? []}
                         requested={requestedVariant}
                         onSelect={handleVariantSelect}
-                        onRetry={variantCatalog.reload}
+                        onRetry={() => { void generateSemanticIdentity(); }}
                     />
                 )}
                 {(activeTab === "sch" || activeTab === "pcb") && canModifyComments && (
@@ -1529,11 +1518,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
 
                     {activeTab === "assembly" && (
                         <div className="absolute inset-0 z-20 flex flex-col bg-background">
-                            {variantSelection.effective && (
+                            {requestedVariant && (
                                 <div className="shrink-0 border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                                    This assembly artifact was generated for the
-                                    reference assembly and does not follow the
-                                    selected variant.
+                                    This committed assembly artifact does not
+                                    follow the selected design variant.
                                 </div>
                             )}
                             <div className="min-h-0 flex-1">

@@ -5,9 +5,9 @@ catalog (contract packet v1.0 section 3.1). The project lookup is role-aware,
 the source reads run off the event loop, and the response carries an ETag so a
 client can revalidate instead of refetching.
 
-Caching follows decision D8: a commit is immutable for this revision, so it
-gets a short private max-age; a working-tree response must revalidate every
-time because the sources can change without the URL changing.
+Responses are private and revalidate on every request: both source content
+and generator behavior can change without the URL changing. ETags avoid
+resending an unchanged payload; the service caches discovery work.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +24,7 @@ from fastapi.responses import Response
 
 from app.api._helpers import get_project_for_role_or_404
 from app.core.security import AuthenticatedUser, require_viewer
-from app.services import project_source_snapshot, variant_catalog_service
+from app.services import project_source_snapshot, variant_catalog_service, variant_source_scan
 
 router = APIRouter(dependencies=[Depends(require_viewer)])
 
@@ -40,6 +41,7 @@ def _catalog_generator_tag() -> str:
     for module in (
         variant_catalog_service,
         project_source_snapshot,
+        variant_source_scan,
     ):
         digest.update(Path(module.__file__).read_bytes())
     return f"{variant_catalog_service.SCHEMA}-{digest.hexdigest()[:12]}"
@@ -63,16 +65,15 @@ async def get_project_variants(
             commit,
         )
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail="Could not read design variants for this revision") from error
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        raise HTTPException(status_code=503, detail="Could not read design variants for this revision") from error
 
-    etag = f'"{payload.get("sourceRevisionKey", "")}-{CATALOG_GENERATOR_TAG}"'
-    # A commit is immutable; a working tree is not, so it must revalidate.
-    cache_control = (
-        "private, max-age=300" if payload.get("commit") else "private, no-cache"
-    )
-    headers = {"Cache-Control": cache_control, "ETag": etag}
+    identity = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
+    etag = f'"{identity}-{CATALOG_GENERATOR_TAG}"'
+    # Source commits are immutable, but the generator can change at deployment.
+    # Revalidate every response; cached discovery and ETags keep this cheap.
+    headers = {"Cache-Control": "private, no-cache", "ETag": etag}
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
     return Response(

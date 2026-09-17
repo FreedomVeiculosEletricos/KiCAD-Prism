@@ -225,6 +225,8 @@ export interface AssemblyVariantState {
 export interface AssemblyState {
     schema: "prism.assembly_state_a0";
     catalog: AssemblyCatalogEntry[];
+    /** Complete physical identity, including neutral and PCB-only footprints. */
+    footprintInventory?: Array<{ uuid: string; reference: string }>;
     default: {
         occurrences: Record<string, AssemblyOccurrenceDefault>;
         components: Record<string, AssemblyComponentDefault>;
