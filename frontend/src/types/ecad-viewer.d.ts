@@ -93,10 +93,24 @@ export interface EcadPcbLayerState {
     highlighted: boolean;
 }
 
+/**
+ * Object kinds the viewer can show or hide on the board. The first four are
+ * footprint text layers; the label kinds drive the zoom-gated pad-number and
+ * net-name overlays (KiCad's "Show pad numbers" / "Show net names").
+ */
+export type EcadPcbObjectVisibilityKind =
+    | "references"
+    | "values"
+    | "footprintText"
+    | "hiddenText"
+    | "padNumbers"
+    | "padNetNames"
+    | "trackNetNames";
+
 export interface EcadPcbViewState {
     layers: EcadPcbLayerState[];
     objectOpacity: Record<"tracks" | "vias" | "pads" | "zones", number>;
-    objectVisibility: Record<"references" | "values" | "footprintText" | "hiddenText", boolean>;
+    objectVisibility: Record<EcadPcbObjectVisibilityKind, boolean>;
     highlightTracks: boolean;
 }
 
@@ -384,7 +398,7 @@ export interface ECadViewerElement extends HTMLElement {
     setPcbLayerHighlight?(name: string | null): boolean;
     applyPcbLayerPreset?(preset: "front" | "back" | "copper" | "outer-copper" | "inner-copper" | "drawings" | "all" | "none"): void;
     setPcbObjectOpacity?(kind: "tracks" | "vias" | "pads" | "zones", opacity: number): void;
-    setPcbObjectVisibility?(kind: "references" | "values" | "footprintText" | "hiddenText", visible: boolean): void;
+    setPcbObjectVisibility?(kind: EcadPcbObjectVisibilityKind, visible: boolean): void;
     setPcbTrackHighlight?(enabled: boolean): void;
     getScreenLocation(x: number, y: number): { x: number; y: number } | null;
     requestCrossProbe(request: CrossProbeRequest): Promise<
