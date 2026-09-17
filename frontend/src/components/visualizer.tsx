@@ -37,6 +37,11 @@ import { DesignVariantSelector } from "./design-variants/variant-selector";
 import { usePrismCrossProbe } from "@/hooks/use-prism-cross-probe";
 import { useProjectVariants } from "@/hooks/use-project-variants";
 import { projectAssemblyState } from "@/lib/design-variants";
+import {
+    syncViewerVariant,
+    viewerVariantNotice,
+    type ViewerVariantTarget,
+} from "@/lib/ecad-viewer-variant";
 import type { User } from "@/types/auth";
 import type {
     ECadViewerElement,
@@ -357,6 +362,10 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
     const [labelInstances, setLabelInstances] = useState<LabelInstanceRef[]>([]);
     const [navigatingLabelInstance, setNavigatingLabelInstance] = useState(false);
     const [activeSchematicPage, setActiveSchematicPage] = useState<ActiveSchematicPage | null>(null);
+    // Bumped every time a host reports ready; the variant sync effect keys on
+    // it so a ready arriving after the selection still converges.
+    const [schematicReadyGeneration, setSchematicReadyGeneration] = useState(0);
+    const [pcbReadyGeneration, setPcbReadyGeneration] = useState(0);
 
     // Comment collaboration state
     const [comments, setComments] = useState<Comment[]>([]);
@@ -383,11 +392,17 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         notifyClientReady,
     } = usePrismCrossProbe(semanticIndex);
     const notifySchematicViewerReady = useCallback(
-        () => notifyClientReady("visualizer-schematic"),
+        () => {
+            setSchematicReadyGeneration((generation) => generation + 1);
+            notifyClientReady("visualizer-schematic");
+        },
         [notifyClientReady],
     );
     const notifyPcbViewerReady = useCallback(
-        () => notifyClientReady("visualizer-pcb"),
+        () => {
+            setPcbReadyGeneration((generation) => generation + 1);
+            notifyClientReady("visualizer-pcb");
+        },
         [notifyClientReady],
     );
 
@@ -429,6 +444,57 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         },
         [searchParams, setSearchParams],
     );
+
+    // The ecad-viewer elements own replay across source replacement and page
+    // switches (the reflected `variant` attribute is durable). These effects
+    // cover what they cannot: a freshly mounted element, and a ready arriving
+    // after the selection. A bundle older than the vendored API is reported,
+    // never skipped silently.
+    const reportedViewerVariantIssues = useRef(new Set<string>());
+    const reportViewerVariantSync = useCallback(
+        (target: ViewerVariantTarget, result: ReturnType<typeof syncViewerVariant>) => {
+            const notice = viewerVariantNotice(target, result);
+            if (!notice) return;
+            const key = `${target}:${result.state}:${result.requested ?? ""}`;
+            if (reportedViewerVariantIssues.current.has(key)) return;
+            reportedViewerVariantIssues.current.add(key);
+            console.error(`[Visualizer] ${notice}`);
+            toast.error(notice);
+        },
+        [],
+    );
+    useEffect(() => {
+        let cancelled = false;
+        void customElements.whenDefined("ecad-viewer").then(() => {
+            if (cancelled) return;
+            reportViewerVariantSync(
+                "schematic",
+                syncViewerVariant(schematicViewerElement, variantSelection.effective),
+            );
+        });
+        return () => { cancelled = true; };
+    }, [
+        reportViewerVariantSync,
+        schematicReadyGeneration,
+        schematicViewerElement,
+        variantSelection.effective,
+    ]);
+    useEffect(() => {
+        let cancelled = false;
+        void customElements.whenDefined("ecad-viewer").then(() => {
+            if (cancelled) return;
+            reportViewerVariantSync(
+                "pcb",
+                syncViewerVariant(pcbViewerElement, variantSelection.effective),
+            );
+        });
+        return () => { cancelled = true; };
+    }, [
+        pcbReadyGeneration,
+        pcbViewerElement,
+        reportViewerVariantSync,
+        variantSelection.effective,
+    ]);
 
     const canImportLibraryComponent = canWriteCatalog(user?.role);
     const canModifyComments = user?.role === "admin" || user?.role === "designer";

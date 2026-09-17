@@ -315,6 +315,10 @@ export interface EcadTransitionTraceDetail {
 
 export interface ECadViewerElement extends HTMLElement {
     readonly isReady: boolean;
+    /** Design-variant API (packet 3.4); required by the vendored bundle. */
+    setVariant(name: string | null): boolean;
+    getVariant(): string | null;
+    getVariants(): Array<{ name: string; description: string | null }>;
     replaceSources(update: { revisionKey: string; sources: Array<{ filename: string; content: string }> }): Promise<void>;
     appendSources(update: { revisionKey: string; sources: Array<{ filename: string; content: string }> }): Promise<void>;
     setActive(active: boolean): void;
