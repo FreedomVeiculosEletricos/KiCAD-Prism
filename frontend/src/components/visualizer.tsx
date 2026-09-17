@@ -27,7 +27,16 @@ import {
     type ActiveSchematicPage,
 } from "@/lib/comment-overlays";
 import { DesignSearchField } from "./design-search-field";
+import {
+    DESIGN_VARIANT_SELECTOR_ENABLED,
+    requestedVariantFromSearchParams,
+    resolveVariantSelection,
+    variantSearchParams,
+} from "./design-variants/variant-selection";
+import { DesignVariantSelector } from "./design-variants/variant-selector";
 import { usePrismCrossProbe } from "@/hooks/use-prism-cross-probe";
+import { useProjectVariants } from "@/hooks/use-project-variants";
+import { projectAssemblyState } from "@/lib/design-variants";
 import type { User } from "@/types/auth";
 import type {
     ECadViewerElement,
@@ -305,7 +314,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
 
     // Open on the tab a caller asked for (e.g. clicking a changed .kicad_pcb in
     // the history file list), read once on mount; defaults to the schematic.
-    const [searchParams] = useSearchParams();
+    const [searchParams, setSearchParams] = useSearchParams();
     const [activeTab, setActiveTab] = useState<VisualizerTab>(() => {
         const requested = searchParams.get("tab");
         return requested === "pcb"
@@ -381,6 +390,46 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         () => notifyClientReady("visualizer-pcb"),
         [notifyClientReady],
     );
+
+    // The URL owns the requested variant; the catalog hook and the index know
+    // whether this revision can honour it. Nothing here mirrors the request
+    // into state — a selector change rewrites the URL and re-renders.
+    const requestedVariant = requestedVariantFromSearchParams(searchParams);
+    const variantCatalog = useProjectVariants({
+        projectId,
+        commit: commit ?? null,
+        indexIdentity: {
+            commit: commit ?? null,
+            sourceRevisionKey: semanticIndex?.sourceRevisionKey,
+        },
+        sessionKey: user?.email ?? "",
+    });
+    const variantSelection = resolveVariantSelection(
+        requestedVariant,
+        variantCatalog,
+        semanticIndex,
+    );
+    const effectiveAssembly = useMemo(
+        () =>
+            semanticIndex
+                ? projectAssemblyState(semanticIndex, variantSelection.effective)
+                : null,
+        [semanticIndex, variantSelection.effective],
+    );
+    // Presentation consumers read the effective projection; cross-probe
+    // registration below keeps the base index so selection identities stay
+    // stable while the projection changes.
+    const effectiveComponents =
+        effectiveAssembly?.components ?? semanticIndex?.components ?? null;
+    const handleVariantSelect = useCallback(
+        (name: string | null) => {
+            setSearchParams(variantSearchParams(searchParams, name), {
+                replace: true,
+            });
+        },
+        [searchParams, setSearchParams],
+    );
+
     const canImportLibraryComponent = canWriteCatalog(user?.role);
     const canModifyComments = user?.role === "admin" || user?.role === "designer";
 
@@ -1209,6 +1258,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
         <div className="relative flex h-full min-h-0 flex-col bg-background">
             <DesignSearchField
                 semanticIndex={semanticIndex}
+                components={effectiveComponents}
                 currentPage={activeSchematicPage?.filename || activeSchematicPage?.page || activeSchematicPage?.projectPath}
                 loading={semanticIndexLoading}
                 active={viewerActive}
@@ -1234,6 +1284,15 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                     );
                 })}
                 <div className="flex-1" />
+                {DESIGN_VARIANT_SELECTOR_ENABLED && activeTab !== "assembly" && (
+                    <DesignVariantSelector
+                        resolution={variantSelection}
+                        variants={variantCatalog.catalog}
+                        requested={requestedVariant}
+                        onSelect={handleVariantSelect}
+                        onRetry={variantCatalog.reload}
+                    />
+                )}
                 {(activeTab === "sch" || activeTab === "pcb") && canModifyComments && (
                     <Button
                         variant={commentMode ? "default" : "ghost"}
@@ -1372,6 +1431,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                         <div className="absolute inset-0 z-20 bg-background">
                             <EngineeringBomTable
                                 semanticIndex={semanticIndex}
+                                components={effectiveComponents}
                                 loading={semanticIndexLoading}
                                 error={semanticIndexError}
                                 selection={globalSelection}
@@ -1382,26 +1442,35 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                     )}
 
                     {activeTab === "assembly" && (
-                        <div className="absolute inset-0 z-20 bg-background">
-                            {ibomUrl ? (
-                                <iframe
-                                    title="Assembly Assistant"
-                                    src={ibomUrl}
-                                    className="h-full w-full border-0 bg-background"
-                                    // InteractiveHtmlBom needs scripts plus
-                                    // same-origin to run, and downloads for
-                                    // its exports. Content is generated by
-                                    // our backend from the repo's own design
-                                    // files, so the scripts+same-origin pair
-                                    // is accepted by design here.
-                                    // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox
-                                    sandbox="allow-scripts allow-same-origin allow-downloads"
-                                />
-                            ) : (
-                                <div className="flex h-full items-center justify-center p-8 text-center text-muted-foreground">
-                                    No interactive assembly HTML was found for this revision.
+                        <div className="absolute inset-0 z-20 flex flex-col bg-background">
+                            {variantSelection.effective && (
+                                <div className="shrink-0 border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                                    This assembly artifact was generated for the
+                                    reference assembly and does not follow the
+                                    selected variant.
                                 </div>
                             )}
+                            <div className="min-h-0 flex-1">
+                                {ibomUrl ? (
+                                    <iframe
+                                        title="Assembly Assistant"
+                                        src={ibomUrl}
+                                        className="h-full w-full border-0 bg-background"
+                                        // InteractiveHtmlBom needs scripts plus
+                                        // same-origin to run, and downloads for
+                                        // its exports. Content is generated by
+                                        // our backend from the repo's own design
+                                        // files, so the scripts+same-origin pair
+                                        // is accepted by design here.
+                                        // react-doctor-disable-next-line react-doctor/iframe-missing-sandbox
+                                        sandbox="allow-scripts allow-same-origin allow-downloads"
+                                    />
+                                ) : (
+                                    <div className="flex h-full items-center justify-center p-8 text-center text-muted-foreground">
+                                        No interactive assembly HTML was found for this revision.
+                                    </div>
+                                )}
+                            </div>
                         </div>
                     )}
 
@@ -1450,6 +1519,7 @@ export function Visualizer({ projectId, user, commit, active: viewerActive = tru
                                 open
                                 selection={globalSelection}
                                 semanticIndex={semanticIndex}
+                                components={effectiveComponents}
                                 layerColors={layerColors}
                                 viewContext={activeViewContext ?? undefined}
                                 onOpenChange={(open) => {
