@@ -13,13 +13,6 @@ import type {
     PrismSemanticIndex,
 } from "@/types/prism-selection";
 
-/**
- * Temporary exposure gate (VAR-14 stop condition). The selector stays out of
- * the production toolbar until the ECAD viewers and the 3D tab follow the
- * selection (VAR-16/VAR-19); VAR-21 removes this constant.
- */
-export const DESIGN_VARIANT_SELECTOR_ENABLED = false;
-
 export type VariantSelectionState =
     | "applied"
     | "missing"
