@@ -1,5 +1,10 @@
 import { CameraController } from "./camera.js";
 import { BomViewer } from "./bom-viewer.js";
+import {
+  buildComponentFeatureGroups,
+  isComponentHidden,
+  planComponentVisibility,
+} from "./component-visibility.js";
 import { escapeHtml } from "./escape-html.js";
 import { loadGltf } from "./gltf-loader.js";
 import { clamp } from "./math.js";
@@ -88,6 +93,7 @@ function initialState() {
     showBoard: true,
     showComponents: true,
     isolateNet: false,
+    hiddenComponents: new Set(),
     /** User/view prefs restored after Esc; not overwritten by net-probe toggles. */
     savedShowBoard: true,
     savedShowComponents: true,
@@ -145,6 +151,7 @@ function initialScene() {
     failed: new Map(),
     residentTiles: new Map(),
     componentFeatures: new Map(),
+    componentModelCounts: new Map(),
     runtimeBounds: null,
     layerZOffsets: new Float32Array(256),
     layerZOffsetSignature: "",
@@ -359,6 +366,9 @@ export async function mountStandaloneViewer(options = {}) {
     setWorkspace(workspace) {
       const nextWorkspace = workspace === "stackup" ? "stackup" : "pcb";
       if (state.workspace !== nextWorkspace) switchWorkspace(nextWorkspace);
+    },
+    setHiddenComponents(references) {
+      return applyHiddenComponents(references);
     },
     dispose() {
       disposeViewerSession(token);
@@ -970,6 +980,11 @@ async function loadComponents(token = activeViewerToken) {
   for (const primitive of loaded.primitives) {
     const component = scene.componentFeatures.get(primitive.designator);
     if (component) mergeFeatureBounds(component.featureId, primitive.position);
+  }
+  // A reference whose GLB has two top-level model nodes is an
+  // alternate-footprint pair; the group builder keeps it visible.
+  for (const [designator, count] of loaded.componentNodeCounts || []) {
+    scene.componentModelCounts.set(designator, count);
   }
   for (const primitive of mergePrimitivesByMaterial(loaded.primitives)) {
     renderer.addPrimitive(primitive, {
@@ -1935,7 +1950,8 @@ function renderSearch(query) {
   }
   const nets = scene.nets.filter((net) => String(net.name).toLowerCase().includes(value)).slice(0, 8);
   const components = [...scene.componentFeatures.values()].filter((item) =>
-    `${item.designator} ${item.value} ${item.footprint}`.toLowerCase().includes(value)).slice(0, 6);
+    !state.hiddenComponents.has(String(item.designator || ""))
+    && `${item.designator} ${item.value} ${item.footprint}`.toLowerCase().includes(value)).slice(0, 6);
   container.innerHTML = [
     ...nets.map((net) => `<button data-net="${net.id}"><b>${escapeHtml(net.name)}</b><span>${escapeHtml(net.netClass || "")}</span></button>`),
     ...components.map((item) => `<button data-feature="${item.featureId}"><b>${escapeHtml(item.designator)}</b><span>${escapeHtml(item.value)}</span></button>`),
@@ -1968,6 +1984,10 @@ function selectNet(netId, shouldFrame) {
 
 function selectFeature(featureId, shouldFrame = false) {
   const feature = scene.features.get(featureId);
+  if (
+    feature?.kind === "component"
+    && isComponentHidden(componentReferenceFromFeature(feature), state.hiddenComponents)
+  ) return;
   if (shouldFrame) state.selectionAnchor = null;
   state.selectedFeatureId = featureId;
   state.activeNetId = Number(feature?.netId || 0);
@@ -1985,6 +2005,7 @@ function selectFeature(featureId, shouldFrame = false) {
 }
 
 function selectComponentReference(reference, shouldFrame = false) {
+  if (isComponentHidden(reference, state.hiddenComponents)) return;
   const component = scene.componentFeatures.get(reference);
   bomViewer?.setSelectionByReference(reference, { scroll: state.workspace === "bom" });
   if (!component?.featureId) return;
@@ -2024,6 +2045,42 @@ function selectComponentReference(reference, shouldFrame = false) {
 
 function componentReferenceFromFeature(feature) {
   return feature?.designator || feature?.reference || feature?.componentDesignator || "";
+}
+
+function componentFeatureGroups() {
+  return buildComponentFeatureGroups(
+    scene.manifest?.components || [],
+    scene.componentModelCounts,
+  );
+}
+
+/**
+ * Replace the hidden component set (VAR-18). Ambiguous references (alternate
+ * footprints) and unknown references are reported and stay visible; hiding the
+ * current selection clears it, and search results drop hidden references so
+ * nothing can frame an invisible model.
+ */
+function applyHiddenComponents(references) {
+  const plan = planComponentVisibility(references, componentFeatureGroups());
+  state.hiddenComponents = plan.hiddenReferences;
+  renderer?.setHiddenFeatureIds(plan.hiddenFeatureIds);
+  if (plan.ambiguous.length) {
+    console.warn(
+      `[prism-semantic-viewer] keeping ambiguous components visible: ${plan.ambiguous.join(", ")}`,
+    );
+  }
+  if (plan.unknown.length) {
+    console.warn(
+      `[prism-semantic-viewer] ignoring unknown components: ${plan.unknown.join(", ")}`,
+    );
+  }
+  const selectedReference = componentReferenceFromFeature(
+    scene.features.get(state.selectedFeatureId),
+  );
+  if (isComponentHidden(selectedReference, state.hiddenComponents)) clearSelection();
+  const searchInput = searchControlsEl.querySelector("input");
+  if (searchInput?.value) renderSearch(searchInput.value);
+  return plan;
 }
 
 function framePcbFeature(feature, forceComponent = false) {

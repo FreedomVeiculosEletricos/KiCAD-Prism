@@ -122,6 +122,7 @@ export class PrismSemanticViewerElement extends HTMLElement {
     this.controller = null;
     this.reloadOwner = createReloadOwner();
     this.pendingSelection = null;
+    this.pendingHiddenComponents = null;
     this.reloadQueued = false;
     this.reloadSource = null;
   }
@@ -227,6 +228,11 @@ export class PrismSemanticViewerElement extends HTMLElement {
   publishController(controller) {
     this.controller = controller;
     this.controller?.setWorkspace?.(this.workspace);
+    // The hidden set is view state that must outlive a reload: a controller
+    // that was created after the last setHiddenComponents call replays it.
+    if (this.pendingHiddenComponents) {
+      this.controller?.setHiddenComponents?.(this.pendingHiddenComponents);
+    }
     // A fresh viewer is already unselected. Avoid a redundant clearSelection()
     // while the staged shell is completing its first-frame setup.
     if (this.pendingSelection) this.controller?.setSelection?.(this.pendingSelection);
@@ -248,6 +254,18 @@ export class PrismSemanticViewerElement extends HTMLElement {
   setSelection(selection) {
     this.pendingSelection = selection || null;
     this.controller?.setSelection?.(this.pendingSelection);
+  }
+
+  /**
+   * Replace the hidden component references (VAR-18). Idempotent and safe
+   * before the viewer is ready or after a reload: the last call is replayed on
+   * the next controller.
+   */
+  setHiddenComponents(references) {
+    this.pendingHiddenComponents = Array.isArray(references)
+      ? [...references]
+      : [];
+    this.controller?.setHiddenComponents?.(this.pendingHiddenComponents);
   }
 
   resize() {

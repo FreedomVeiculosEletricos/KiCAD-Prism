@@ -16,6 +16,11 @@ export interface PrismRendererSelection {
 
 export interface PrismSemanticViewerElement extends HTMLElement {
     setSelection: (selection: PrismRendererSelection | null) => void;
+    /**
+     * Replaces the hidden component set (VAR-18). Safe before ready and after
+     * reloads; ambiguous or unknown references stay visible.
+     */
+    setHiddenComponents: (references: string[]) => void;
     resize: () => void;
 }
 
