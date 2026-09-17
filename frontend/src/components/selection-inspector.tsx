@@ -35,6 +35,11 @@ interface SelectionInspectorProps {
     open: boolean;
     selection: PrismSelection | null;
     semanticIndex: PrismSemanticIndex | null;
+    /**
+     * Effective components for the active assembly selection (VAR-11's
+     * projection). When omitted the inspector shows the base index.
+     */
+    components?: SemanticComponent[] | null;
     onOpenChange: (open: boolean) => void;
     onClear: () => void;
     onImportComponent?: () => void;
@@ -59,13 +64,18 @@ interface SelectionInspectorProps {
 const atIndex = <T,>(items: T[], index: number | undefined): T | undefined =>
     index === undefined ? undefined : items[index];
 
-function resolveComponent(selection: PrismSelection, index: PrismSemanticIndex | null): SemanticComponent | undefined {
+function resolveComponent(
+    selection: PrismSelection,
+    index: PrismSemanticIndex | null,
+    effectiveComponents?: SemanticComponent[] | null,
+): SemanticComponent | undefined {
     if (!index || selection.kind === "net") return undefined;
+    const components = effectiveComponents ?? index.components;
     if (selection.componentUid) {
-        const byUid = index.components.find((component) => component.componentUid === selection.componentUid);
+        const byUid = components.find((component) => component.componentUid === selection.componentUid);
         if (byUid) return byUid;
     }
-    return atIndex(index.components, index.indexes.componentByReference?.[selection.reference]);
+    return atIndex(components, index.indexes.componentByReference?.[selection.reference]);
 }
 
 function resolveNet(selection: PrismSelection, index: PrismSemanticIndex | null): SemanticNet | undefined {
@@ -285,6 +295,7 @@ export function SelectionInspector({
     open,
     selection,
     semanticIndex,
+    components,
     onOpenChange,
     onClear,
     onImportComponent,
@@ -299,7 +310,7 @@ export function SelectionInspector({
     viewContext,
 }: SelectionInspectorProps) {
     if (!open || !selection) return null;
-    const component = resolveComponent(selection, semanticIndex);
+    const component = resolveComponent(selection, semanticIndex, components);
     const net = resolveNet(selection, semanticIndex);
     const terminal = resolveTerminal(selection, semanticIndex);
     const SelectionIcon = selection.kind === "component" ? Cpu : selection.kind === "terminal" ? Waypoints : Network;
