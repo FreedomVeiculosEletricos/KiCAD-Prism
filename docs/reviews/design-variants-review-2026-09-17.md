@@ -9,19 +9,19 @@ The overall architecture is sound: source-specific native semantics, immutable i
 | Priority | Area / tickets | Trigger and correction |
 | --- | --- | --- |
 | P1 | Historical discovery — VAR-07/08/20 | Historical requests consulted current path configuration and could borrow a sibling project's board. Resolve `.prism.json` inside the selected snapshot using the common path resolver; include configuration in source identity. Historical board anchors work after the live file is deleted. |
-| P2 | Catalog parsing — VAR-07 | Text regex searches could interpret quoted text, misplaced forms or nested field names as variant names. Use a quote-aware structural scanner, read each schematic once, and reject malformed sources or paths outside the snapshot. |
+| P2 | Catalog parsing — VAR-07 | Text regex searches could interpret quoted text, misplaced forms or nested field names as variant names. Use a quote-aware structural scanner, read each schematic once, and reject malformed relevant records or paths outside the snapshot. Metadata-free files use the explicitly documented fast path. |
 | P2 | Occurrence identity — VAR-09/10 | Monkey's fallback could borrow the first occurrence's reference when the requested instance is missing. Use base attributes without mutating the native object; retain the warning. A Reference field override cannot change identity. |
 | P2 | Legacy BOM flags — VAR-09 | Applying the top schematic's version gate to every child misinterpreted mixed-version hierarchies. Resolve each symbol and ancestor sheet using its containing schematic's version. |
 | P2 | Physical identity — VAR-10/11/18/19 | A neutral-default PCB-only footprint was absent from both sparse default maps and logical component joins, so a named DNP override had no reference to hide. Publish and consume the complete footprint UUID/reference inventory. |
-| P2 | Loading lifecycle — VAR-12/14 | Catalog/index disagreement could remain indefinitely in loading state after Sync. Refresh on index source-key changes, reject responses for another project, and make a settled mismatch retryable. |
+| P2 | Loading lifecycle — VAR-12/14 | Catalog/index disagreement could remain indefinitely in loading state after Sync. Eliminate the independent catalog request: load catalog and overrides atomically from the semantic index. |
 | P2 | Empty selector / Assembly — VAR-14/19 | Hide the selector when there are no variants; preserve a missing-name notice. The committed Assembly artifact notice follows the requested selection and no longer asserts an unknown generation variant. |
 | P2 | Release discovery — VAR-20 | A board-only project had no `.kicad_pro` and therefore no Release Studio variants. Discover using its board or schematic anchor. |
-| P2 | Cache correctness — VAR-08 | Moving refs were given immutable-style max-age, and two different commits with identical source content could share response identity. Cache only exact SHA URLs for 300 seconds; include full response metadata in the ETag and sanitize operational errors. |
+| P2 | Cache correctness — VAR-08 | Moving refs were given immutable-style max-age, and two different commits with identical source content could share response identity. Revalidate all URLs, including exact SHAs; include full response metadata and generator identity in the ETag and sanitize operational errors. |
 | P2 | Reproducible fixtures — VAR-01/21 | The manifest required ten ignored, uncommitted `.kicad_prl` preference files. Remove only those entries; native inputs, evidence, and expected values stay unchanged. |
 
-## Performance
+## Original correction performance (through c91489e)
 
-Catalog discovery previously archived the entire repository, reread schematics, and repeated scanning on every request, including conditional requests. The correction materializes only regular KiCad source/configuration blobs in a single Git batch, scans relevant structure, and caches small catalog results in a bounded per-process LRU (128 entries). Exact-SHA identities have a separate bounded cache (512 entries). Authorization still runs before every API request. Working-tree sources are hashed each time and checked again before a cold result is cached; a concurrent edit causes a retryable error rather than poisoning an old key.
+Before the original correction, catalog discovery archived the entire repository, reread schematics, and repeated scanning on every request, including conditional requests. The correction materializes only regular KiCad source/configuration blobs in a single Git batch, scans relevant structure, and caches small catalog results in a bounded per-process LRU (128 entries). Exact-SHA identities have a separate bounded cache (512 entries). Authorization still runs before every API request. Working-tree sources are hashed each time and checked again before a cold result is cached; a concurrent edit causes a retryable error rather than poisoning an old key.
 
 Median elapsed milliseconds over seven cold/warm pairs on the same workstation and local project corpus. Cold clears both new caches; warm repeats the same request. These are service-call measurements, excluding HTTP, browser paint, full Monkey parsing and initial 3D generation. They are not production latency promises.
 
@@ -48,9 +48,9 @@ An additional overlay stress probe used OpenSwitch's parsed native design and 20
 | VAR-04/05/06 | Reviewed schematic/PCB resolvers and repaint lifecycle, including merged repaint fix; browser tests passed. No new ECAD source changes. |
 | VAR-07/08 | Corrected structural discovery, revision configuration, extraction costs, caches and response identity. |
 | VAR-09/10 | Corrected missing occurrences, mixed-version BOM semantics, reference identity and physical inventory. |
-| VAR-11/12 | Corrected physical projection and revision-owned catalog refresh; immutable logical projection retained. |
+| VAR-11/12 | Corrected physical projection and removed the redundant catalog request; immutable logical projection retained. |
 | VAR-13 | All-components BOM default and explicit assembly filter retained; effective fields continue into BOM/details/search. |
-| VAR-14 | Corrected empty/mismatch states; URL remains selection authority. |
+| VAR-14 | Corrected empty/missing states; URL remains selection authority. |
 | VAR-15/16 | Pinned ECAD source and imperative bridge reviewed; selection is replayed after readiness/source changes. No bundle changes required. |
 | VAR-17 | Real WebGPU color/pick readback passed through hide/show and mask growth. |
 | VAR-18/19 | Controller tests cover ambiguity/replay/selection; added missing physical identity. Show DNP remains a local visibility override. |
@@ -59,9 +59,9 @@ An additional overlay stress probe used OpenSwitch's parsed native design and 20
 
 ## Additive wire clarification
 
-`assembly.footprintInventory?: Array<{uuid: string, reference: string}>` carries complete physical identity independently of sparse flags. New indexes emit it; old indexes remain readable through the existing component/default-map fallback. No flag precedence or product behavior is redefined. The generator build fingerprint changes, invalidating older generated index artifacts. This is an additive clarification to packet v1 section 3.2; the frozen packet itself is not silently rewritten.
+`assembly.footprintInventory?: Array<{uuid: string, reference: string}>` carries complete physical identity independently of sparse flags. New indexes emit it. The simplification pass below removes the legacy membership fallbacks because generator fingerprints invalidate those older artifacts. No flag precedence or product behavior is redefined. The generator build fingerprint changes, invalidating older generated index artifacts. This is an additive clarification to packet v1 section 3.2; the frozen packet itself is not silently rewritten.
 
-## Verification
+## Original correction verification (c91489e)
 
 - Backend, final correction sources: **1,430 tests, OK; 14 live-KiCad skips**. All PostgreSQL URL classes were configured against disposable databases. A previous rerun against a used catalog database failed seven unrelated import-remediation fixture cases; the complete fresh-database run passed.
 - Strict Release Studio live runner: **43 tests, OK, zero skips**, in `release-studio-live-kicad:checkpoint-fix` with read-only corrected app/tests. Baked KiCad identity: `kicad/kicad:10.0.4@sha256:ee71e88396f8563168eb1ef282cda9ff2670fe86a677c63dd78b35e3d464454c`. The first attempt with the development ARM image correctly failed the digest identity gate; no check was weakened. This uses the existing pinned runtime image, not a freshly rebuilt correction image.
@@ -91,7 +91,7 @@ flowchart TB
     subgraph BE["Prism backend"]
         AUTH["Project authorization + revision identity"]
         CAT["Catalog discovery<br/>JSON reader + custom structural S-expression scanner<br/>Names, descriptions and source diagnostics only"]
-        CC["Bounded in-process catalog cache<br/>Content key; immutable SHA identity cache<br/>ETag / private HTTP caching"]
+        CC["Bounded in-process catalog cache<br/>Content key; immutable SHA identity cache<br/>ETag / private revalidation"]
         MONKEY["Semantic-index cache miss<br/>Revision snapshot → kicad_monkey parsed design"]
         RES["Prism assembly resolver<br/>Monkey symbol/footprint resolution + native compatibility rules<br/>Default state + sparse overrides for every variant"]
         IC["Cached semantic-index JSON on disk<br/>Source key + generator/dependency fingerprint<br/>Logical components + assembly + physical inventory"]
@@ -100,12 +100,13 @@ flowchart TB
         REL["Release Studio source choices<br/>Selected build variant → kicad-cli"]
         AUTH --> CAT --> CC
         AUTH --> MONKEY --> RES --> IC
+        MONKEY -->|same materialized snapshot; no rehash or catalog cache| CAT
         CAT -->|catalog names| RES
         CC --> REL
     end
 
     subgraph FE["Browser / Prism React"]
-        LOAD["useProjectVariants<br/>Validate catalog against index revision"]
+        LOAD["Load semantic-index JSON<br/>Catalog and overrides arrive atomically"]
         URL["URL variant parameter<br/>Selector + back/forward + reload"]
         SELECT["Resolved effective selection<br/>Unknown/unready → default + notice"]
         PROJ["Immutable frontend projection<br/>Apply selected sparse override"]
@@ -131,7 +132,6 @@ flowchart TB
     SRC --> AUTH
     SRC --> FILES
     SRC --> GEOM
-    CC --> LOAD
     IC --> LOAD
     IC --> PROJ
     FILES -->|initial load or revision/source change| PARSE
@@ -140,3 +140,67 @@ flowchart TB
 ```
 
 Selecting a variant does not ask the backend to generate replacement schematic or PCB files. ECAD independently resolves its already parsed source records in TypeScript. Prism's BOM and 3D visibility instead use the backend-generated assembly data. These are two semantic implementations, tested against shared native fixtures. Catalog discovery adds a third, deliberately limited scanner that extracts names rather than resolving component state. A cold semantic-index build still uses its existing full snapshot/Monkey path; the selective Git extraction optimization in this PR is for catalog discovery.
+
+
+## Opus review validation and simplification — 2026-09-18
+
+The major duplication and performance findings were valid. This pass changes
+the implementation in the same correction PR, against `c91489e`, without
+changing variant precedence, BOM policy, DNP policy or Release Studio's default
+sentinel.
+
+| Finding | Disposition |
+| --- | --- |
+| A / 2.4 / flash-to-default: separate catalog request despite waiting for the index | Removed `useProjectVariants`, its request lifecycle and revision reconciliation. The visualizer now takes both catalog and overlays from one index. A usable index remains selected during a refresh error. The independently authorized endpoint remains available. |
+| B: replace the imperative viewer bridge with an attribute | Not equivalent for Prism's progressive loading. ECAD marks the root loaded and validates the request before support files arrive; an unknown name clears the stored request and reflected attribute. Appending the defining project/child file then replays null, and React has no changed prop to restore. Retain ready-time replay and mismatch reporting. This conclusion is from the pinned element lifecycle, not a new browser acceptance run. |
+| C: unused occurrence and flag wire maps | Retain the frozen contract. Occurrence resolution also feeds component projection, so removing the serialized occurrence map would not eliminate the semantic calculation. Catalog is now consumed directly. Diagnostics presentation remains a follow-up. |
+| D: physical classification merges five identity sources | Use only the complete `assembly.footprintInventory`; sparse flag maps provide DNP values, not membership. Remove the unused inventory argument and old-index fallbacks. Duplicate references stay ambiguous; orphan footprints remain supported. |
+| E / 2.2: duplicate revision helpers and repeated Git plumbing | Valid maintenance opportunity, deferred to one shared revision/snapshot abstraction. Merging the private helpers also changes PCB-only versus project-anchor behavior across index consumers. It is no longer on the index catalog path after this pass. Exact-SHA warm lookup remains cached. |
+| F: configuration cache write-then-clear | Add `store=False` for snapshot discovery, preserving any live-project cache entry and avoiding temporary-path entries. |
+| F: project ID in catalog cache key | Stamp project ID after the cached result, so multiple project views of the same path/anchor share discovery without leaking identity. |
+| F: repeated default occurrence dictionary | Build once before the variant loop. |
+| F: Release Studio root/anchor wrappers | No change: small cleanup with no measured benefit, outside this pass's dataflow simplification. |
+| 2.1: metadata-free structural scan | Add a conservative regex precheck accepting whitespace after `(`; skip the structural walk when no relevant record or sheet link can exist. Quoted false positives still take the structural path. |
+| 2.3 / consistency-check failure during index build | Call `discover_snapshot_catalog` directly on the builder-owned snapshot. No fake project, double source hash, temporary-path LRU entries or catalog-specific working-tree consistency exception. The independent endpoint still checks working-tree consistency. Do not catch and silently drop the catalog. |
+| 2.5: skip unchanged occurrence resolution | Deferred. Preserve native inheritance semantics; this was not the measured bottleneck. |
+| Exact-SHA HTTP freshness after deploy | All catalog responses now use `private, no-cache` with ETags. Generator changes revalidate immediately; unchanged responses can still return 304. |
+| URL Back behavior / real variant named Default | Preserve the existing replace-history choice and the user's explicitly deferred Release Studio sentinel migration. |
+
+### Discovery boundary
+
+The metadata-free fast path deliberately does not certify that an entire KiCad
+file is syntactically valid. A malformed file without any relevant token no
+longer produces a catalog `source-unparseable` diagnostic. Relevant malformed
+records still do, and native model parsing during index generation/rendering
+is unchanged. The regression tests record this boundary rather than claiming
+full validation. The malformed native fixtures and catalog ordering/case rules
+remain covered.
+
+### Independent performance measurements
+
+Local Jetson AGX Thor baseboard: approximately 85 MB PCB plus 13 MB schematics,
+zero variants. Same Python runtime, before `c91489e` versus this pass, five
+samples per mode, medians in milliseconds. Clear both in-process caches before
+each cold sample; immediately repeat for warm samples. OS filesystem caches
+were not flushed. No concurrent heavy tests were running during the samples.
+
+| Catalog request | Before cold | After cold | Before warm | After warm |
+| --- | ---: | ---: | ---: | ---: |
+| Working tree | 2443.20 | 251.65 | 59.15 | 59.89 |
+| Exact SHA | 2870.36 | 684.80 | 0.02 | 0.02 |
+| Branch (`HEAD`) | 2809.06 | 641.94 | 76.53 | 73.58 |
+
+This is approximately 9.7x faster cold working-tree discovery and 4.2x faster
+cold exact-SHA discovery. It is not a measurement of total semantic-index build
+or viewer load time. Files containing relevant variants still use the
+structural scanner. Large variant-bearing boards and a shared Git snapshot
+plan are the next useful performance targets.
+
+### Validation for the simplification
+
+- Backend: **1,435 tests passed, 14 live-KiCad skips**, with all three PostgreSQL database URLs configured against fresh disposable databases.
+- Frontend: **100 files / 770 tests passed** on the prescribed Node 22 runtime. The first invocation used the host's default Node and failed unrelated browser-storage tests; the supported runtime passed. Removed hook tests account for the lower count.
+- Frontend lint, React Doctor gate (0 warnings / 0 errors), application build and panel build passed.
+- Python compilation, agent-document checker, catalog architecture check against `c91489e`, and `git diff --check` passed.
+- ECAD and semantic renderer source/bundles are unchanged; their prior run evidence is listed separately above. No new full interactive product acceptance run is claimed.
+- The exact-head GitHub quality-gate result is recorded on PR #300; it includes the containerized live-KiCad acceptance gate. Local results alone are not merge approval.

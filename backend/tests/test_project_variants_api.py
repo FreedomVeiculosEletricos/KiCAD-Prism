@@ -178,10 +178,10 @@ class VariantCatalogCachingTests(unittest.TestCase):
                 api.get_project_variants("prj", _request(headers), payload.get("commit"), _User())
             )
 
-    def test_commit_responses_are_private_and_cacheable(self) -> None:
+    def test_commit_responses_are_private_and_revalidate(self) -> None:
         response = self._read(self.PAYLOAD)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["cache-control"], "private, max-age=300")
+        self.assertEqual(response.headers["cache-control"], "private, no-cache")
         expected_etag = response.headers["etag"]
 
         revalidated = self._read(

@@ -12,8 +12,9 @@ design-variant contract packet v1.0 section 2.1:
 Board-side names (2 and 4) fold case-insensitively into the first matching
 catalog entry with a ``catalog-name-case-mismatch`` diagnostic; schematic names
 stay distinct (KiCad's schematic variant names are case-sensitive). An
-unreadable or malformed source is skipped with a ``source-unparseable``
-diagnostic: the readable sources still produce a catalog.
+unreadable source or malformed relevant record is skipped with a
+``source-unparseable`` diagnostic: readable sources still produce a catalog.
+Metadata-free files take a fast path; discovery is not whole-file validation.
 
 Discovery reads text with a structural, quote-aware S-expression scanner,
 so quoted strings and escaped quotes never confuse the form walk, and it reads
@@ -242,83 +243,91 @@ def discover_variant_catalog(
     """
 
     source_revision_key, resolved_commit = project_revision_identity(project, commit)
-    return deepcopy(_discover_cached(
+    result = deepcopy(_discover_cached(
         str(project.path), getattr(project, "project_file", None),
-        str(getattr(project, "id", "")), source_revision_key, resolved_commit,
+        source_revision_key, resolved_commit,
     ))
-
-
-@lru_cache(maxsize=128)
-def _discover_cached(path: str, anchor: str | None, project_id: str,
-                     source_revision_key: str, resolved_commit: str | None) -> dict[str, Any]:
-    project = SimpleNamespace(path=path, project_file=anchor, id=project_id)
-    builder = _CatalogBuilder()
-
-    with project_source_snapshot(project, resolved_commit) as snapshot:
-        board, schematic = source_files(project, snapshot)
-
-        if snapshot.project_file.suffix.lower() == ".kicad_pro":
-            registry_entries, registry_readable = _project_registry_entries(
-                snapshot.project_file
-            )
-            if not registry_readable:
-                builder.source_unparseable(
-                    SOURCE_PROJECT, _relative(snapshot, snapshot.project_file)
-                )
-            for entry in registry_entries:
-                builder.add_project_name(entry["name"], entry["description"])
-
-        header_entries: list[tuple[str, Optional[str]]] = []
-        footprint_names: list[str] = []
-        if board is not None:
-            board_text = _read_text(board)
-            if board_text is None:
-                builder.source_unparseable(SOURCE_PCB, _relative(snapshot, board))
-            else:
-                header_entries, footprint_names, board_readable = _board_records(
-                    board_text
-                )
-                if not board_readable:
-                    builder.source_unparseable(
-                        SOURCE_PCB, _relative(snapshot, board)
-                    )
-
-        for name, description in header_entries:
-            builder.add_board_name(name, description, SOURCE_PCB, "Board header")
-
-        if schematic is not None:
-            pending = [schematic]
-            visited: set[Path] = set()
-            while pending:
-                path = pending.pop().resolve()
-                if path in visited:
-                    continue
-                visited.add(path)
-                # Source files must stay within the project snapshot. Never
-                # follow a file-authored path into the host filesystem.
-                if not path.is_relative_to(snapshot.root):
-                    builder.source_unparseable(SOURCE_SCHEMATIC, path.name)
-                    continue
-                text = _read_text(path)
-                records = scan_source(text, "kicad_sch") if text is not None else None
-                if records is None or not records.readable:
-                    builder.source_unparseable(SOURCE_SCHEMATIC, _relative(snapshot, path))
-                    continue
-                for name in records.names:
-                    builder.add_schematic_name(name)
-                pending.extend(reversed([path.parent / name for name in records.sheets]))
-
-        for name in footprint_names:
-            builder.add_board_name(name, None, SOURCE_FOOTPRINT, "Footprint record")
-
-    if resolved_commit is None and project_revision_identity(project)[0] != source_revision_key:
-        raise RuntimeError("Project sources changed during variant discovery; retry")
-
     return {
         "schema": SCHEMA,
         "projectId": str(getattr(project, "id", "")),
         "commit": resolved_commit,
         "sourceRevisionKey": source_revision_key,
-        "variants": builder.variants(),
-        "diagnostics": builder.diagnostics(),
+        **result,
     }
+
+
+@lru_cache(maxsize=128)
+def _discover_cached(path: str, anchor: str | None,
+                     source_revision_key: str, resolved_commit: str | None) -> dict[str, Any]:
+    project = SimpleNamespace(path=path, project_file=anchor)
+    with project_source_snapshot(project, resolved_commit) as snapshot:
+        result = discover_snapshot_catalog(snapshot)
+    if resolved_commit is None and project_revision_identity(project)[0] != source_revision_key:
+        raise RuntimeError("Project sources changed during variant discovery; retry")
+    return result
+
+
+def discover_snapshot_catalog(snapshot: ProjectSourceSnapshot) -> dict[str, Any]:
+    """Read an existing source snapshot without revision lookup or caching.
+
+    The semantic-index builder already owns its revision and parsed source
+    lifetime. Do not re-hash that tree or cache its temporary checkout path.
+    """
+    builder = _CatalogBuilder()
+    board, schematic = source_files(snapshot)
+
+    if snapshot.project_file.suffix.lower() == ".kicad_pro":
+        registry_entries, registry_readable = _project_registry_entries(
+            snapshot.project_file
+        )
+        if not registry_readable:
+            builder.source_unparseable(
+                SOURCE_PROJECT, _relative(snapshot, snapshot.project_file)
+            )
+        for entry in registry_entries:
+            builder.add_project_name(entry["name"], entry["description"])
+
+    header_entries: list[tuple[str, Optional[str]]] = []
+    footprint_names: list[str] = []
+    if board is not None:
+        board_text = _read_text(board)
+        if board_text is None:
+            builder.source_unparseable(SOURCE_PCB, _relative(snapshot, board))
+        else:
+            header_entries, footprint_names, board_readable = _board_records(
+                board_text
+            )
+            if not board_readable:
+                builder.source_unparseable(
+                    SOURCE_PCB, _relative(snapshot, board)
+                )
+
+    for name, description in header_entries:
+        builder.add_board_name(name, description, SOURCE_PCB, "Board header")
+
+    if schematic is not None:
+        pending = [schematic]
+        visited: set[Path] = set()
+        while pending:
+            path = pending.pop().resolve()
+            if path in visited:
+                continue
+            visited.add(path)
+            # Source files must stay within the project snapshot. Never
+            # follow a file-authored path into the host filesystem.
+            if not path.is_relative_to(snapshot.root):
+                builder.source_unparseable(SOURCE_SCHEMATIC, path.name)
+                continue
+            text = _read_text(path)
+            records = scan_source(text, "kicad_sch") if text is not None else None
+            if records is None or not records.readable:
+                builder.source_unparseable(SOURCE_SCHEMATIC, _relative(snapshot, path))
+                continue
+            for name in records.names:
+                builder.add_schematic_name(name)
+            pending.extend(reversed([path.parent / name for name in records.sheets]))
+
+    for name in footprint_names:
+        builder.add_board_name(name, None, SOURCE_FOOTPRINT, "Footprint record")
+
+    return {"variants": builder.variants(), "diagnostics": builder.diagnostics()}

@@ -1,7 +1,5 @@
 /**
- * VAR-14: resolution of `?variant=` against the fetched catalog and the
- * index's own catalog. Cases E16 (unknown name), E17 (identity mismatch) and
- * the empty/late/failed catalog states from the acceptance list.
+ * Resolve the URL request from the single semantic-index response.
  */
 import { describe, expect, it } from "vitest";
 
@@ -11,7 +9,6 @@ import {
     variantSearchParams,
     variantSelectionNotice,
     variantSelectorDisabled,
-    type VariantCatalogSnapshot,
 } from "./variant-selection";
 import type {
     AssemblyCatalogEntry,
@@ -69,19 +66,6 @@ const LITE: AssemblyCatalogEntry = {
     sources: ["schematic"],
 };
 
-function catalog(
-    overrides: Partial<VariantCatalogSnapshot> = {},
-): VariantCatalogSnapshot {
-    return {
-        catalog: [LITE],
-        loading: false,
-        error: null,
-        empty: false,
-        identityMismatch: false,
-        ...overrides,
-    };
-}
-
 describe("requestedVariantFromSearchParams", () => {
     it("reads a non-empty variant parameter and treats blank as absent", () => {
         expect(
@@ -115,71 +99,31 @@ describe("variantSearchParams", () => {
 });
 
 describe("resolveVariantSelection", () => {
-    it("stays loading until both the index and the catalog are in", () => {
-        expect(
-            resolveVariantSelection("Lite", catalog(), null).state,
-        ).toBe("loading");
-        expect(
-            resolveVariantSelection("Lite", catalog({ loading: true }), indexWith([LITE])).state,
-        ).toBe("loading");
+    it("uses only the index and distinguishes loading from failure", () => {
+        expect(resolveVariantSelection("Lite", null).state).toBe("loading");
+        expect(resolveVariantSelection("Lite", null, "failed").state).toBe("failed");
     });
-
-    it("reports failure, empty catalog and old index distinctly", () => {
-        expect(
-            resolveVariantSelection("Lite", catalog({ error: "boom" }), indexWith([LITE])).state,
-        ).toBe("failed");
-        expect(
-            resolveVariantSelection(null, catalog({ catalog: [], empty: true }), indexWith([])).state,
-        ).toBe("empty");
-        expect(
-            resolveVariantSelection(null, catalog(), indexWithoutAssembly()).state,
-        ).toBe("unavailable");
+    it("reports empty and unavailable data separately", () => {
+        expect(resolveVariantSelection(null, indexWith([])).state).toBe("empty");
+        expect(resolveVariantSelection(null, indexWithoutAssembly()).state).toBe("unavailable");
     });
-
-    it("advertises the default assembly without a request", () => {
-        const resolution = resolveVariantSelection(null, catalog(), indexWith([LITE]));
-        expect(resolution).toEqual({ effective: null, state: "applied" });
-        expect(variantSelectionNotice(resolution)).toBeNull();
+    it("applies the requested variant from the same index as the catalog", () => {
+        expect(resolveVariantSelection("Lite", indexWith([LITE]))).toEqual({effective: "Lite", state: "applied"});
+        expect(resolveVariantSelection(null, indexWith([LITE]))).toEqual({effective: null, state: "applied"});
     });
-
-    it("applies a name present in both catalogs", () => {
-        const resolution = resolveVariantSelection("Lite", catalog(), indexWith([LITE]));
-        expect(resolution).toEqual({ effective: "Lite", state: "applied" });
-        expect(variantSelectionNotice(resolution, "Lite")).toBeNull();
+    it("keeps a usable index active if a refresh fails", () => {
+        expect(resolveVariantSelection("Lite", indexWith([LITE]), "refresh failed")).toEqual({effective: "Lite", state: "applied"});
     });
-
-    it("reports a missing name and never falls back to it silently (E16)", () => {
-        const resolution = resolveVariantSelection("Nope", catalog(), indexWith([LITE]));
-        expect(resolution).toEqual({ effective: null, state: "missing" });
-        expect(variantSelectionNotice(resolution, "Nope")).toContain("Nope");
+    it("does not apply an absent variant or silently drop the URL request", () => {
+        for (const index of [indexWith([]), indexWith([LITE])]) {
+            const resolution = resolveVariantSelection("Removed", index);
+            expect(resolution).toEqual({effective: null, state: "missing"});
+            expect(variantSelectionNotice(resolution, "Removed")).toContain("Removed");
+        }
     });
-
-    it("keeps the missing notice even when the catalog is empty", () => {
-        const resolution = resolveVariantSelection(
-            "Nope",
-            catalog({ catalog: [], empty: true }),
-            indexWith([]),
-        );
-        expect(resolution.state).toBe("missing");
-        expect(variantSelectionNotice(resolution, "Nope")).toContain("Nope");
-    });
-
-    it("does not apply a name the fetched catalog has but the index lacks", () => {
-        const resolution = resolveVariantSelection(
-            "Pro",
-            catalog({ catalog: [LITE, { name: "Pro", description: null, sources: [] }] }),
-            indexWith([LITE]),
-        );
-        expect(resolution.state).toBe("missing");
-    });
-
-    it("withholds the selection while catalog and index identities disagree (E17)", () => {
-        const resolution = resolveVariantSelection(
-            "Lite",
-            catalog({ identityMismatch: true }),
-            indexWith([LITE]),
-        );
-        expect(resolution).toEqual({ effective: null, state: "failed" });
+    it("takes catalog and overlays together when a new index replaces the old one", () => {
+        expect(resolveVariantSelection("Lite", indexWith([LITE])).effective).toBe("Lite");
+        expect(resolveVariantSelection("Lite", indexWith([])).state).toBe("missing");
     });
 });
 

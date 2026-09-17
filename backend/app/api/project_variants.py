@@ -5,9 +5,9 @@ catalog (contract packet v1.0 section 3.1). The project lookup is role-aware,
 the source reads run off the event loop, and the response carries an ETag so a
 client can revalidate instead of refetching.
 
-Caching follows decision D8: a commit is immutable for this revision, so it
-gets a short private max-age; a working-tree response must revalidate every
-time because the sources can change without the URL changing.
+Responses are private and revalidate on every request: both source content
+and generator behavior can change without the URL changing. ETags avoid
+resending an unchanged payload; the service caches discovery work.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -72,11 +71,9 @@ async def get_project_variants(
 
     identity = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
     etag = f'"{identity}-{CATALOG_GENERATOR_TAG}"'
-    # A commit is immutable; a working tree is not, so it must revalidate.
-    cache_control = (
-        "private, max-age=300" if commit and re.fullmatch(r"[0-9a-fA-F]{40}", commit) else "private, no-cache"
-    )
-    headers = {"Cache-Control": cache_control, "ETag": etag}
+    # Source commits are immutable, but the generator can change at deployment.
+    # Revalidate every response; cached discovery and ETags keep this cheap.
+    headers = {"Cache-Control": "private, no-cache", "ETag": etag}
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
     return Response(

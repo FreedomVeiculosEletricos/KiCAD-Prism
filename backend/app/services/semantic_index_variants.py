@@ -34,7 +34,6 @@ import re
 from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from app.services import semantic_index_service
@@ -818,6 +817,7 @@ def build_assembly_state(
     ]
 
     default_by_uuid = {state.uuid: state for state in footprints}
+    default_by_occurrence = {state.occurrence_id: state for state in occurrences}
     variants: list[dict[str, Any]] = []
     alternate_diagnostics: list[dict[str, Any]] = []
     mismatch_diagnostics: list[dict[str, Any]] = []
@@ -835,7 +835,7 @@ def build_assembly_state(
             {
                 "name": variant_name,
                 "occurrences": _variant_occurrence_wire(
-                    {state.occurrence_id: state for state in occurrences},
+                    default_by_occurrence,
                     occurrence_states,
                 ),
                 "components": _variant_component_wire(
@@ -1054,12 +1054,11 @@ def assemble_semantic_index(
 
     from app.services import variant_catalog_service
 
-    project = SimpleNamespace(
-        id="",
-        path=str(project_file.parent),
-        project_file=project_file.name,
+    from app.services.project_source_snapshot import ProjectSourceSnapshot
+
+    catalog_result = variant_catalog_service.discover_snapshot_catalog(
+        ProjectSourceSnapshot(root=project_file.parent.resolve(), project_file=project_file.resolve(), commit=None)
     )
-    catalog_result = variant_catalog_service.discover_variant_catalog(project)
     block = build_assembly_state(
         design,
         project_file=project_file,

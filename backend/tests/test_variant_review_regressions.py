@@ -29,8 +29,22 @@ class SourceScanningTests(unittest.TestCase):
         self.assertEqual(result.names, ())
 
     def test_bad_balance_and_multiple_roots_are_rejected(self):
-        for text in ('(kicad_pcb', '(kicad_pcb))', '(kicad_pcb)(kicad_pcb)', '(kicad_pcb "unterminated)'):
+        for text in ('(kicad_pcb (variant)', '(kicad_pcb (variant)))', '(kicad_pcb (variant))(kicad_pcb)', '(kicad_pcb (variant) "unterminated)'):
             self.assertFalse(scan_source(text, 'kicad_pcb').readable, text)
+
+    def test_metadata_free_sources_do_not_run_the_structural_scanner(self):
+        from app.services import variant_source_scan as scanner
+        with patch.object(scanner, '_scan_source', side_effect=AssertionError('full scan')):
+            self.assertEqual(scanner.scan_source('(kicad_pcb (version 20260101))', 'kicad_pcb').names, ())
+            # No catalog syntax is present; whole-file validation belongs to
+            # the native parsers, including for malformed metadata-free text.
+            self.assertEqual(scanner.scan_source('(kicad_pcb', 'kicad_pcb').names, ())
+
+    def test_whitespace_separated_variant_form_and_sheet_links_are_not_skipped(self):
+        result = scan_source('(kicad_pcb ( variants ( variant (name "Spaced"))))', 'kicad_pcb')
+        self.assertEqual(result.header, (('Spaced', None),))
+        result = scan_source('(kicad_sch (sheet (property "Sheetfile" "child.kicad_sch")))', 'kicad_sch')
+        self.assertEqual(result.sheets, ('child.kicad_sch',))
 
     def test_escaped_names_and_default_sentinel(self):
         result = scan_source('(kicad_pcb (variants (variant (name "A\\\"B")) (variant (name "< Default >"))))', 'kicad_pcb')
@@ -88,6 +102,36 @@ class CatalogSnapshotTests(unittest.TestCase):
             self.assertEqual(self.names(sha), ['V'])
             with self.assertRaises(AssertionError):
                 self.names('HEAD')
+
+    def test_catalog_cache_is_shared_without_leaking_project_id(self):
+        from copy import copy
+        (self.root / 'top.kicad_pcb').write_text(board('V'))
+        first = catalog.discover_variant_catalog(self.project)
+        other = copy(self.project)
+        other.id = 'second-view'
+        with patch.object(catalog, 'project_source_snapshot', side_effect=AssertionError('duplicate scan')):
+            second = catalog.discover_variant_catalog(other)
+        self.assertEqual(first['projectId'], 'test')
+        self.assertEqual(second['projectId'], 'second-view')
+
+    def test_snapshot_path_resolution_preserves_existing_config_cache(self):
+        from copy import deepcopy
+        from app.services import path_config_service as paths
+        from app.services.project_source_snapshot import ProjectSourceSnapshot, source_files
+        paths.get_path_config(str(self.root.resolve()), anchor="top.kicad_pro")
+        before = deepcopy(paths._config_cache)
+        snapshot = ProjectSourceSnapshot(self.root.resolve(), (self.root / 'top.kicad_pro').resolve(), None)
+        source_files(snapshot)
+        self.assertEqual(paths._config_cache, before)
+        paths.clear_config_cache(str(self.root.resolve()))
+
+    def test_snapshot_discovery_does_not_lookup_or_cache_revision(self):
+        from app.services.project_source_snapshot import ProjectSourceSnapshot
+        (self.root / 'top.kicad_pcb').write_text(board('V'))
+        snapshot = ProjectSourceSnapshot(self.root.resolve(), (self.root / 'top.kicad_pro').resolve(), None)
+        with patch.object(catalog, 'project_revision_identity', side_effect=AssertionError('rehash')):
+            self.assertEqual(catalog.discover_snapshot_catalog(snapshot)['variants'][0]['name'], 'V')
+        self.assertEqual(catalog._discover_cached.cache_info().currsize, 0)
 
     def test_deleted_live_board_does_not_break_historical_anchor(self):
         (self.root / 'only.kicad_pcb').write_text(board('Historical'))

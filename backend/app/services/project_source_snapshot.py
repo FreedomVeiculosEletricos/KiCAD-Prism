@@ -180,7 +180,7 @@ def project_source_snapshot(
 
 
 def source_files(
-    project: Any, snapshot: ProjectSourceSnapshot
+    snapshot: ProjectSourceSnapshot
 ) -> tuple[Optional[Path], Optional[Path]]:
     """The configured board and root schematic inside a snapshot.
 
@@ -194,8 +194,7 @@ def source_files(
     anchor = snapshot.project_file.name
     # Historical discovery must use the historical configuration. Temporary
     # paths must not accumulate in the global path-configuration cache.
-    config = path_config_service.get_path_config(str(snapshot.root), anchor=anchor, use_cache=False)
-    path_config_service.clear_config_cache(str(snapshot.root))
+    config = path_config_service.get_path_config(str(snapshot.root), anchor=anchor, use_cache=False, store=False)
     for value in (config.pcb, config.schematic):
         if value and (Path(value).is_absolute() or ".." in Path(value).parts):
             raise ValueError("Configured source is outside the project")

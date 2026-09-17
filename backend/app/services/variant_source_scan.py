@@ -10,6 +10,10 @@ import re
 from dataclasses import dataclass
 
 _STRINGS = re.compile(r'"(?:\\.|[^"\\])*(?:"|$)')
+# Whitespace after an opening parenthesis is legal; a literal "(variant"
+# substring alone would miss those records. False positives in quoted text
+# merely take the structural path below.
+_RELEVANT = re.compile(r'\(\s*variants?(?=\s|\))')
 _PARENS = re.compile(r'[()]')
 _FORMS = re.compile(r'\(\s*(kicad_pcb|kicad_sch|footprint|symbol|sheet|instances|project|path|variants|variant|property)(?=\s|\))')
 _NAME = re.compile(r'^\(\s*(?:name|description)\s+("(?:\\.|[^"\\])*")\s*\)$')
@@ -34,6 +38,11 @@ def _end(mask: str, start: int) -> int:
 
 
 def scan_source(text: str, root: str) -> SourceRecords:
+    # This is metadata discovery, not a full KiCad validator. Without variant
+    # forms or possible sheet links there is nothing to extract. The native
+    # parsers still validate files when building/rendering the design.
+    if not _RELEVANT.search(text) and (root != "kicad_sch" or "Sheetfile" not in text):
+        return SourceRecords()
     try:
         return _scan_source(text, root)
     except (ValueError, IndexError):

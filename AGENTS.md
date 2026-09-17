@@ -104,10 +104,8 @@ then `run_project_import_job_v3`) → `backend/app/services/git_service.py` ·
 `frontend/src/components/visualizer.tsx` (overlay attachment)
 
 **Select a design variant**
-`backend/app/api/project_variants.py` →
-`backend/app/services/variant_catalog_service.py` ·
-`backend/app/services/semantic_index_variants.py` (index assembly block) →
-`frontend/src/hooks/use-project-variants.ts` (catalog request) →
+`backend/app/services/variant_catalog_service.py` →
+`backend/app/services/semantic_index_variants.py` (index catalog and assembly block) →
 `frontend/src/components/design-variants/variant-selection.ts` (URL owner and
 resolution) →
 `frontend/src/lib/design-variants.ts` (effective projection) →
